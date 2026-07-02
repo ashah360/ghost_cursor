@@ -149,3 +149,19 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+## CI
+
+Two GitHub Actions workflows (`.github/workflows/`):
+
+- **`unit`** (every push/PR, blocking) — the 110 hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
+- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes + the real `cursor-agent` binary and exercises every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
+
+Set the repo secret **`CURSOR_API_KEY`** for the e2e job. Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env in `e2e.yml` (default `gpt-5.4-nano-low` — cheap + fast; verify the slug with `cursor-agent models`).
+
+Reproduce the e2e env locally with `Dockerfile.e2e`:
+
+```bash
+docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
+docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
+```

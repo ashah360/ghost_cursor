@@ -1,0 +1,53 @@
+name: unit
+
+# Fast, deterministic, no-network unit tests. Blocking on every push/PR.
+# The real-cursor e2e suite lives in e2e.yml (scheduled/on-demand) so a
+# nondeterministic LLM call never red-Xes an unrelated change.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out ghost_cursor
+        uses: actions/checkout@v4
+        with:
+          path: ghost_cursor
+
+      - name: Check out Hermes Agent (real core imports — no mocks)
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install the plugin into the Hermes tree
+        run: |
+          set -euo pipefail
+          mkdir -p hermes-agent/plugins/ghost_cursor
+          cp ghost_cursor/*.py hermes-agent/plugins/ghost_cursor/
+          cp ghost_cursor/test_ghost_cursor_plugin.py hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
+          cp ghost_cursor/conftest.py hermes-agent/tests/plugins/conftest_ghost_cursor.py || true
+
+      - name: Install deps
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip pytest
+          uv sync --frozen || uv sync || pip install -e .
+
+      - name: Unit tests (110, hermetic)
+        working-directory: hermes-agent
+        run: uv run pytest tests/plugins/test_ghost_cursor_plugin.py -q

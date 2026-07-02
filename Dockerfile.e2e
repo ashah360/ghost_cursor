@@ -1,0 +1,37 @@
+# Reproduce the ghost_cursor e2e environment locally — real Hermes + real
+# cursor-agent, no mocks. Mirrors what the GitHub Actions e2e job does.
+#
+#   docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
+#   docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
+#
+# (Or mount your key file / pass it however you prefer.)
+FROM python:3.11-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# uv for fast, locked dep install
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+# Real Hermes core (the plugin imports hermes_constants + tools.* + hermes_cli.config)
+RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent /opt/hermes-agent
+WORKDIR /opt/hermes-agent
+RUN uv sync --frozen || uv sync || pip install -e .
+
+# Real cursor-agent binary
+RUN curl https://cursor.com/install -fsS | bash
+ENV PATH="/root/.local/bin:${PATH}"
+
+# The plugin + its tests
+COPY *.py /opt/hermes-agent/plugins/ghost_cursor/
+COPY test_ghost_cursor_plugin.py /opt/hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
+COPY conftest.py /opt/hermes-agent/tests/plugins/conftest_ghost_cursor.py
+COPY tests/e2e/ /opt/hermes-agent/tests/plugins/e2e/
+
+ENV GHOST_CURSOR_E2E=1 \
+    GHOST_CURSOR_TEST_MODEL=gpt-5.4-nano-low \
+    PYTHONPATH=/opt/hermes-agent
+
+# Unit tests always; e2e only if CURSOR_API_KEY is provided at runtime.
+CMD ["bash", "-lc", "uv run pytest tests/plugins/test_ghost_cursor_plugin.py -q && uv run pytest tests/plugins/e2e/test_e2e.py -q -v"]
