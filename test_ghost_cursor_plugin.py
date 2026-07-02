@@ -27,16 +27,20 @@ import pytest
 
 from plugins.ghost_cursor import (
     CURSOR_EDIT_SCHEMA,
+    CURSOR_STATUS_SCHEMA,
+    STATUS_TOOL_NAME,
     TOOL_NAME,
     TOOLSET,
     _resolve_hermes_session_id,
     _resolve_progress_callback,
     check_cursor_edit_available,
     cursor_edit,
+    cursor_status,
     register,
 )
 from plugins.ghost_cursor import acp_runner as gc_acp
 from plugins.ghost_cursor import events as gc_events
+from plugins.ghost_cursor import jobs as gc_jobs
 from plugins.ghost_cursor import runner as gc_runner
 from plugins.ghost_cursor import session_registry as gc_sessions
 
@@ -987,21 +991,30 @@ class TestProgressCallbackResolution:
 # ---------------------------------------------------------------------------
 
 class TestRegistration:
-    def test_register_wires_tool_into_ghost_cursor_toolset(self):
-        captured = {}
+    def test_register_wires_tools_into_ghost_cursor_toolset(self):
+        calls = []
 
         ctx = SimpleNamespace(
-            register_tool=lambda **kw: captured.update(kw)
+            register_tool=lambda **kw: calls.append(kw)
         )
         register(ctx)
 
-        assert captured["name"] == TOOL_NAME
-        assert captured["toolset"] == TOOLSET
-        assert captured["check_fn"] is check_cursor_edit_available
-        assert captured["schema"] is CURSOR_EDIT_SCHEMA
-        assert captured["schema"]["parameters"]["required"] == ["task"]
+        by_name = {c["name"]: c for c in calls}
+        assert set(by_name) == {TOOL_NAME, STATUS_TOOL_NAME}
+
+        edit = by_name[TOOL_NAME]
+        assert edit["toolset"] == TOOLSET
+        assert edit["check_fn"] is check_cursor_edit_available
+        assert edit["schema"] is CURSOR_EDIT_SCHEMA
+        assert edit["schema"]["parameters"]["required"] == ["task"]
         # The handler returns a JSON string (registry contract).
-        assert callable(captured["handler"])
+        assert callable(edit["handler"])
+
+        status = by_name[STATUS_TOOL_NAME]
+        assert status["toolset"] == TOOLSET
+        assert status["check_fn"] is check_cursor_edit_available
+        assert status["schema"]["parameters"]["required"] == []
+        assert callable(status["handler"])
 
     def test_schema_steers_delegation(self):
         desc = CURSOR_EDIT_SCHEMA["description"].lower()
@@ -1150,3 +1163,639 @@ class TestLegacyRunner:
         assert events[-1][0] == "harness.error"
         assert events[-1][1]["timeout"] is True
         assert elapsed < 15, f"group kill did not tear down the pipe ({elapsed:.1f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Background jobs — dispatch, cursor_status, G1/G2/G3, auto-promote
+# ---------------------------------------------------------------------------
+
+def _drain_completion_queue():
+    """Pop and return every event currently on the shared completion queue."""
+    from tools.process_registry import process_registry
+
+    events = []
+    while not process_registry.completion_queue.empty():
+        try:
+            events.append(process_registry.completion_queue.get_nowait())
+        except Exception:
+            break
+    return events
+
+
+@pytest.fixture
+def clean_jobs():
+    """Fresh cursor-job registry + a drained completion queue."""
+    gc_jobs.registry._reset_for_tests()
+    _drain_completion_queue()
+    yield gc_jobs.registry
+    gc_jobs.registry._reset_for_tests()
+    _drain_completion_queue()
+
+
+def _wait_until(cond, timeout=10.0, interval=0.02):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if cond():
+            return True
+        time.sleep(interval)
+    return cond()
+
+
+def _slow_replay_factory(repo, steps=8, step_delay=0.05, session_id_val="s-bg"):
+    """A cancel-aware replay: early file edit, slow thought stream, late edit.
+
+    Honors ``cancel_check`` the way the real ``run_acp`` does — a cancel
+    mid-run resolves with ``stopReason: "cancelled"``.
+    """
+
+    def replay(*_a, cancel_check=None, **_k):
+        yield ("acp.session", {"sessionId": session_id_val, "cwd": repo, "model": "m"})
+        yield ("acp.update", {
+            "sessionUpdate": "tool_call", "toolCallId": "t1",
+            "title": "Edit File", "kind": "edit", "status": "pending", "rawInput": {},
+        })
+        yield ("acp.update", {
+            "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            "status": "completed",
+            "content": [{"type": "diff", "path": f"{repo}/f1.py",
+                         "oldText": "a\n", "newText": "a\nb\n"}],
+        })
+        for i in range(steps):
+            if cancel_check and cancel_check():
+                yield ("acp.result", {"stopReason": "cancelled"})
+                return
+            time.sleep(step_delay)
+            yield ("acp.update", {
+                "sessionUpdate": "agent_thought_chunk",
+                "content": {"type": "text", "text": f"working on step {i} "},
+            })
+        yield ("acp.update", {
+            "sessionUpdate": "tool_call", "toolCallId": "t2",
+            "title": "Edit File", "kind": "edit", "status": "pending", "rawInput": {},
+        })
+        yield ("acp.update", {
+            "sessionUpdate": "tool_call_update", "toolCallId": "t2",
+            "status": "completed",
+            "content": [{"type": "diff", "path": f"{repo}/f2.py",
+                         "oldText": "", "newText": "new\n"}],
+        })
+        yield ("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "all done"},
+        })
+        yield ("acp.result", {"stopReason": "end_turn"})
+
+    return replay
+
+
+class TestBackgroundDispatch:
+    def test_background_returns_job_id_immediately(self, clean_jobs, monkeypatch, tmp_path):
+        """background=true must return the turn-ending shape at once, while
+        the run keeps going on its worker thread."""
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=12, step_delay=0.05)
+        )
+        t0 = time.monotonic()
+        res = json.loads(cursor_edit(
+            "big refactor", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        assert time.monotonic() - t0 < 0.5, "background dispatch blocked the turn"
+        assert res["success"] is True
+        assert res["status"] == "running"
+        assert res["background"] is True
+        assert res["job_id"].startswith("cursor_")
+        assert res["repo"] == repo
+        assert "cursor_session_id" in res  # "" until acp.session fires
+
+        job = clean_jobs.get(res["job_id"])
+        assert job is not None and job.background and job.deliver
+        assert job.done_event.wait(10)
+        assert job.status == "completed"
+        assert job.result["files_changed_count"] == 2
+
+    def test_completion_event_delivered_with_result_and_session_id(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(gc_acp, "run_acp", _slow_replay_factory(repo, steps=2))
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        job = clean_jobs.get(res["job_id"])
+        assert job.done_event.wait(10)
+
+        events = _drain_completion_queue()
+        assert len(events) == 1
+        evt = events[0]
+        assert evt["type"] == "async_delegation"
+        assert evt["delegation_id"] == job.job_id
+        assert evt["status"] == "completed"
+        # G2: the full result dict rides in the payload — continuation works.
+        assert evt["result"]["session_id"] == "s-bg"
+        assert evt["result"]["resumed"] is False
+        assert evt["result"]["success"] is True
+        assert evt["result"]["files_changed_count"] == 2
+        assert evt["cursor_session_id"] == "s-bg"
+        assert "session_id" in evt["summary"]
+        # The shared formatter renders it (this is what re-enters the chat).
+        from tools.process_registry import format_process_notification
+        text = format_process_notification(evt)
+        assert job.job_id in text
+        assert "s-bg" in text
+
+    def test_sync_path_unchanged_and_never_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        """background=False keeps today's blocking behavior byte-for-byte and
+        must not enqueue any completion event."""
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert result["success"] is True
+        assert result["status"] == "completed"
+        assert result["files_changed_count"] == 2
+        assert result["session_id"] == "s-fixture"
+        assert _drain_completion_queue() == []
+        job = clean_jobs.most_recent()
+        assert job.status == "completed" and job.deliver is False
+
+    def test_background_jobs_do_not_stream_through_the_turn_callback(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        """The dispatching turn ends immediately — nothing may be emitted
+        through its progress callback afterwards."""
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(gc_acp, "run_acp", _slow_replay_factory(repo, steps=2))
+        seen = []
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), background=True,
+            progress_callback=lambda *a, **k: seen.append(a),
+        ))
+        job = clean_jobs.get(res["job_id"])
+        assert job.done_event.wait(10)
+        assert seen == []
+        assert job.result["live_progress"] is False
+        # ...but the progress buffer captured everything for cursor_status.
+        assert job.progress_events > 0
+
+
+class TestCursorStatusReadOnly:
+    def test_polling_a_live_job_never_cancels_it(self, clean_jobs, monkeypatch, tmp_path):
+        """THE critical property: asking "how's it going?" must not kill the
+        run (the interrupt-kills-work footgun this feature removes)."""
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=20, step_delay=0.05)
+        )
+        res = json.loads(cursor_edit(
+            "long task", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        job = clean_jobs.get(res["job_id"])
+
+        # Wait until the session is established and the first diff landed.
+        assert _wait_until(lambda: job.cursor_session_id and job.files)
+
+        s1 = json.loads(cursor_status(res["job_id"]))
+        assert s1["success"] is True
+        assert s1["status"] == "running"
+        assert s1["cursor_session_id"] == "s-bg"          # G2 mid-run
+        assert s1["files_changed_count"] == 1
+        assert s1["files_changed_so_far"][0]["path"].endswith("f1.py")
+        assert "+b" in s1["files_changed_so_far"][0]["diff"]
+
+        time.sleep(0.2)
+        s2 = json.loads(cursor_status(res["job_id"]))
+        assert s2["status"] == "running"
+        assert s2["progress_events"] >= s1["progress_events"]
+
+        # Read-only proof: no cancel was requested, the run keeps going and
+        # produces its normal, complete result.
+        assert not job.cancel_event.is_set()
+        assert job.done_event.wait(10)
+        assert job.status == "completed"
+        assert job.result["files_changed_count"] == 2
+        assert job.result["session_id"] == "s-bg"
+
+    def test_omitted_job_id_reports_most_recent(self, clean_jobs, monkeypatch, tmp_path):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(gc_acp, "run_acp", _slow_replay_factory(repo, steps=2))
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        status = json.loads(cursor_status())
+        assert status["success"] is True
+        assert status["job_id"] == res["job_id"]
+        clean_jobs.get(res["job_id"]).done_event.wait(10)
+
+    def test_unknown_job_id_is_a_clean_error(self, clean_jobs):
+        status = json.loads(cursor_status("cursor_nope"))
+        assert status["success"] is False
+        assert "cursor_nope" in status["error"]
+
+    def test_no_jobs_is_a_clean_error(self, clean_jobs):
+        status = json.loads(cursor_status())
+        assert status["success"] is False
+        assert "no cursor_edit jobs" in status["error"]
+
+    def test_finished_job_snapshot_includes_result(self, clean_jobs, monkeypatch, tmp_path):
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        status = json.loads(cursor_status())
+        assert status["status"] == "completed"
+        assert status["result"]["session_id"] == "s-fixture"
+        assert status["result"]["files_changed_count"] == 2
+
+
+class TestSameRepoConcurrency:
+    """G1: two cursor agents on one working tree = corruption. Reject."""
+
+    def test_second_background_run_on_same_repo_is_rejected(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=20, step_delay=0.05)
+        )
+        first = json.loads(cursor_edit(
+            "task A", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        assert first["status"] == "running"
+
+        second = json.loads(cursor_edit(
+            "task B", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        assert second["success"] is False
+        assert second["status"] == "rejected"
+        assert second["job_id"] == first["job_id"]
+        assert "already running" in second["reason"]
+
+        # A sync call against the busy repo is refused too — same tree.
+        sync = json.loads(cursor_edit(
+            "task C", repo=str(tmp_path), progress_callback=None
+        ))
+        assert sync["status"] == "rejected"
+        assert sync["job_id"] == first["job_id"]
+
+        job = clean_jobs.get(first["job_id"])
+        assert job.done_event.wait(10)
+        # Only the first job ever ran and delivered.
+        assert len(_drain_completion_queue()) == 1
+
+    def test_different_repo_runs_concurrently(self, clean_jobs, monkeypatch, tmp_path):
+        repo_a = tmp_path / "a"
+        repo_b = tmp_path / "b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+
+        def replay(*_a, cancel_check=None, **_k):
+            yield ("acp.session", {"sessionId": "s", "cwd": "x", "model": "m"})
+            time.sleep(0.3)
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        res_a = json.loads(cursor_edit("a", repo=str(repo_a), background=True,
+                                       progress_callback=None))
+        res_b = json.loads(cursor_edit("b", repo=str(repo_b), background=True,
+                                       progress_callback=None))
+        assert res_a["status"] == "running"
+        assert res_b["status"] == "running"
+        assert res_a["job_id"] != res_b["job_id"]
+        for rid in (res_a["job_id"], res_b["job_id"]):
+            assert clean_jobs.get(rid).done_event.wait(10)
+
+    def test_finished_job_releases_the_repo(self, clean_jobs, monkeypatch, tmp_path):
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        first = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert first["success"] is True
+        second = json.loads(cursor_edit("t2", repo=str(tmp_path), progress_callback=None))
+        assert second["success"] is True  # no rejection once settled
+
+
+class TestSessionContinuityAcrossAsync:
+    """G2: session_id survives the async boundary (status + payload +
+    interject registry)."""
+
+    def test_session_id_midrun_in_registry_and_in_completion_payload(
+        self, clean_jobs, clean_registry, monkeypatch, tmp_path
+    ):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id",
+                            lambda: "h-bg")
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=15, step_delay=0.05)
+        )
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        job = clean_jobs.get(res["job_id"])
+        assert job.hermes_session_id == "h-bg"
+
+        # Mid-run: session id visible via cursor_status AND eagerly persisted
+        # to the interject-resume registry (status "running").
+        assert _wait_until(lambda: job.cursor_session_id)
+        status = json.loads(cursor_status(res["job_id"]))
+        assert status["cursor_session_id"] == "s-bg"
+        entry = gc_sessions._registry.get("h-bg")
+        assert entry and entry["cursor_session_id"] == "s-bg"
+        assert entry["status"] == "running"
+
+        assert job.done_event.wait(10)
+        evt = _drain_completion_queue()[0]
+        assert evt["result"]["session_id"] == "s-bg"
+        assert evt["cursor_session_id"] == "s-bg"
+        # Clean completion settles the registry (not continuable).
+        assert gc_sessions._registry["h-bg"]["status"] == "completed"
+
+    def test_background_run_passes_session_id_to_run_acp(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        captured = {}
+
+        def recording(*args, **kwargs):
+            captured.update(kwargs)
+            yield ("acp.session", {"sessionId": "s-prior", "cwd": "x",
+                                   "model": "m", "resumed": True})
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", recording)
+        res = json.loads(cursor_edit(
+            "continue", repo=str(tmp_path), background=True,
+            progress_callback=None, session_id="s-prior",
+        ))
+        job = clean_jobs.get(res["job_id"])
+        assert job.done_event.wait(10)
+        assert captured["session_id"] == "s-prior"
+        evt = _drain_completion_queue()[0]
+        assert evt["result"]["session_id"] == "s-prior"
+        assert evt["result"]["resumed"] is True
+
+
+class TestAllTerminalStatesDeliver:
+    """G3: success, failure, cancel, timeout, and handshake errors each
+    deliver a distinct completion message — never a silent death."""
+
+    def _run_bg(self, clean_jobs, monkeypatch, tmp_path, replay):
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), background=True, progress_callback=None
+        ))
+        job = clean_jobs.get(res["job_id"])
+        assert job.done_event.wait(10)
+        events = _drain_completion_queue()
+        assert len(events) == 1, f"expected exactly one delivery, got {events}"
+        return job, events[0]
+
+    def test_completed_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, _replay_acp)
+        assert evt["status"] == "completed"
+        assert evt["result"]["success"] is True
+
+    def test_cancelled_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        def cancelling(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s", "cwd": "x", "model": "m"})
+            yield ("acp.result", {"stopReason": "cancelled"})
+
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, cancelling)
+        assert job.status == "cancelled"
+        assert evt["status"] == "cancelled"
+        assert "cancel" in evt["error"]
+        # Result parity with the sync tool: cancels report status "failed".
+        assert evt["result"]["status"] == "failed"
+
+    def test_timeout_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        def timing_out(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s", "cwd": "x", "model": "m"})
+            yield ("acp.error", {"error": "ACP run timed out after 5s", "timeout": True})
+
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, timing_out)
+        assert job.status == "timeout"
+        assert evt["status"] == "timeout"
+        assert "timed out" in evt["error"]
+        assert evt["result"]["status"] == "timeout"
+
+    def test_midrun_failure_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        def failing_midrun(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s", "cwd": "x", "model": "m"})
+            yield ("acp.error", {"error": "ACP connection failed mid-run: boom"})
+
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, failing_midrun)
+        assert job.status == "failed"
+        assert evt["status"] == "failed"
+        assert "boom" in evt["error"]
+
+    def test_handshake_failure_delivers(self, clean_jobs, monkeypatch, tmp_path):
+        def failing(*_a, **_k):
+            raise gc_acp.AcpError(
+                "ACP initialize handshake with cursor-agent failed (boom)"
+            )
+            yield  # pragma: no cover — make it a generator
+
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, failing)
+        assert job.status == "failed"
+        assert evt["status"] == "failed"
+        assert "handshake" in evt["error"]
+        assert evt["result"] == {
+            "success": False,
+            "error": "ACP initialize handshake with cursor-agent failed (boom)",
+        }
+
+    def test_terminal_messages_are_distinct(self, clean_jobs, monkeypatch, tmp_path):
+        """Each terminal state renders a message that names its state."""
+        from tools.process_registry import format_process_notification
+
+        job, evt = self._run_bg(clean_jobs, monkeypatch, tmp_path, _replay_acp)
+        completed_text = format_process_notification(evt)
+        assert "completed" in completed_text
+
+        def timing_out(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s", "cwd": "x", "model": "m"})
+            yield ("acp.error", {"error": "ACP run timed out after 5s", "timeout": True})
+
+        repo_b = tmp_path / "b"
+        repo_b.mkdir()
+        monkeypatch.setattr(gc_acp, "run_acp", timing_out)
+        res = json.loads(cursor_edit("t", repo=str(repo_b), background=True,
+                                     progress_callback=None))
+        jb = clean_jobs.get(res["job_id"])
+        assert jb.done_event.wait(10)
+        timeout_text = format_process_notification(_drain_completion_queue()[0])
+        assert "timeout" in timeout_text
+        assert timeout_text != completed_text
+
+
+class TestAutoPromote:
+    def test_sync_overrun_promotes_to_background(self, clean_jobs, monkeypatch, tmp_path):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=30, step_delay=0.05)
+        )
+        t0 = time.monotonic()
+        res = json.loads(cursor_edit(
+            "slow task", repo=str(tmp_path), progress_callback=None,
+            promote_after=0.3,
+        ))
+        elapsed = time.monotonic() - t0
+        assert res["status"] == "promoted"
+        assert res["success"] is True
+        assert res["background"] is True
+        assert res["job_id"].startswith("cursor_")
+        assert 0.3 <= elapsed < 1.0, f"promotion did not detach promptly ({elapsed:.2f}s)"
+
+        job = clean_jobs.get(res["job_id"])
+        assert job.detached and job.deliver
+        assert not job.done_event.is_set(), "run must continue after promotion"
+
+        # The detached run finishes and delivers like a background job.
+        assert job.done_event.wait(10)
+        assert job.status == "completed"
+        evt = _drain_completion_queue()[0]
+        assert evt["delegation_id"] == job.job_id
+        assert evt["result"]["files_changed_count"] == 2
+        assert evt["result"]["session_id"] == "s-bg"
+
+    def test_fast_sync_run_does_not_promote(self, clean_jobs, monkeypatch, tmp_path):
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), progress_callback=None, promote_after=30.0
+        ))
+        assert res["status"] == "completed"
+        assert res["files_changed_count"] == 2
+        assert _drain_completion_queue() == []
+
+    def test_promote_zero_disables_promotion(self, clean_jobs, monkeypatch, tmp_path):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=6, step_delay=0.05)
+        )
+        res = json.loads(cursor_edit(
+            "t", repo=str(tmp_path), progress_callback=None, promote_after=0
+        ))
+        assert res["status"] == "completed"  # blocked to completion
+        assert _drain_completion_queue() == []
+
+    def test_promotion_stops_streaming_through_the_dead_turn(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        """After detaching, nothing more may be emitted via the promoted
+        turn's progress callback — the buffer takes over."""
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=30, step_delay=0.05)
+        )
+        seen = []
+        res = json.loads(cursor_edit(
+            "slow", repo=str(tmp_path), promote_after=0.3,
+            progress_callback=lambda *a, **k: seen.append(a),
+        ))
+        assert res["status"] == "promoted"
+        emitted_at_promotion = len(seen)
+        job = clean_jobs.get(res["job_id"])
+        assert job.done_event.wait(10)
+        # A tiny in-flight emission race is tolerable; a stream that keeps
+        # going after detach is not.
+        assert len(seen) <= emitted_at_promotion + 1
+        assert job.progress_events > job.result["progress_events_emitted"]
+
+
+class TestSyncInterruptStillCancels:
+    def test_interrupt_mid_sync_run_cancels_natively(
+        self, clean_jobs, monkeypatch, tmp_path
+    ):
+        """The pre-background contract: an interrupt on the calling thread
+        cancels a synchronous run via cursor's native session/cancel."""
+        import threading as _threading
+
+        from tools.interrupt import set_interrupt
+
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _slow_replay_factory(repo, steps=100, step_delay=0.05)
+        )
+        tid = _threading.current_thread().ident
+
+        def delayed_interrupt():
+            time.sleep(0.4)
+            set_interrupt(True, tid)
+
+        t = _threading.Thread(target=delayed_interrupt)
+        t.start()
+        try:
+            result = json.loads(cursor_edit(
+                "t", repo=str(tmp_path), progress_callback=None, promote_after=0
+            ))
+        finally:
+            t.join()
+            set_interrupt(False, tid)
+
+        assert result["success"] is False
+        assert result["status"] == "failed"
+        assert "cancel" in result["error"]
+        job = clean_jobs.most_recent()
+        assert job.status == "cancelled"
+        # Sync cancels stay in-turn: no completion event.
+        assert _drain_completion_queue() == []
+
+
+class TestBackgroundSchemas:
+    def test_cursor_edit_schema_has_optional_background_param(self):
+        props = CURSOR_EDIT_SCHEMA["parameters"]["properties"]
+        assert props["background"]["type"] == "boolean"
+        assert "background" not in CURSOR_EDIT_SCHEMA["parameters"]["required"]
+        # The description steers the agent to background long-running work.
+        desc = CURSOR_EDIT_SCHEMA["description"]
+        assert "background=true" in desc
+        assert "60-90" in desc
+        assert "cursor_status" in desc
+
+    def test_cursor_status_schema_is_read_only_and_optional_job_id(self):
+        assert CURSOR_STATUS_SCHEMA["name"] == STATUS_TOOL_NAME
+        assert CURSOR_STATUS_SCHEMA["parameters"]["required"] == []
+        desc = CURSOR_STATUS_SCHEMA["description"].lower()
+        assert "read-only" in desc
+        assert "without" in desc  # ...interrupting it
+
+    def test_handler_maps_background_arg(self, clean_jobs, monkeypatch, tmp_path):
+        repo = str(gc_runner.resolve_repo(str(tmp_path)))
+        monkeypatch.setattr(gc_acp, "run_acp", _slow_replay_factory(repo, steps=2))
+        from plugins.ghost_cursor import _handle_cursor_edit, _handle_cursor_status
+
+        res = json.loads(_handle_cursor_edit(
+            {"task": "t", "repo": str(tmp_path), "background": True}
+        ))
+        assert res["status"] == "running"
+        status = json.loads(_handle_cursor_status({"job_id": res["job_id"]}))
+        assert status["success"] is True
+        assert status["job_id"] == res["job_id"]
+        clean_jobs.get(res["job_id"]).done_event.wait(10)
+
+
+class TestProgressBuffer:
+    def test_buffer_accumulates_and_rolls(self, clean_jobs):
+        job = gc_jobs.CursorJob(job_id="cursor_test", task="t", repo="/r", timeout=60)
+        monkey_cap = 500
+        old_cap = gc_jobs.MAX_PROGRESS_CHARS
+        gc_jobs.MAX_PROGRESS_CHARS = monkey_cap
+        try:
+            for i in range(100):
+                job.append_progress({"kind": "lifecycle", "event": "reasoning",
+                                     "text": f"chunk {i:03d} " + "x" * 40})
+            assert len(job.progress_buffer) <= monkey_cap
+            assert job.progress_events == 100
+            # Oldest entries rolled out, newest survive.
+            assert "chunk 099" in job.progress_buffer
+            assert "chunk 000" not in job.progress_buffer
+            # Rolling trims at a line boundary — every line stays valid JSON.
+            for line in job.progress_buffer.strip().splitlines():
+                json.loads(line)
+        finally:
+            gc_jobs.MAX_PROGRESS_CHARS = old_cap
+
+    def test_buffer_drops_full_file_content_but_keeps_diff(self, clean_jobs):
+        job = gc_jobs.CursorJob(job_id="cursor_test2", task="t", repo="/r", timeout=60)
+        job.append_progress({
+            "kind": "file_diff", "path": "/r/f.py",
+            "before": "B" * 10_000, "after": "A" * 10_000,
+            "diff": "+line\n" * 1_000, "added": 1000, "removed": 0, "status": "M",
+        })
+        line = json.loads(job.progress_buffer.strip())
+        assert "before" not in line and "after" not in line
+        assert line["path"] == "/r/f.py"
+        assert len(line["diff"]) <= gc_jobs._BUFFER_DIFF_CHARS + 40

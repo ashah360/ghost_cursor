@@ -110,6 +110,17 @@ So the flow is: run a task → interrupt it → send a nudge → it picks up the
 
 Honest label: this is *interject/steer*, not seamless queuing — there's a cancel boundary, so work in flight at the moment of interruption is discarded, then continued from the nudge with context intact.
 
+## Background mode — don't block the conversation
+
+By default `cursor_edit` runs synchronously (best for quick edits — you see the diff in the same turn). For longer work, pass **`background: true`**: the tool dispatches a tracked job and returns immediately with a `job_id`, so **the conversation stays free** — you can keep talking to the agent without interrupting (or killing) the running cursor job.
+
+- **`cursor_status(job_id?)`** — a **strictly read-only** progress view: current status, files touched so far with per-edit diffs, latest reasoning, `session_id`, elapsed. Polling it **never cancels** the job (that property is tested, not assumed — it was the exact footgun that killed foreground runs). Omit `job_id` for the most recent job in this session+repo.
+- **Completion delivery** — when the job ends it delivers a message into the session for **every terminal state** (success, failure, cursor error, timeout, cancelled) — never a silent death. The payload carries the full result (`files_changed`, `session_id`, …) so resume/interject still work across the async boundary.
+- **Auto-promote-on-overrun** — a synchronous run that exceeds a soft threshold (default 90s, `plugins.ghost_cursor.promote_after_seconds` in config.yaml, 0 disables) is detached to a background job instead of blocking — belt-and-suspenders for a misjudged sync run.
+- **Same-repo concurrency guard** — a second background run against a repo that already has an active job is rejected (two agents on one working tree = corruption).
+
+Why this matters: a synchronous tool holds the conversation turn open for the whole run, so messaging the agent mid-run triggers an interrupt that cancels the turn — and the cursor work with it. Background mode decouples the run from the turn, so "how's it going?" becomes a safe read instead of a kill.
+
 ## How live progress works (no core patch)
 
 A registry-dispatched tool handler isn't handed the calling `AIAgent`, but Hermes installs the agent's `_touch_activity` as a thread-local activity callback right before each tool dispatch. `_resolve_progress_callback()` reads that thread-local, walks `__self__` back to the live agent, and uses its `tool_progress_callback`. Each emission is:
