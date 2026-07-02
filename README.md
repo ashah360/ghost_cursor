@@ -21,15 +21,18 @@ The obvious way to drive `cursor-agent` from another program is `cursor-agent -p
 
 The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
-## What you get
+## What you get (v0.3 — session-handle interface)
 
-- **`cursor_edit(task, repo?, session_id?)`** — delegate a coding task; Cursor edits real files in `repo`.
-- **Multi-turn resume** — every result returns a `session_id`; pass it back on the next call to **continue that Cursor session with full prior context** (refine, fix, iterate). Under the hood it uses ACP `session/load`; if the session expired it falls back to a fresh one (`resumed: false`) rather than erroring. Omit `session_id` for a one-shot.
-- **Live streaming** — reasoning fragments + per-edit `file_diff`s (path / before / after / unified diff / +added / −removed) emitted as they happen, via the calling agent's `tool_progress_callback`.
-- **Structured result** — `{success, status, repo, summary, files_changed:[{path, added, removed, status, diff}], files_changed_count, live_progress, session_id, resumed, ...}`.
-- **Native cancel** — an interrupt sends ACP `session/cancel`, waits briefly, then hard-terminates.
-- **Git-diff fallback** — for shell-driven edits the ACP stream didn't carry a diff for, diffs are recovered from `git`.
-- **`check_fn`** — the tool only appears when the `cursor-agent` binary is installed.
+Four explicit tools mirroring Hermes's `terminal`/`process` split. The single handle is the cursor **`session_id`**, returned by `cursor_start` and passed to the rest.
+
+- **`cursor_start(task, repo, model?, session_id?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (ACP `session/load`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor-agent model (config fallback: `plugins.ghost_cursor.model`).
+- **`cursor_send(session_id, message)`** — steer / follow up. Honest semantics: Cursor's ACP has **no true queue** — this interrupts the current prompt (`session/cancel`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
+- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed. Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
+- **`cursor_stop(session_id)`** — graceful `session/cancel`, SIGKILL only on hang. Returns final status + partial `files_changed`.
+
+Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state (success/fail/error/timeout/cancel), **same-repo concurrency guard** (a second `cursor_start` on a repo with an active handle is rejected — two agents on one tree = corruption; different repos run in parallel), **handle persistence** across turns (a JSON table under `<HERMES_HOME>/state/`), **git-diff fallback** for shell-driven edits, and a **`check_fn`** so the tools only appear when `cursor-agent` is installed.
+
+> Migrating from v0.2? The single blocking `cursor_edit` + hidden auto-resume registry are **gone** (breaking). Start work with `cursor_start`, resume by passing the handle back — no repo+timestamp heuristic guessing which session to continue.
 
 ## Requirements
 
@@ -44,21 +47,22 @@ Drop the plugin into your Hermes plugins directory and enable it:
 ```bash
 # 1. copy the plugin
 mkdir -p ~/.hermes/plugins/ghost_cursor
-cp __init__.py acp_runner.py events.py runner.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
+cp __init__.py acp_runner.py events.py runner.py jobs.py handles.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
 
 # 2. enable it in ~/.hermes/config.yaml
 #    plugins:
 #      enabled:
 #        - ghost_cursor
 
-# 3. restart the gateway so the tool loads
+# 3. restart the gateway so the tools load
 hermes gateway restart
 ```
 
 Verify it registered:
 
 ```bash
-# cursor_edit should show up as a tool once cursor-agent is on PATH
+# cursor_start / cursor_send / cursor_status / cursor_stop should show up
+# as tools once cursor-agent is on PATH
 ```
 
 ## Usage

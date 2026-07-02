@@ -118,6 +118,7 @@ class _AcpClient:
         cancel_requested: threading.Event,
         timeout: float,
         session_id: Optional[str] = None,
+        model: Optional[str] = None,
     ) -> None:
         self._task = task
         self._workdir = workdir
@@ -126,6 +127,15 @@ class _AcpClient:
         self._timeout = timeout
         # Prior cursor session to continue via session/load (None = fresh).
         self._resume_session_id = session_id
+        # Model override. INSTRUMENTED (2026-07-02, cursor-agent
+        # 2026.07.01-777f564): passing `model`/`modelId` in session/new
+        # params is silently ignored, and `session/set_model` rejects plain
+        # model ids ("Invalid model value") — but the global `--model` flag
+        # on the `cursor-agent ... acp` invocation IS honored (session/new
+        # reports it as models.currentModelId). So the override rides the
+        # argv. Caveat: cursor-agent persists the flag as its new default
+        # for later flag-less runs (upstream behavior).
+        self._model = (str(model).strip() or None) if model else None
         # "cancel" | "timeout" — written by the consumer thread before it sets
         # cancel_requested (single write, read after the event fires).
         self.abort_reason: Optional[str] = None
@@ -171,10 +181,12 @@ class _AcpClient:
     # -- child process -----------------------------------------------------
 
     async def _spawn(self) -> None:
+        argv: List[str] = [CURSOR_AGENT_BIN, "--trust"]
+        if self._model:
+            argv += ["--model", self._model]
+        argv.append("acp")
         self._proc = await asyncio.create_subprocess_exec(
-            CURSOR_AGENT_BIN,
-            "--trust",
-            "acp",
+            *argv,
             cwd=str(self._workdir),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
@@ -522,6 +534,7 @@ def run_acp(
     timeout: float = DEFAULT_TIMEOUT_S,
     cancel_check: Optional[Callable[[], bool]] = None,
     session_id: Optional[str] = None,
+    model: Optional[str] = None,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Run cursor-agent on ``task`` inside ``repo`` over ACP, yielding events.
 
@@ -534,6 +547,11 @@ def run_acp(
     (multi-turn). If the load fails (expired/unknown id), the run falls back
     to a fresh ``session/new`` — the ``acp.session`` event's ``resumed``
     field reports what actually happened.
+
+    ``model`` overrides the cursor-agent model for this run. Instrumented:
+    the ACP session/new params do NOT accept a model, so the override is
+    passed as ``--model`` on the cursor-agent invocation (see _AcpClient);
+    the session's actual model comes back on the ``acp.session`` event.
 
     Raises:
         HarnessError: empty task / bad repo (preflight).
@@ -554,6 +572,7 @@ def run_acp(
         cancel_requested=cancel_requested,
         timeout=float(timeout),
         session_id=(str(session_id).strip() or None) if session_id else None,
+        model=model,
     )
     thread = threading.Thread(
         target=lambda: asyncio.run(client.run()),

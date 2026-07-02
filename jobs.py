@@ -1,27 +1,26 @@
-"""Background job registry for ``cursor_edit`` — decouple cursor runs from turns.
+"""Job table for cursor runs — one entry per dispatched run, keyed by handle.
 
-Why this exists
----------------
-The synchronous ``cursor_edit`` holds the Hermes turn open for the whole
-cursor run (minutes). While the turn is open the only way the user can talk
-to the agent is an out-of-band interrupt — which cancels the turn and kills
-the running cursor session. This module lets a cursor run execute as a
-tracked BACKGROUND JOB decoupled from the turn: the tool returns a job handle
-immediately, chat stays free, progress accumulates in a readable rolling
-buffer (mirroring ``tools/process_registry``'s output-buffer pattern), and
-completion is delivered into the session as a NEW message when the job ends.
+v0.3 session-handle model
+-------------------------
+Every cursor run executes as a background :class:`CursorJob` on a worker
+thread. The SINGLE public handle for a run is the cursor ``session_id``
+(minted by ACP ``session/new``, surfaced at the ``acp.session`` event):
+``cursor_start`` returns it, and ``cursor_send`` / ``cursor_status`` /
+``cursor_stop`` take it back. This registry is the in-process job table
+behind that handle — rolling progress buffer, status, files-changed
+aggregation, and deliver-on-complete. A tiny JSON persistence layer
+(``handles.py``) mirrors handle → status/repo across process restarts;
+the live job state itself is process-local (like async delegation).
 
-Every ``cursor_edit`` run — synchronous or background — executes on a worker
-thread as a :class:`CursorJob`. The synchronous path simply *waits* on the
-job (proxying the caller's interrupt flag to the job's cancel event), which
-is what makes auto-promote-on-overrun a clean detach: promotion just stops
-waiting; the run genuinely continues on its worker thread.
+There is deliberately NO auto-resume heuristic here (the v0.2
+``session_registry`` repo+timestamp guesswork is gone). Lookup is by
+explicit handle only: :meth:`CursorJobRegistry.get_by_session`.
 
 Completion delivery (reuses core infra — nothing reinvented)
 ------------------------------------------------------------
 On EVERY terminal state (completed / failed / cancelled / timeout — never
-silent), a job whose delivery flag is set pushes an event onto the shared
-``tools.process_registry.process_registry.completion_queue`` with
+silent), a job whose delivery flag is still set pushes an event onto the
+shared ``tools.process_registry.process_registry.completion_queue`` with
 ``type="async_delegation"`` — the exact rail ``delegate_task(background=true)``
 uses (see ``tools/async_delegation.py``). The CLI ``process_loop`` drain and
 the gateway's ``_async_delegation_watcher`` already consume that queue while
@@ -30,21 +29,28 @@ message-role alternation legal and the prompt cache intact. The event's
 ``session_key`` (captured on the dispatching thread) routes it back to the
 originating gateway session; an empty key means CLI.
 
+Delivery is ARMED, not assumed: a job is dispatched with ``deliver=False``
+and the dispatching tool arms it (:meth:`CursorJob.arm_delivery`) only
+after it has returned the running-handle shape to the caller. A run that
+reaches a terminal state BEFORE that (handshake failure, ultra-fast
+completion) is reported in-turn by the dispatching tool itself — arming
+races finalize under the job lock, so the outcome lands exactly once:
+either in the tool result or as a delivered message, never both, never
+neither. Symmetrically, when ``cursor_stop`` / ``cursor_send`` settle a
+run in-turn they disarm delivery first (:meth:`CursorJob.mark_handled`).
+
 The completion payload carries the FULL final result dict (success / status /
 summary / files_changed / session_id / resumed) both as a structured
 ``result`` field and rendered into the human-readable ``summary`` block, so
-multi-turn continuation (pass ``session_id`` back to ``cursor_edit``)
-survives the async boundary.
+continuation (pass ``session_id`` to ``cursor_send``) survives the async
+boundary.
 
-Concurrency guard (G1)
-----------------------
+Concurrency guard (same repo)
+-----------------------------
 Two agents editing one working tree corrupts it. ``dispatch()`` atomically
 rejects a new job when an active job already holds the same resolved repo,
-returning the existing job so the caller can point at it.
-
-State is process-local (like async delegation): jobs do not survive a
-restart. The cursor session id is still persisted eagerly through
-``session_registry`` so interject/auto-resume works across processes.
+returning the existing job so the caller can surface its handle. Parallel
+runs on DIFFERENT repos are fine — different handles.
 """
 
 from __future__ import annotations
@@ -57,6 +63,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from plugins.ghost_cursor import handles as _handles
+
 logger = logging.getLogger(__name__)
 
 # Rolling progress buffer cap — mirrors process_registry.MAX_OUTPUT_CHARS.
@@ -65,7 +73,7 @@ MAX_PROGRESS_CHARS = 200_000
 MAX_FINISHED_JOBS = 20
 
 # Per-envelope trims for the rolling buffer (full-fidelity diffs live in the
-# job's ``files`` aggregation, same caps as the sync result).
+# job's ``files`` aggregation, same caps as the final result).
 _BUFFER_DIFF_CHARS = 2_000
 _BUFFER_OUTPUT_CHARS = 1_000
 # Trims for the completion payload / status snapshots.
@@ -105,33 +113,28 @@ def trim_result(result: Dict[str, Any]) -> Dict[str, Any]:
 
 @dataclass
 class CursorJob:
-    """One cursor run — sync-waited, background, or promoted mid-run."""
+    """One dispatched cursor run (always a background worker thread)."""
 
-    job_id: str
+    job_id: str  # internal dispatch id; the PUBLIC handle is cursor_session_id
     task: str
     repo: str
     timeout: float
-    hermes_session_id: str = ""
     session_key: str = ""
     requested_session_id: Optional[str] = None
-    auto_resumed: bool = False
-    background: bool = False          # dispatched with background=True
-    detached: bool = False            # promoted from a sync wait (overrun)
-    deliver: bool = False             # push a completion event at finalize
-    live_progress: bool = False       # sync runs stream via the agent pcb
+    requested_model: Optional[str] = None
+    deliver: bool = False             # armed by the dispatching tool (see module doc)
     status: str = "running"
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
-    cursor_session_id: str = ""
+    cursor_session_id: str = ""       # THE handle, set at acp.session
     resumed: bool = False
-    model: str = ""
+    model: str = ""                   # actual model reported by acp.session
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     assistant_parts: List[str] = field(default_factory=list)
     reasoning_tail: str = ""
     progress_buffer: str = ""
     progress_events: int = 0
-    emitted: int = 0
     run_error: Optional[str] = None
     timed_out: bool = False
     completed: bool = False
@@ -140,35 +143,46 @@ class CursorJob:
     # --- control ---
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
+    # Set the instant the ACP session is established (handle available).
+    session_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
 
     # -- control -------------------------------------------------------------
 
-    def emit_live(self) -> bool:
-        """Whether progress should still stream through the caller's pcb.
-
-        Background jobs never stream (their turn already ended); a promoted
-        job stops streaming the moment it detaches from the waiting turn.
-        """
-        return not (self.background or self.detached)
-
     def request_cancel(self) -> None:
         """Ask the run to stop via cursor's native session/cancel path."""
         self.cancel_event.set()
 
-    def detach(self) -> bool:
-        """Promote a sync-waited job to background delivery.
+    def arm_delivery(self) -> bool:
+        """Turn on completion delivery for this run.
 
-        Returns False when the job already reached a terminal state (the
-        caller should return the final result instead). Atomic with respect
-        to finalize: whichever wins the lock decides who reports the result.
+        Called by the dispatching tool AFTER it has handed the running
+        handle back to the caller — from then on the outcome must arrive as
+        a delivered message. Returns False when the job already reached a
+        terminal state (finalize won the race with ``deliver`` still False,
+        so nothing was enqueued and the caller must report the final result
+        in-turn instead). Atomic with respect to finalize via the job lock.
         """
         with self._lock:
             if self.status in TERMINAL_STATUSES:
                 return False
-            self.detached = True
             self.deliver = True
+            return True
+
+    def mark_handled(self) -> bool:
+        """Suppress completion delivery — the caller reports the outcome in-turn.
+
+        Used by ``cursor_stop`` / ``cursor_send`` before they cancel: the
+        terminal state reaches the conversation through the tool result, so
+        the async delivery would be a duplicate message. Returns False when
+        the job already reached a terminal state (finalize won the race —
+        delivery may already have fired; the caller just reads the result).
+        """
+        with self._lock:
+            if self.status in TERMINAL_STATUSES:
+                return False
+            self.deliver = False
             return True
 
     # -- progress buffer -------------------------------------------------------
@@ -215,16 +229,17 @@ class CursorJob:
                     entry["diff"] = _clip(entry["diff"], _PAYLOAD_DIFF_CHARS)
                 files.append(entry)
             snap: Dict[str, Any] = {
-                "job_id": self.job_id,
+                "session_id": self.cursor_session_id,
                 "status": self.status,
                 "repo": self.repo,
                 "task": _clip(self.task, 400),
-                "background": bool(self.background or self.detached),
-                "promoted": self.detached,
                 "elapsed_s": round((self.finished_at or now) - self.created_at, 1),
                 "cursor_session_id": self.cursor_session_id,
                 "resumed": self.resumed,
-                "auto_resumed": self.auto_resumed,
+                "model": self.model or (self.requested_model or ""),
+                "summary_so_far": _clip(
+                    "".join(self.assistant_parts).strip(), _PAYLOAD_SUMMARY_CHARS
+                ),
                 "files_changed_so_far": files,
                 "files_changed_count": len(files),
                 "latest_reasoning": self.reasoning_tail[-1500:],
@@ -252,12 +267,9 @@ class CursorJobRegistry:
         task: str,
         repo: str,
         timeout: float,
-        hermes_session_id: str = "",
         session_key: str = "",
         requested_session_id: Optional[str] = None,
-        auto_resumed: bool = False,
-        background: bool = False,
-        live_progress: bool = False,
+        requested_model: Optional[str] = None,
     ) -> Tuple[Optional[CursorJob], Optional[CursorJob]]:
         """Start a cursor run on a worker thread.
 
@@ -272,13 +284,9 @@ class CursorJobRegistry:
             task=task,
             repo=repo,
             timeout=timeout,
-            hermes_session_id=hermes_session_id or "",
             session_key=session_key or "",
             requested_session_id=requested_session_id,
-            auto_resumed=auto_resumed,
-            background=background,
-            deliver=background,
-            live_progress=live_progress,
+            requested_model=requested_model,
         )
         with self._lock:
             existing = self._find_active_for_repo_locked(repo)
@@ -296,8 +304,8 @@ class CursorJobRegistry:
         job._thread = thread
         thread.start()
         logger.info(
-            "Dispatched cursor job %s (background=%s, repo=%s): %.80s",
-            job.job_id, background, repo, task,
+            "Dispatched cursor run %s (repo=%s, resume=%s): %.80s",
+            job.job_id, repo, requested_session_id or "-", task,
         )
         return job, None
 
@@ -319,10 +327,10 @@ class CursorJobRegistry:
     def _terminal_status(job: CursorJob, result: Dict[str, Any]) -> str:
         """Map a final result dict onto the job's terminal status.
 
-        The result dict itself keeps the synchronous tool's exact status
-        vocabulary (a native cancel is result status "failed" — unchanged);
-        the JOB status distinguishes "cancelled" so status queries and the
-        completion message name the real terminal state.
+        The result dict itself keeps the run's exact status vocabulary (a
+        native cancel is result status "failed" — unchanged); the JOB status
+        distinguishes "cancelled" so status queries and the completion
+        message name the real terminal state.
         """
         st = str(result.get("status") or "")
         if st == "timeout":
@@ -334,11 +342,12 @@ class CursorJobRegistry:
         return "failed"
 
     def _finalize(self, job: CursorJob, result: Dict[str, Any]) -> None:
-        """Settle the job and, when delivery is on, push the completion event.
+        """Settle the job and, when delivery is still on, push the completion.
 
         The status write and the delivery-flag read share one lock hold so a
-        concurrent ``detach()`` either lands before (delivery fires) or loses
-        (the sync waiter returns the final result itself) — never neither.
+        concurrent ``mark_handled()`` either lands before (delivery is
+        suppressed, the caller reports in-turn) or loses (delivery fires) —
+        never neither.
         """
         status = self._terminal_status(job, result)
         with job._lock:
@@ -349,12 +358,19 @@ class CursorJobRegistry:
             job.finished_at = time.time()
             deliver = job.deliver
         logger.info("Cursor job %s finished: %s (deliver=%s)", job.job_id, status, deliver)
+        # Settle the persistent handle table so the handle stays resolvable
+        # (and correctly non-running) across process restarts.
+        if job.cursor_session_id:
+            _handles.record(job.cursor_session_id, status=status)
         # Enqueue BEFORE signalling done: anyone who observes the job as
-        # finished (sync waiter, tests, drains) must also find the completion
+        # finished (waiters, tests, drains) must also find the completion
         # event already on the queue — no observe-then-miss window.
         if deliver:
             self._push_completion_event(job, result)
         job.done_event.set()
+        # Unblock anyone still waiting for a session that will never come
+        # (e.g. handshake failure before acp.session).
+        job.session_event.set()
 
     def _push_completion_event(self, job: CursorJob, result: Dict[str, Any]) -> None:
         """Deliver the terminal result into the originating session.
@@ -363,7 +379,8 @@ class CursorJobRegistry:
         ``type="async_delegation"`` event — the same rail
         ``delegate_task(background=true)`` uses, already drained by the CLI
         process_loop and the gateway's async-delegation watcher and injected
-        as a fresh turn. Fires for EVERY terminal state; a failure to enqueue
+        as a fresh turn. Fires for EVERY terminal state (unless the outcome
+        was already reported in-turn via mark_handled); a failure to enqueue
         is logged loudly because it would mean a silently-lost result.
         """
         try:
@@ -378,13 +395,13 @@ class CursorJobRegistry:
         payload_result = trim_result(result)
         evt = {
             "type": "async_delegation",
-            "delegation_id": job.job_id,
+            "delegation_id": job.cursor_session_id or job.job_id,
             "session_key": job.session_key,
-            "goal": f"cursor_edit (background): {_clip(job.task, 200)}",
+            "goal": f"cursor_start: {_clip(job.task, 200)}",
             "context": None,
             "toolsets": None,
             "role": "cursor",
-            "model": job.model or "cursor-agent",
+            "model": job.model or job.requested_model or "cursor-agent",
             "status": job.status,
             "summary": self._completion_summary(job, result),
             "error": result.get("error"),
@@ -412,7 +429,7 @@ class CursorJobRegistry:
     def _completion_summary(job: CursorJob, result: Dict[str, Any]) -> str:
         """Human-readable completion block, distinct per terminal state."""
         lines = [
-            f"Background cursor_edit job {job.job_id} finished — status: {job.status}.",
+            f"Cursor run finished — status: {job.status}.",
             f"Repo: {job.repo}",
         ]
         files = result.get("files_changed") or []
@@ -429,8 +446,10 @@ class CursorJobRegistry:
         sid = result.get("session_id") or job.cursor_session_id
         if sid:
             lines.append(
-                f"Cursor session_id: {sid} — pass it back as `session_id` to "
-                "cursor_edit to continue this cursor session with full prior context."
+                f"Cursor session_id: {sid} — pass it to cursor_send for "
+                "follow-up work in this cursor session, or to "
+                "cursor_start(session_id=...) for a new task with this "
+                "session's context."
             )
         if result.get("error"):
             lines.append(f"Error: {result['error']}")
@@ -443,6 +462,27 @@ class CursorJobRegistry:
     def get(self, job_id: str) -> Optional[CursorJob]:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def get_by_session(self, session_id: str) -> Optional[CursorJob]:
+        """The newest job for a cursor session handle (explicit lookup only).
+
+        Matches the ESTABLISHED handle first; falls back to the REQUESTED
+        resume handle so a just-dispatched continuation (``cursor_send`` /
+        resume) is addressable in the window before its ``acp.session``
+        event fires.
+        """
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        for job in jobs:
+            if job.cursor_session_id == sid:
+                return job
+        for job in jobs:
+            if not job.cursor_session_id and job.requested_session_id == sid:
+                return job
+        return None
 
     def list_jobs(self) -> List[CursorJob]:
         with self._lock:
@@ -465,34 +505,10 @@ class CursorJobRegistry:
                 job.run_error = job.run_error or "worker thread died without finalizing"
                 job.finished_at = job.finished_at or time.time()
                 job.done_event.set()
+                job.session_event.set()
                 continue
             return job
         return None
-
-    def most_recent(self, hermes_session_id: Optional[str] = None) -> Optional[CursorJob]:
-        """The job ``cursor_status`` should report when no job_id was given.
-
-        Preference order: a running job for this Hermes session, any running
-        job, the most recent job for this session, the most recent job.
-        """
-        with self._lock:
-            jobs = list(self._jobs.values())
-        if not jobs:
-            return None
-        sid = str(hermes_session_id or "")
-        newest = lambda seq: max(seq, key=lambda j: j.created_at)  # noqa: E731
-        running = [j for j in jobs if j.status == "running"]
-        if sid:
-            mine_running = [j for j in running if j.hermes_session_id == sid]
-            if mine_running:
-                return newest(mine_running)
-        if running:
-            return newest(running)
-        if sid:
-            mine = [j for j in jobs if j.hermes_session_id == sid]
-            if mine:
-                return newest(mine)
-        return newest(jobs)
 
     # -- housekeeping ------------------------------------------------------------
 

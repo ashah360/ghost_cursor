@@ -1,8 +1,10 @@
 name: ghost_cursor
 version: 0.3.0
-description: "Delegate coding tasks to the Cursor agent (cursor-agent CLI over ACP — JSON-RPC on stdio). Registers two tools: `cursor_edit` runs cursor-agent inside a target repo (synchronously, or as a non-blocking background job via background=true / auto-promote-on-overrun), streams per-edit progress (reasoning + file diffs), and returns a structured summary of files changed — background completions are delivered into the session on every terminal state via the shared completion queue; `cursor_status` is a strictly read-only live-progress view over running/finished jobs. Native session/cancel on interrupt; same-repo concurrency guarded. Tools gate on the cursor-agent binary being installed."
+description: "Delegate coding tasks to the Cursor agent (cursor-agent CLI over ACP — JSON-RPC on stdio) via explicit session handles. Four tools mirroring the terminal/process split: `cursor_start` dispatches a run and returns its cursor session_id handle immediately (optional model override, optional session_id to continue a prior session via session/load); `cursor_send` steers or follows up (honest interrupt-and-re-prompt semantics — cursor has no queue); `cursor_status` is a strictly read-only progress view (never cancels); `cursor_stop` cancels gracefully (native session/cancel, SIGKILL only on hang) and returns partial results. Completions are delivered into the session on every terminal state via the shared completion queue, keyed by the handle. Same-repo concurrency guarded; different repos run in parallel. Tools gate on the cursor-agent binary being installed. BREAKING vs 0.2: cursor_edit and the repo+timestamp auto-resume registry are removed — resume is explicit via the handle."
 author: Arman
 kind: backend
 provides_tools:
-  - cursor_edit
+  - cursor_start
+  - cursor_send
   - cursor_status
+  - cursor_stop
