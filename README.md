@@ -102,6 +102,14 @@ If the prior session is gone (Cursor restarted, id expired), call 2 transparentl
 
 > Note: this is cross-turn *resume* (continue between calls), not mid-flight steering — you can't inject a nudge into a prompt that's currently running; cancel and re-prompt (with the same `session_id`) for that.
 
+## Interject — steer a running task mid-flight
+
+Cursor's ACP has no true mid-prompt queue (a second prompt cancels and replaces the first), so "interject" is built as **stop + auto-resume**: when a `cursor_edit` run is interrupted, its cursor `session_id` is eagerly persisted to a small registry (keyed by the calling session + repo). The **next** `cursor_edit` in the same session/repo — with **no** explicit `session_id` — automatically continues that interrupted cursor session, folding your new instruction in with full prior context.
+
+So the flow is: run a task → interrupt it → send a nudge → it picks up the same cursor session and keeps going. No id-threading required. Guards: auto-resume only fires for a recently interrupted run (≤10 min, cancelled/running) — a cleanly *completed* run is never auto-resumed, so an unrelated next task starts fresh. Passing `session_id` explicitly always overrides. The result reports `auto_resumed: true` when this kicked in.
+
+Honest label: this is *interject/steer*, not seamless queuing — there's a cancel boundary, so work in flight at the moment of interruption is discarded, then continued from the nudge with context intact.
+
 ## How live progress works (no core patch)
 
 A registry-dispatched tool handler isn't handed the calling `AIAgent`, but Hermes installs the agent's `_touch_activity` as a thread-local activity callback right before each tool dispatch. `_resolve_progress_callback()` reads that thread-local, walks `__self__` back to the live agent, and uses its `tool_progress_callback`. Each emission is:

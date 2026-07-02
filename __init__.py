@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Optional
 from plugins.ghost_cursor import acp_runner as _acp
 from plugins.ghost_cursor import events as _events
 from plugins.ghost_cursor import runner as _runner
+from plugins.ghost_cursor import session_registry as _sessions
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,10 @@ CURSOR_EDIT_SCHEMA = {
         "diffs). The result also includes a `session_id` — for iterative or "
         "follow-up work on the same task (refine, fix, review feedback), pass "
         "it back as `session_id` to continue that cursor session with full "
-        "prior context instead of starting fresh."
+        "prior context instead of starting fresh. If a cursor run in the same "
+        "repo was recently interrupted (stopped mid-flight), the next call "
+        "auto-continues that session — so a mid-run nudge just works; passing "
+        "`session_id` explicitly overrides this."
     ),
     "parameters": {
         "type": "object",
@@ -127,8 +131,39 @@ def check_cursor_edit_available() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Progress emission
+# Calling-agent resolution (progress callback + Hermes session id)
 # ---------------------------------------------------------------------------
+
+def _resolve_hermes_session_id() -> Optional[str]:
+    """Locate the calling Hermes session id (best-effort, may be None).
+
+    Same resolution path as :func:`_resolve_progress_callback` — the
+    thread-local activity callback's ``__self__`` is the live ``AIAgent``,
+    whose ``session_id`` keys the interject-resume registry. When no agent
+    is reachable, return None and the registry degrades to a no-op.
+    """
+    try:
+        from tools.environments.base import _get_activity_callback
+
+        cb = _get_activity_callback()
+        agent = getattr(cb, "__self__", None)
+        sid = getattr(agent, "session_id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        cli = getattr(get_plugin_manager(), "_cli_ref", None)
+        agent = getattr(cli, "agent", None)
+        sid = getattr(agent, "session_id", None)
+        if sid:
+            return str(sid)
+    except Exception:
+        pass
+    return None
+
 
 def _resolve_progress_callback() -> Optional[Callable]:
     """Locate the calling agent's ``tool_progress_callback`` (best-effort).
@@ -204,6 +239,13 @@ def cursor_edit(
     tests and direct harness invocation). ``session_id`` continues a prior
     cursor session (multi-turn) via ACP ``session/load``; the result's
     ``session_id`` / ``resumed`` fields report the session actually used.
+
+    Interject-via-resume: when no explicit ``session_id`` is passed and the
+    session registry holds a recent interrupted cursor run for the calling
+    Hermes session + repo, that session is auto-resumed (``auto_resumed`` is
+    True in the result). The active cursor session id is recorded eagerly the
+    moment ACP establishes it — before the prompt streams — so a stop that
+    discards this tool result still leaves the id behind for the next call.
     """
     if not str(task or "").strip():
         return json.dumps({"success": False, "error": "task is required"})
@@ -223,6 +265,17 @@ def cursor_edit(
         return json.dumps({"success": False, "error": str(exc)})
 
     pcb = progress_callback if progress_callback is not None else _resolve_progress_callback()
+
+    # Interject-via-resume: when the caller passed no explicit session_id,
+    # auto-resume a recently interrupted cursor run for this Hermes
+    # session + repo (see session_registry). Explicit session_id wins.
+    hermes_sid = _resolve_hermes_session_id()
+    auto_resumed = False
+    if not str(session_id or "").strip():
+        prior = _sessions.get_recent(hermes_sid, str(workdir))
+        if prior:
+            session_id = prior
+            auto_resumed = True
 
     started = time.monotonic()
     emitted = 0
@@ -282,6 +335,12 @@ def cursor_edit(
                 # continuation; the normalizer only folds it into lifecycle.
                 result_session_id = str(obj.get("sessionId") or "")
                 resumed = bool(obj.get("resumed"))
+                # Eager persistence: record the instant ACP establishes the
+                # session (before the prompt streams), so an interrupt that
+                # discards this tool result still leaves the id resumable.
+                _sessions.record(
+                    hermes_sid, result_session_id, str(workdir), "running"
+                )
             for envelope in normalizer.normalize(key, obj):
                 _fold(envelope)
     except _acp.AcpError as exc:
@@ -305,9 +364,21 @@ def cursor_edit(
     duration_ms = int((time.monotonic() - started) * 1000)
     files_changed = sorted(files.values(), key=lambda f: f["path"])
     prose = "".join(assistant_parts).strip()
+    success = completed and run_error is None
+
+    # Settle the registry: a clean completion is NOT continuable (a later
+    # unrelated task must start fresh); anything else — cancel, timeout,
+    # interrupt, mid-run crash — is, so the next cursor_edit can resume it.
+    if result_session_id:
+        _sessions.record(
+            hermes_sid,
+            result_session_id,
+            str(workdir),
+            "completed" if success else "cancelled",
+        )
 
     result: Dict[str, Any] = {
-        "success": completed and run_error is None,
+        "success": success,
         "status": "timeout" if timed_out else ("completed" if completed and not run_error else "failed"),
         "repo": str(workdir),
         "summary": prose or ("(no assistant summary)" if not run_error else ""),
@@ -318,6 +389,7 @@ def cursor_edit(
         "progress_events_emitted": emitted,
         "session_id": result_session_id,
         "resumed": resumed,
+        "auto_resumed": auto_resumed,
     }
     if run_error:
         result["error"] = run_error

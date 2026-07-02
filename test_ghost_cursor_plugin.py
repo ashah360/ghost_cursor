@@ -29,6 +29,7 @@ from plugins.ghost_cursor import (
     CURSOR_EDIT_SCHEMA,
     TOOL_NAME,
     TOOLSET,
+    _resolve_hermes_session_id,
     _resolve_progress_callback,
     check_cursor_edit_available,
     cursor_edit,
@@ -37,6 +38,7 @@ from plugins.ghost_cursor import (
 from plugins.ghost_cursor import acp_runner as gc_acp
 from plugins.ghost_cursor import events as gc_events
 from plugins.ghost_cursor import runner as gc_runner
+from plugins.ghost_cursor import session_registry as gc_sessions
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cursor_stream.jsonl"
 ACP_FIXTURE = Path(__file__).parent / "fixtures" / "acp_session_updates.jsonl"
@@ -416,6 +418,208 @@ class TestCursorEditHandler:
         result = json.loads(cursor_edit("   "))
         assert result["success"] is False
         assert "task is required" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# session_registry — eager persistence for interject-via-resume
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def clean_registry(monkeypatch):
+    """Fresh in-memory registry state (HERMES_HOME is already a temp dir
+    via the autouse _isolate_hermes_home fixture, so the JSON file is too)."""
+    monkeypatch.setattr(gc_sessions, "_registry", {})
+    monkeypatch.setattr(gc_sessions, "_loaded", False)
+    return gc_sessions
+
+
+class TestSessionRegistry:
+    def test_recent_cancelled_entry_is_continuable(self, clean_registry):
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "cancelled")
+        assert gc_sessions.get_recent("h-1", "/w/repo") == "s-cursor"
+
+    def test_recent_running_entry_is_continuable(self, clean_registry):
+        # "running" = interrupted so hard the settle write never happened.
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "running")
+        assert gc_sessions.get_recent("h-1", "/w/repo") == "s-cursor"
+
+    def test_completed_entry_is_not_continuable(self, clean_registry):
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "completed")
+        assert gc_sessions.get_recent("h-1", "/w/repo") is None
+
+    def test_stale_entry_is_not_continuable(self, clean_registry):
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "cancelled")
+        gc_sessions._registry["h-1"]["updated_at"] = time.time() - 601
+        assert gc_sessions.get_recent("h-1", "/w/repo") is None
+        # ...but a custom window can still reach it.
+        assert gc_sessions.get_recent("h-1", "/w/repo", max_age_s=3600) == "s-cursor"
+
+    def test_repo_mismatch_returns_none(self, clean_registry):
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "cancelled")
+        assert gc_sessions.get_recent("h-1", "/other/repo") is None
+
+    def test_unknown_or_missing_hermes_sid_returns_none(self, clean_registry):
+        assert gc_sessions.get_recent("h-nope", "/w/repo") is None
+        assert gc_sessions.get_recent(None, "/w/repo") is None
+
+    def test_record_without_ids_is_a_noop(self, clean_registry):
+        gc_sessions.record(None, "s-cursor", "/w/repo", "running")
+        gc_sessions.record("h-1", None, "/w/repo", "running")
+        gc_sessions.record("", "", "/w/repo", "running")
+        assert gc_sessions._registry == {}
+
+    def test_persists_across_process_restart(self, clean_registry, monkeypatch):
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "cancelled")
+        # Simulate a fresh process: wipe the in-memory dict, force a reload.
+        monkeypatch.setattr(gc_sessions, "_registry", {})
+        monkeypatch.setattr(gc_sessions, "_loaded", False)
+        assert gc_sessions.get_recent("h-1", "/w/repo") == "s-cursor"
+
+    def test_corrupt_file_never_raises_and_recovers(self, clean_registry, monkeypatch):
+        path = gc_sessions._state_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json at all", "utf-8")
+        assert gc_sessions.get_recent("h-1", "/w/repo") is None
+        # record still works and repairs the file.
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "running")
+        assert gc_sessions.get_recent("h-1", "/w/repo") == "s-cursor"
+        assert json.loads(path.read_text("utf-8"))["h-1"]["status"] == "running"
+
+    def test_unwritable_state_file_degrades_silently(self, clean_registry, monkeypatch):
+        monkeypatch.setattr(gc_sessions, "_state_file", lambda: None)
+        gc_sessions.record("h-1", "s-cursor", "/w/repo", "running")
+        assert gc_sessions.get_recent("h-1", "/w/repo") == "s-cursor"  # in-memory
+
+
+# ---------------------------------------------------------------------------
+# cursor_edit — interject-via-resume (eager record + auto-resume)
+# ---------------------------------------------------------------------------
+
+class TestInterjectAutoResume:
+    def _recording_replay(self, captured, events=None):
+        def replay(*args, **kwargs):
+            captured.update(kwargs)
+            yield from (events if events is not None else _acp_replay_events())
+
+        return replay
+
+    def _repo_key(self, tmp_path):
+        """The registry repo key cursor_edit uses (resolved workdir)."""
+        return str(gc_runner.resolve_repo(str(tmp_path)))
+
+    def test_auto_resumes_recent_cancelled_session(self, clean_registry, monkeypatch, tmp_path):
+        gc_sessions.record("h-1", "s-prior", self._repo_key(tmp_path), "cancelled")
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+        captured = {}
+        monkeypatch.setattr(gc_acp, "run_acp", self._recording_replay(captured))
+
+        result = json.loads(
+            cursor_edit("also add subtract", repo=str(tmp_path), progress_callback=None)
+        )
+        assert captured["session_id"] == "s-prior"
+        assert result["auto_resumed"] is True
+
+    def test_explicit_session_id_overrides_auto_resume(self, clean_registry, monkeypatch, tmp_path):
+        gc_sessions.record("h-1", "s-prior", self._repo_key(tmp_path), "cancelled")
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+        captured = {}
+        monkeypatch.setattr(gc_acp, "run_acp", self._recording_replay(captured))
+
+        result = json.loads(
+            cursor_edit("t", repo=str(tmp_path), progress_callback=None,
+                        session_id="s-explicit")
+        )
+        assert captured["session_id"] == "s-explicit"
+        assert result["auto_resumed"] is False
+
+    def test_completed_session_is_not_auto_resumed(self, clean_registry, monkeypatch, tmp_path):
+        gc_sessions.record("h-1", "s-done", self._repo_key(tmp_path), "completed")
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+        captured = {}
+        monkeypatch.setattr(gc_acp, "run_acp", self._recording_replay(captured))
+
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert captured["session_id"] is None  # fresh session/new
+        assert result["auto_resumed"] is False
+
+    def test_session_is_recorded_eagerly_before_prompt_streams(
+        self, clean_registry, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+        mid_run = {}
+
+        def replay(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s-live", "cwd": str(tmp_path), "model": "m"})
+            # Resumes only after cursor_edit consumed acp.session — the
+            # registry write must already be visible here, i.e. an interrupt
+            # at any later point still finds the session id persisted.
+            mid_run.update(gc_sessions._registry.get("h-1") or {})
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        cursor_edit("t", repo=str(tmp_path), progress_callback=None)
+        assert mid_run.get("cursor_session_id") == "s-live"
+        assert mid_run.get("status") == "running"
+
+    def test_cancelled_run_settles_registry_as_cancelled(
+        self, clean_registry, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+
+        def cancelling(*_a, **_k):
+            for key, obj in _acp_replay_events():
+                if key == "acp.result":
+                    break
+                yield key, obj
+            yield ("acp.result", {"stopReason": "cancelled"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", cancelling)
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert result["success"] is False
+        entry = gc_sessions._registry["h-1"]
+        assert entry["status"] == "cancelled"
+        assert entry["cursor_session_id"] == "s-fixture"
+        # ...which makes it continuable by the next call.
+        assert gc_sessions.get_recent("h-1", self._repo_key(tmp_path)) == "s-fixture"
+
+    def test_clean_completion_settles_registry_as_completed(
+        self, clean_registry, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: "h-1")
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert result["success"] is True
+        assert result["auto_resumed"] is False
+        assert gc_sessions._registry["h-1"]["status"] == "completed"
+        # A brand-new unrelated task must NOT resume the completed run.
+        assert gc_sessions.get_recent("h-1", self._repo_key(tmp_path)) is None
+
+    def test_no_resolvable_agent_degrades_to_no_persistence(
+        self, clean_registry, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr("plugins.ghost_cursor._resolve_hermes_session_id", lambda: None)
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert result["success"] is True
+        assert result["auto_resumed"] is False
+        assert gc_sessions._registry == {}
+
+    def test_resolves_hermes_session_id_from_thread_local_agent(self):
+        from tools.environments.base import set_activity_callback
+
+        class FakeAgent:
+            session_id = "h-from-agent"
+
+            def _touch_activity(self, desc):
+                pass
+
+        agent = FakeAgent()
+        set_activity_callback(agent._touch_activity)
+        try:
+            assert _resolve_hermes_session_id() == "h-from-agent"
+        finally:
+            set_activity_callback(None)
+        assert _resolve_hermes_session_id() is None
 
 
 # ---------------------------------------------------------------------------
