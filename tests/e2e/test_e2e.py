@@ -30,8 +30,14 @@ import pytest
 
 CURSOR_MODEL = os.environ.get("GHOST_CURSOR_TEST_MODEL", "gpt-5.4-nano-low")
 
+# The Hermes test suite's autouse `_hermetic_environment` fixture scrubs
+# API-key env vars (so unit tests can't hit real APIs). This is the opt-in
+# REAL-network suite, so capture the key at import time — before any fixture
+# runs — and restore it per-test.
+_REAL_CURSOR_KEY = os.environ.get("CURSOR_API_KEY")
+
 _run = os.environ.get("GHOST_CURSOR_E2E") == "1"
-_have_key = bool(os.environ.get("CURSOR_API_KEY"))
+_have_key = bool(_REAL_CURSOR_KEY)
 _have_bin = shutil.which("cursor-agent") is not None
 
 pytestmark = pytest.mark.skipif(
@@ -39,21 +45,63 @@ pytestmark = pytest.mark.skipif(
     reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and install cursor-agent",
 )
 
-PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
+def _find_plugin_init() -> Path:
+    """Locate the ghost_cursor package __init__.py robustly.
+
+    Works whether the e2e file lives beside the plugin (repo layout:
+    <repo>/tests/e2e/, plugin at <repo>/__init__.py) or is copied into a
+    Hermes tree (plugin at <hermes>/plugins/ghost_cursor/__init__.py).
+    Override with GHOST_CURSOR_PLUGIN_INIT.
+    """
+    override = os.environ.get("GHOST_CURSOR_PLUGIN_INIT")
+    if override and Path(override).is_file():
+        return Path(override)
+    here = Path(__file__).resolve()
+    candidates = [
+        # repo layout: tests/e2e/test_e2e.py -> <repo>/__init__.py
+        here.parents[2] / "__init__.py",
+        here.parents[1] / "__init__.py",
+        # installed into a hermes tree
+        Path("plugins/ghost_cursor/__init__.py").resolve(),
+    ]
+    # also search PYTHONPATH roots for plugins/ghost_cursor/__init__.py
+    for root in os.environ.get("PYTHONPATH", "").split(os.pathsep):
+        if root:
+            candidates.append(Path(root) / "plugins" / "ghost_cursor" / "__init__.py")
+    for c in candidates:
+        # a real plugin init defines cursor_start; the empty tests/plugins/__init__
+        # does not — so verify content, not just existence
+        try:
+            if c.is_file() and "def cursor_start" in c.read_text(encoding="utf-8"):
+                return c
+        except Exception:
+            continue
+    raise RuntimeError(f"could not locate ghost_cursor __init__.py; tried {candidates}")
+
+
+PLUGIN = _find_plugin_init()
 
 
 @pytest.fixture()
-def gc(monkeypatch, tmp_path):
-    """Load the real plugin module with an isolated HERMES_HOME."""
+def gc(monkeypatch, tmp_path, request):
+    """Load the real plugin module with an isolated HERMES_HOME and a UNIQUE
+    session key per test (so the same-repo concurrency guard and the handle
+    table never leak state between tests)."""
     home = tmp_path / "hermes_home"
     (home / "state").mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("GHOST_CURSOR_MODEL", CURSOR_MODEL)
+    # Restore the real key the Hermes hermetic fixture scrubbed — this is the
+    # opt-in real-network suite and needs it to reach cursor.
+    if _REAL_CURSOR_KEY:
+        monkeypatch.setenv("CURSOR_API_KEY", _REAL_CURSOR_KEY)
     spec = importlib.util.spec_from_file_location("gc_e2e", PLUGIN)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     mod._resolve_progress_callback = lambda: None
-    mod._resolve_session_key = lambda: "e2e-session"
+    # unique key per test — prevents cross-test handle/concurrency collisions
+    key = f"e2e-{request.node.name}"
+    mod._resolve_session_key = lambda: key
     return mod
 
 

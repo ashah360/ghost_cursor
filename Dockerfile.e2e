@@ -22,16 +22,28 @@ RUN uv sync --frozen || uv sync || pip install -e .
 # Real cursor-agent binary
 RUN curl https://cursor.com/install -fsS | bash
 ENV PATH="/root/.local/bin:${PATH}"
+# Symlink into a standard path so login shells (bash -lc) find it too
+RUN ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent
 
-# The plugin + its tests
+# pytest into the uv project env (it's not a Hermes dep)
+RUN uv add --dev pytest || uv pip install pytest
+
+# The plugin
 COPY *.py /opt/hermes-agent/plugins/ghost_cursor/
+# The unit test + its fixtures must sit together (test uses Path(__file__).parent/"fixtures")
 COPY test_ghost_cursor_plugin.py /opt/hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
-COPY conftest.py /opt/hermes-agent/tests/plugins/conftest_ghost_cursor.py
+COPY conftest.py /opt/hermes-agent/tests/plugins/conftest.py
+COPY fixtures/ /opt/hermes-agent/tests/plugins/fixtures/
+# The e2e suite
 COPY tests/e2e/ /opt/hermes-agent/tests/plugins/e2e/
+# Drop the stray copies the plugin glob pulled in
+RUN rm -f /opt/hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py \
+          /opt/hermes-agent/plugins/ghost_cursor/conftest.py
 
 ENV GHOST_CURSOR_E2E=1 \
     GHOST_CURSOR_TEST_MODEL=gpt-5.4-nano-low \
+    GHOST_CURSOR_PLUGIN_INIT=/opt/hermes-agent/plugins/ghost_cursor/__init__.py \
     PYTHONPATH=/opt/hermes-agent
 
 # Unit tests always; e2e only if CURSOR_API_KEY is provided at runtime.
-CMD ["bash", "-lc", "uv run pytest tests/plugins/test_ghost_cursor_plugin.py -q && uv run pytest tests/plugins/e2e/test_e2e.py -q -v"]
+CMD ["bash", "-lc", "uv run --with pytest pytest tests/plugins/test_ghost_cursor_plugin.py -q && uv run --with pytest pytest tests/plugins/e2e/test_e2e.py -q -v"]

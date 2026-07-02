@@ -182,6 +182,13 @@ class _AcpClient:
 
     async def _spawn(self) -> None:
         argv: List[str] = [CURSOR_AGENT_BIN, "--trust"]
+        # The `acp` subcommand does NOT authenticate from the CURSOR_API_KEY
+        # env var the way `-p` does — it needs either persisted `cursor-agent
+        # login` creds or an explicit `--api-key`. Pass the env key through so
+        # ACP works on fresh installs / CI / headless boxes with no login.
+        _api_key = os.environ.get("CURSOR_API_KEY")
+        if _api_key:
+            argv += ["--api-key", _api_key]
         if self._model:
             argv += ["--model", self._model]
         argv.append("acp")
