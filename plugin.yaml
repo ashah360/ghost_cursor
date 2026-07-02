@@ -1,0 +1,7 @@
+name: ghost_cursor
+version: 0.2.0
+description: "Delegate coding tasks to the Cursor agent (cursor-agent CLI over ACP — JSON-RPC on stdio). Registers one tool — `cursor_edit` — that runs cursor-agent inside a target repo, streams per-edit progress (reasoning + file diffs) through the agent's tool_progress_callback from ACP session/update notifications, and returns a structured summary of files changed. Native session/cancel on interrupt. Tool gates on the cursor-agent binary being installed."
+author: Arman
+kind: backend
+provides_tools:
+  - cursor_edit
