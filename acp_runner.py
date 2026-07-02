@@ -3,13 +3,16 @@
 Replaces the stdout-scraping ``--print --output-format stream-json`` harness
 (kept in ``runner.py`` as the importable legacy/reference implementation) with
 a structured protocol client. Spawns ``cursor-agent --trust acp`` inside the
-target repo, performs the ACP handshake (``initialize`` → ``session/new`` →
-``session/prompt``), and yields the streaming ``session/update`` notifications
-that cursor emits while it works.
+target repo, performs the ACP handshake (``initialize`` → ``session/new`` —
+or ``session/load`` when resuming a prior session — → ``session/prompt``),
+and yields the streaming ``session/update`` notifications that cursor emits
+while it works.
 
 Yielded event tuples (consumed by ``events.AcpNormalizer``):
 
-* ``("acp.session", {...})`` — session established (sessionId, cwd, model).
+* ``("acp.session", {...})`` — session established (sessionId, cwd, model,
+  resumed). ``resumed`` is True when an existing session was continued via
+  ``session/load`` (see below), False for a fresh ``session/new``.
 * ``("acp.update", <update>)`` — one raw ``session/update`` payload, i.e. the
   object under ``params.update`` (``sessionUpdate`` discriminator field).
 * ``("acp.result", {"stopReason": ...})`` — the ``session/prompt`` response.
@@ -69,6 +72,10 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = 1
 INIT_TIMEOUT_S = 30.0
 SESSION_NEW_TIMEOUT_S = 30.0
+# session/load replays the prior session's history as session/update
+# notifications before resolving (observed live, 2026-07-02), so a long
+# prior session takes longer to load than a fresh session/new.
+SESSION_LOAD_TIMEOUT_S = 60.0
 # After session/cancel, how long to wait for the prompt to resolve before
 # SIGKILLing the process group. Observed resolve time is ~0s; the grace only
 # matters when cursor is genuinely hung.
@@ -110,12 +117,15 @@ class _AcpClient:
         out_q: "queue.Queue[Tuple[str, Dict[str, Any]]]",
         cancel_requested: threading.Event,
         timeout: float,
+        session_id: Optional[str] = None,
     ) -> None:
         self._task = task
         self._workdir = workdir
         self._out_q = out_q
         self._cancel_requested = cancel_requested
         self._timeout = timeout
+        # Prior cursor session to continue via session/load (None = fresh).
+        self._resume_session_id = session_id
         # "cancel" | "timeout" — written by the consumer thread before it sets
         # cancel_requested (single write, read after the event fires).
         self.abort_reason: Optional[str] = None
@@ -317,6 +327,54 @@ class _AcpClient:
             resp["result"] = result
         await self._send(resp)
 
+    # -- session establishment -------------------------------------------------
+
+    async def _establish_session(self) -> Tuple[Dict[str, Any], bool]:
+        """Create or resume the cursor session.
+
+        When a resume id was provided, try ``session/load`` first (cursor
+        advertises ``loadSession: true``). Observed live (2026-07-02): load
+        REPLAYS the prior session's history as ``session/update``
+        notifications before resolving — those flow through the normal
+        update path — and resolves with the same shape as ``session/new``
+        minus ``sessionId``. If load fails (expired/unknown id → JSON-RPC
+        ``Invalid params``), fall back to a fresh ``session/new`` so the
+        task still runs, just without prior context.
+
+        Returns:
+            ``(result, resumed)`` — the session/new-or-load result dict and
+            whether the prior session was actually resumed. Raises on
+            failure of the final ``session/new`` attempt (no session at all).
+        """
+        if self._resume_session_id:
+            try:
+                sess = await self._request(
+                    "session/load",
+                    {
+                        "sessionId": self._resume_session_id,
+                        "cwd": str(self._workdir),
+                        "mcpServers": [],
+                    },
+                    timeout=SESSION_LOAD_TIMEOUT_S,
+                )
+                self._session_id = self._resume_session_id
+                return sess, True
+            except Exception as exc:
+                logger.warning(
+                    "ACP session/load for %s failed (%s: %s) — "
+                    "falling back to a fresh session/new",
+                    self._resume_session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        sess = await self._request(
+            "session/new",
+            {"cwd": str(self._workdir), "mcpServers": []},
+            timeout=SESSION_NEW_TIMEOUT_S,
+        )
+        self._session_id = str(sess.get("sessionId") or "")
+        return sess, False
+
     # -- cancellation --------------------------------------------------------
 
     async def _cancel_watcher(self) -> None:
@@ -378,11 +436,7 @@ class _AcpClient:
                     return
 
                 try:
-                    sess = await self._request(
-                        "session/new",
-                        {"cwd": str(self._workdir), "mcpServers": []},
-                        timeout=SESSION_NEW_TIMEOUT_S,
-                    )
+                    sess, resumed = await self._establish_session()
                 except Exception as exc:
                     self._put(
                         "acp.fatal",
@@ -394,7 +448,6 @@ class _AcpClient:
                         },
                     )
                     return
-                self._session_id = str(sess.get("sessionId") or "")
                 models = sess.get("models") if isinstance(sess.get("models"), dict) else {}
                 self._put(
                     "acp.session",
@@ -402,6 +455,7 @@ class _AcpClient:
                         "sessionId": self._session_id,
                         "cwd": str(self._workdir),
                         "model": models.get("currentModelId"),
+                        "resumed": resumed,
                     },
                 )
 
@@ -467,6 +521,7 @@ def run_acp(
     repo: str,
     timeout: float = DEFAULT_TIMEOUT_S,
     cancel_check: Optional[Callable[[], bool]] = None,
+    session_id: Optional[str] = None,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Run cursor-agent on ``task`` inside ``repo`` over ACP, yielding events.
 
@@ -474,6 +529,11 @@ def run_acp(
     tuples (see module docstring). Polls ``cancel_check`` (default: the
     Hermes per-thread interrupt flag) and the overall ``timeout`` between
     events; both trigger a native ``session/cancel``.
+
+    ``session_id`` continues a prior cursor session via ``session/load``
+    (multi-turn). If the load fails (expired/unknown id), the run falls back
+    to a fresh ``session/new`` — the ``acp.session`` event's ``resumed``
+    field reports what actually happened.
 
     Raises:
         HarnessError: empty task / bad repo (preflight).
@@ -493,6 +553,7 @@ def run_acp(
         out_q=out_q,
         cancel_requested=cancel_requested,
         timeout=float(timeout),
+        session_id=(str(session_id).strip() or None) if session_id else None,
     )
     thread = threading.Thread(
         target=lambda: asyncio.run(client.run()),

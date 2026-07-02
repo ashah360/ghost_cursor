@@ -68,7 +68,10 @@ CURSOR_EDIT_SCHEMA = {
         "project files yourself. Provide the full coding instruction as `task`; "
         "the Cursor agent reads the repo, makes the edits, and this tool "
         "returns a summary of every file changed (+added/-removed lines and "
-        "diffs)."
+        "diffs). The result also includes a `session_id` — for iterative or "
+        "follow-up work on the same task (refine, fix, review feedback), pass "
+        "it back as `session_id` to continue that cursor session with full "
+        "prior context instead of starting fresh."
     ),
     "parameters": {
         "type": "object",
@@ -86,6 +89,15 @@ CURSOR_EDIT_SCHEMA = {
                 "description": (
                     "Absolute path to the repository to work in. Optional — "
                     "defaults to the configured workspace repo."
+                ),
+            },
+            "session_id": {
+                "type": "string",
+                "description": (
+                    "Optional. Pass the `session_id` returned by a previous "
+                    "cursor_edit call to CONTINUE that cursor session with "
+                    "full prior context (multi-turn/iterative work — refine, "
+                    "fix, follow up). Omit to start a fresh session."
                 ),
             },
         },
@@ -183,12 +195,15 @@ def cursor_edit(
     repo: Optional[str] = None,
     timeout: float = _runner.DEFAULT_TIMEOUT_S,
     progress_callback: Optional[Callable] = None,
+    session_id: Optional[str] = None,
     **_kwargs: Any,
 ) -> str:
     """Run cursor-agent on ``task``, stream progress, return a JSON summary.
 
     ``progress_callback`` overrides the auto-resolved agent callback (used by
-    tests and direct harness invocation).
+    tests and direct harness invocation). ``session_id`` continues a prior
+    cursor session (multi-turn) via ACP ``session/load``; the result's
+    ``session_id`` / ``resumed`` fields report the session actually used.
     """
     if not str(task or "").strip():
         return json.dumps({"success": False, "error": "task is required"})
@@ -219,6 +234,8 @@ def cursor_edit(
     run_error: Optional[str] = None
     timed_out = False
     completed = False
+    result_session_id = ""
+    resumed = False
 
     def _fold(envelope: Dict[str, Any]) -> None:
         nonlocal emitted, completed, run_error, timed_out
@@ -257,7 +274,14 @@ def cursor_edit(
 
     normalizer = _events.AcpNormalizer()
     try:
-        for key, obj in _acp.run_acp(str(task), str(workdir), timeout=float(timeout)):
+        for key, obj in _acp.run_acp(
+            str(task), str(workdir), timeout=float(timeout), session_id=session_id
+        ):
+            if key == "acp.session":
+                # The sessionId rides back to the caller for multi-turn
+                # continuation; the normalizer only folds it into lifecycle.
+                result_session_id = str(obj.get("sessionId") or "")
+                resumed = bool(obj.get("resumed"))
             for envelope in normalizer.normalize(key, obj):
                 _fold(envelope)
     except _acp.AcpError as exc:
@@ -292,6 +316,8 @@ def cursor_edit(
         "duration_ms": duration_ms,
         "live_progress": live_progress,
         "progress_events_emitted": emitted,
+        "session_id": result_session_id,
+        "resumed": resumed,
     }
     if run_error:
         result["error"] = run_error
@@ -304,6 +330,7 @@ def _handle_cursor_edit(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_edit(
         task=args.get("task", ""),
         repo=args.get("repo"),
+        session_id=args.get("session_id"),
     )
 
 

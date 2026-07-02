@@ -23,9 +23,10 @@ The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
 ## What you get
 
-- **`cursor_edit(task, repo?)`** — delegate a coding task; Cursor edits real files in `repo`.
+- **`cursor_edit(task, repo?, session_id?)`** — delegate a coding task; Cursor edits real files in `repo`.
+- **Multi-turn resume** — every result returns a `session_id`; pass it back on the next call to **continue that Cursor session with full prior context** (refine, fix, iterate). Under the hood it uses ACP `session/load`; if the session expired it falls back to a fresh one (`resumed: false`) rather than erroring. Omit `session_id` for a one-shot.
 - **Live streaming** — reasoning fragments + per-edit `file_diff`s (path / before / after / unified diff / +added / −removed) emitted as they happen, via the calling agent's `tool_progress_callback`.
-- **Structured result** — `{success, status, repo, summary, files_changed:[{path, added, removed, status, diff}], files_changed_count, live_progress, ...}`.
+- **Structured result** — `{success, status, repo, summary, files_changed:[{path, added, removed, status, diff}], files_changed_count, live_progress, session_id, resumed, ...}`.
 - **Native cancel** — an interrupt sends ACP `session/cancel`, waits briefly, then hard-terminates.
 - **Git-diff fallback** — for shell-driven edits the ACP stream didn't carry a diff for, diffs are recovered from `git`.
 - **`check_fn`** — the tool only appears when the `cursor-agent` binary is installed.
@@ -83,6 +84,23 @@ Programmatic shape of the result:
   "live_progress": true
 }
 ```
+
+## Iterative / multi-turn
+
+Reuse the `session_id` from a result to continue that Cursor session — it keeps full prior context, so follow-ups build on earlier work (matching style, remembering decisions) instead of re-deriving from scratch:
+
+```
+call 1:  cursor_edit(task="Create calc.py with add(a, b).")
+         → { ..., "session_id": "b5b4dbe1-…", "resumed": false }
+
+call 2:  cursor_edit(task="Now add subtract in the same style.",
+                     session_id="b5b4dbe1-…")
+         → { ..., "session_id": "b5b4dbe1-…", "resumed": true }
+```
+
+If the prior session is gone (Cursor restarted, id expired), call 2 transparently starts fresh and reports `resumed: false` — the task still runs, just without the earlier context.
+
+> Note: this is cross-turn *resume* (continue between calls), not mid-flight steering — you can't inject a nudge into a prompt that's currently running; cancel and re-prompt (with the same `session_id`) for that.
 
 ## How live progress works (no core patch)
 

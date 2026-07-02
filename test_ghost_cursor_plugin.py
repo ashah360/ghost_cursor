@@ -355,6 +355,57 @@ class TestCursorEditHandler:
         assert "handshake" in result["error"]
         assert "files_changed" not in result  # no run happened
 
+    def test_result_includes_session_id_and_resumed(self, monkeypatch, tmp_path):
+        """The sessionId from acp.session rides back in the result so the
+        caller can continue the session; a fresh run reports resumed=False."""
+        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        result = json.loads(cursor_edit("t", repo=str(tmp_path), progress_callback=None))
+        assert result["session_id"] == "s-fixture"
+        assert result["resumed"] is False
+
+    def test_resumed_run_reports_resumed_true(self, monkeypatch, tmp_path):
+        def resumed_replay(*_a, **_k):
+            yield ("acp.session", {"sessionId": "s-prior", "cwd": str(tmp_path),
+                                   "model": "m", "resumed": True})
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", resumed_replay)
+        result = json.loads(
+            cursor_edit("follow up", repo=str(tmp_path),
+                        progress_callback=None, session_id="s-prior")
+        )
+        assert result["session_id"] == "s-prior"
+        assert result["resumed"] is True
+
+    def test_session_id_arg_is_passed_to_run_acp(self, monkeypatch, tmp_path):
+        captured = {}
+
+        def recording_replay(*args, **kwargs):
+            captured.update(kwargs)
+            yield from _acp_replay_events()
+
+        monkeypatch.setattr(gc_acp, "run_acp", recording_replay)
+        cursor_edit("t", repo=str(tmp_path), progress_callback=None,
+                    session_id="s-continue")
+        assert captured["session_id"] == "s-continue"
+
+    def test_handler_maps_session_id_arg(self, monkeypatch, tmp_path):
+        """The registered tool handler forwards args["session_id"]."""
+        captured = {}
+
+        def recording_replay(*args, **kwargs):
+            captured.update(kwargs)
+            yield from _acp_replay_events()
+
+        monkeypatch.setattr(gc_acp, "run_acp", recording_replay)
+        from plugins.ghost_cursor import _handle_cursor_edit
+
+        result = json.loads(_handle_cursor_edit(
+            {"task": "t", "repo": str(tmp_path), "session_id": "s-from-args"}
+        ))
+        assert captured["session_id"] == "s-from-args"
+        assert result["session_id"] == "s-fixture"
+
     def test_missing_repo_is_a_clean_error(self, monkeypatch):
         monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
         result = json.loads(cursor_edit("t", repo="/definitely/not/a/dir"))
@@ -486,11 +537,26 @@ for line in sys.stdin:
     elif m == "session/new":
         send({"jsonrpc": "2.0", "id": msg["id"],
               "result": {"sessionId": "s-test", "models": {"currentModelId": "fake-model"}}})
+    elif m == "session/load":
+        if MODE == "loadfail":
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "error": {"code": -32602, "message": "Invalid params",
+                            "data": {"message": "Session not found"}}})
+        else:
+            # Replay of prior history precedes the load response (observed
+            # live 2026-07-02), then the same result shape as session/new
+            # minus sessionId.
+            update({"sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": "prior task"}})
+            update({"sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "prior answer"}})
+            send({"jsonrpc": "2.0", "id": msg["id"],
+                  "result": {"models": {"currentModelId": "fake-model"}}})
     elif m == "session/prompt":
         prompt_id = msg["id"]
         update({"sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": "working"}})
-        if MODE == "happy":
+        if MODE in ("happy", "load", "loadfail"):
             update({"sessionUpdate": "tool_call", "toolCallId": "t1",
                     "title": "Edit File", "kind": "edit", "status": "pending",
                     "rawInput": {}})
@@ -571,6 +637,103 @@ class TestAcpRunner:
         with pytest.raises(gc_runner.HarnessError):
             list(gc_acp.run_acp("t", "/nope/nothing/here"))
 
+    def test_session_id_resumes_via_session_load(self, tmp_path, monkeypatch):
+        """session_id → session/load path: the resume id is kept (not the
+        fake server's session/new id) and resumed=True, with the replayed
+        history flowing through as ordinary acp.update events."""
+        _install_fake_acp(tmp_path, monkeypatch, "load")
+        events = list(gc_acp.run_acp("continue it", str(tmp_path), timeout=30.0,
+                                     cancel_check=lambda: False,
+                                     session_id="s-prior"))
+        # Replayed history arrives BEFORE session/load resolves, so the
+        # acp.session event follows the replay updates in the stream.
+        sessions = [o for k, o in events if k == "acp.session"]
+        assert len(sessions) == 1
+        assert sessions[0]["sessionId"] == "s-prior"
+        assert sessions[0]["resumed"] is True
+        replayed = [o for k, o in events if k == "acp.update"
+                    and o.get("sessionUpdate") == "user_message_chunk"]
+        assert replayed, "session/load replay did not flow through acp.update"
+        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
+
+    def test_session_load_failure_falls_back_to_session_new(self, tmp_path, monkeypatch):
+        """Expired/unknown session id must not hard-fail: fall back to a
+        fresh session/new and report resumed=False."""
+        _install_fake_acp(tmp_path, monkeypatch, "loadfail")
+        events = list(gc_acp.run_acp("continue it", str(tmp_path), timeout=30.0,
+                                     cancel_check=lambda: False,
+                                     session_id="s-expired"))
+        assert events[0][0] == "acp.session"
+        assert events[0][1]["sessionId"] == "s-test"  # fresh session
+        assert events[0][1]["resumed"] is False
+        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
+
+    def test_no_session_id_creates_fresh_session(self, tmp_path, monkeypatch):
+        """Omitting session_id keeps the one-shot behavior byte-identical."""
+        _install_fake_acp(tmp_path, monkeypatch, "happy")
+        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=30.0,
+                                     cancel_check=lambda: False))
+        assert events[0][1]["sessionId"] == "s-test"
+        assert events[0][1]["resumed"] is False
+
+
+# ---------------------------------------------------------------------------
+# _AcpClient._establish_session — request-layer method selection
+# ---------------------------------------------------------------------------
+
+class TestEstablishSession:
+    def _run(self, session_id, responder):
+        """Drive _establish_session with a mocked _request; returns
+        (methods_called, params_by_method, (sess, resumed), client)."""
+        import asyncio
+        import queue
+        import threading
+
+        client = gc_acp._AcpClient(
+            task="t", workdir=Path("/w"), out_q=queue.Queue(),
+            cancel_requested=threading.Event(), timeout=60.0,
+            session_id=session_id,
+        )
+        calls = []
+
+        async def fake_request(method, params, timeout=None):
+            calls.append((method, params))
+            return responder(method)
+
+        client._request = fake_request
+        result = asyncio.run(client._establish_session())
+        return calls, result, client
+
+    def test_session_id_uses_session_load_not_session_new(self):
+        calls, (sess, resumed), client = self._run(
+            "s-prior",
+            lambda m: {"models": {"currentModelId": "m"}},
+        )
+        assert [m for m, _ in calls] == ["session/load"]
+        assert calls[0][1]["sessionId"] == "s-prior"
+        assert calls[0][1]["mcpServers"] == []
+        assert resumed is True
+        assert client._session_id == "s-prior"
+
+    def test_load_failure_falls_back_to_session_new(self):
+        def responder(method):
+            if method == "session/load":
+                raise RuntimeError("ACP error -32602: Invalid params")
+            return {"sessionId": "s-fresh", "models": {}}
+
+        calls, (sess, resumed), client = self._run("s-gone", responder)
+        assert [m for m, _ in calls] == ["session/load", "session/new"]
+        assert resumed is False
+        assert client._session_id == "s-fresh"
+
+    def test_no_session_id_goes_straight_to_session_new(self):
+        calls, (sess, resumed), client = self._run(
+            None, lambda m: {"sessionId": "s-fresh", "models": {}}
+        )
+        assert [m for m, _ in calls] == ["session/new"]
+        assert resumed is False
+        assert client._session_id == "s-fresh"
+
 
 # ---------------------------------------------------------------------------
 # Agent auto-resolution via the thread-local activity callback
@@ -640,6 +803,14 @@ class TestRegistration:
         desc = CURSOR_EDIT_SCHEMA["description"].lower()
         assert "prefer this tool" in desc
         assert "delegate" in desc
+
+    def test_schema_session_id_is_optional_continuation_param(self):
+        props = CURSOR_EDIT_SCHEMA["parameters"]["properties"]
+        assert props["session_id"]["type"] == "string"
+        assert "continue" in props["session_id"]["description"].lower()
+        assert "session_id" not in CURSOR_EDIT_SCHEMA["parameters"]["required"]
+        # The description steers the agent to reuse the returned session_id.
+        assert "session_id" in CURSOR_EDIT_SCHEMA["description"]
 
     def test_check_fn_false_without_binary(self, monkeypatch):
         monkeypatch.setattr(gc_runner, "cursor_agent_available", lambda: False)
