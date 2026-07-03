@@ -33,7 +33,10 @@ Run watchdogs are INACTIVITY-based, not wall-clock: a run that keeps
 streaming ACP events is alive and is never aborted for total elapsed time.
 The watchdog fires only after ``inactivity_timeout_s`` seconds of SILENCE
 (no ACP messages received at all — every ``session/update`` notification,
-agent request, and response resets the clock). A separate, optional
+agent request, and response resets the clock). An in-flight tool call
+(``tool_call`` seen, no terminal ``tool_call_update`` yet) also counts as
+activity: cursor streams nothing while a long local command runs, so the
+inactivity clock is suspended until the call finishes. A separate, optional
 ``max_wall_s`` hard ceiling (disabled by default) is the safety net for
 true runaways that stream forever without finishing; the abort error names
 whichever limit fired.
@@ -163,6 +166,14 @@ class _AcpClient:
         # inactivity watchdog — a plain float is fine, attribute writes are
         # atomic under the GIL.
         self.last_activity_monotonic: float = time.monotonic()
+        # toolCallIds with a tool_call/tool_call_update seen but no terminal
+        # (completed/failed) update yet. A pending tool call means cursor is
+        # legitimately BUSY (e.g. a 20-minute typecheck command) even though
+        # no ACP events stream while it runs, so the inactivity watchdog is
+        # suspended while this is non-empty. Mutated only on the client loop
+        # thread; the consumer thread only reads its truthiness (safe under
+        # the GIL).
+        self._pending_tool_calls: set = set()
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 0
@@ -175,6 +186,24 @@ class _AcpClient:
 
     def _put(self, key: str, obj: Dict[str, Any]) -> None:
         self._out_q.put((key, obj))
+
+    def has_pending_tool_call(self) -> bool:
+        """True while any tool call has started but not yet finished."""
+        return bool(self._pending_tool_calls)
+
+    def _track_tool_call(self, update: Dict[str, Any]) -> None:
+        """Keep the pending-tool-call set in sync with session/update
+        tool_call / tool_call_update notifications (see field comment)."""
+        variant = str(update.get("sessionUpdate") or "")
+        if variant not in ("tool_call", "tool_call_update"):
+            return
+        call_id = str(update.get("toolCallId") or "")
+        if not call_id:
+            return
+        if str(update.get("status") or "") in ("completed", "failed"):
+            self._pending_tool_calls.discard(call_id)
+        else:
+            self._pending_tool_calls.add(call_id)
 
     def _timeout_error(self) -> Dict[str, Any]:
         """The acp.error payload for a watchdog abort — names which limit
@@ -337,6 +366,7 @@ class _AcpClient:
             params = obj.get("params") or {}
             update = params.get("update")
             if isinstance(update, dict):
+                self._track_tool_call(update)
                 self._put("acp.update", update)
         # other notifications: ignore
 
@@ -579,8 +609,12 @@ def run_acp(
 
     * ``inactivity_timeout_s`` — abort only after this many seconds with NO
       ACP messages received. Streamed activity resets the clock, so a slow
-      but active run is never killed for total elapsed time. Default
-      ``DEFAULT_INACTIVITY_TIMEOUT_S`` (600s of silence); 0 disables.
+      but active run is never killed for total elapsed time. A PENDING tool
+      call also suspends the clock: cursor emits no events while a long
+      local command (10–25 min typecheck/build) runs, but it is busy, not
+      hung — only true silence (no events AND no in-flight tool call) fires
+      the watchdog. Default ``DEFAULT_INACTIVITY_TIMEOUT_S`` (600s of
+      silence); 0 disables.
     * ``max_wall_s`` — optional hard ceiling on TOTAL run time, a safety
       net for runaways that stream forever. Default ``DEFAULT_MAX_WALL_S``
       (0 = disabled).
@@ -644,6 +678,13 @@ def run_acp(
                 if (
                     inactivity_s > 0
                     and now - client.last_activity_monotonic >= inactivity_s
+                    # An in-flight tool call IS activity: cursor streams no
+                    # ACP events while a long local command (typecheck,
+                    # build) runs, but it is busy, not hung. Only true
+                    # silence — no events AND no pending tool call — times
+                    # out. When the call finishes, its tool_call_update
+                    # resets the clock, so the window restarts from there.
+                    and not client.has_pending_tool_call()
                 ):
                     client.abort_reason = "timeout"
                     client.abort_detail = f"no activity for {int(inactivity_s)}s"

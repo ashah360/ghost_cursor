@@ -236,6 +236,72 @@ class TestAcpNormalizer:
         assert envs[0]["event"] == "run.failed"
         assert envs[0]["timeout"] is True
 
+    def test_transport_error_before_end_turn_maps_to_run_failed(self):
+        """Live repro (2026-07-03): the model stream died mid-exploration;
+        cursor-agent streamed the RetriableError as its LAST message chunks
+        and still resolved session/prompt with end_turn. That end_turn must
+        classify as run.failed with the error line first-class."""
+        normalizer = gc_events.AcpNormalizer()
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "Now let me explore the relevant code"},
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "tool_call", "toolCallId": "t1",
+            "title": "Read file", "kind": "read", "status": "pending",
+            "rawInput": {},
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            "status": "completed",
+        })
+        # The error arrives split across streamed deltas, like any message.
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text",
+                        "text": "RetriableError: [canceled] http/2 stream "},
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text",
+                        "text": "closed with error code CANCEL (0x8)"},
+        })
+        envs = normalizer.normalize("acp.result", {"stopReason": "end_turn"})
+        assert envs[0]["event"] == "run.failed"
+        assert envs[0]["status"] == "failed"
+        assert envs[0]["transport_error"] is True
+        assert (
+            "RetriableError: [canceled] http/2 stream closed with error "
+            "code CANCEL (0x8)" in envs[0]["error"]
+        )
+
+    def test_recovered_transport_error_still_completes(self):
+        """A transport error followed by MORE activity means cursor retried
+        and recovered — the eventual end_turn is a genuine completion."""
+        normalizer = gc_events.AcpNormalizer()
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text",
+                        "text": "RetriableError: [canceled] http/2 stream "
+                                "closed with error code CANCEL (0x8)"},
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "tool_call", "toolCallId": "t2",
+            "title": "`ls`", "kind": "execute", "status": "pending",
+            "rawInput": {"command": "ls"},
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "tool_call_update", "toolCallId": "t2",
+            "status": "completed",
+        })
+        normalizer.normalize("acp.update", {
+            "sessionUpdate": "agent_message_chunk",
+            "content": {"type": "text", "text": "All done, tests pass."},
+        })
+        envs = normalizer.normalize("acp.result", {"stopReason": "end_turn"})
+        assert envs[0]["event"] == "run.completed"
+        assert envs[0]["status"] == "completed"
+
     def test_unknown_update_variant_passes_through(self):
         envs = gc_events.AcpNormalizer().normalize(
             "acp.update", {"sessionUpdate": "mystery_update", "x": 1}
@@ -1471,6 +1537,55 @@ class TestAllTerminalStatesDeliver:
         assert evt["status"] == "failed"
         assert "boom" in evt["error"]
 
+    def test_transport_drop_delivers_failed_not_completed(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Live repro (2026-07-03): the stream died with a RetriableError
+        narrated as the final message chunks, then a "clean" end_turn. The
+        delivered completion must say failed with the error first-class in
+        the header — not completed with the error buried in the summary."""
+        release = threading.Event()
+
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, session_id=None, model=None):
+            yield ("acp.session", {"sessionId": "s-drop", "cwd": str(workdir),
+                                   "model": "m"})
+            release.wait(10)
+            yield ("acp.update", {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text",
+                            "text": "Now let me explore the relevant code\n"},
+            })
+            yield ("acp.update", {
+                "sessionUpdate": "agent_message_chunk",
+                "content": {"type": "text",
+                            "text": "RetriableError: [canceled] http/2 stream "
+                                    "closed with error code CANCEL (0x8)"},
+            })
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        res = _start_run("t", repo=str(tmp_path))
+        assert "running in background" in res, f"run never armed: {res}"
+        job = _job_for("s-drop")
+        release.set()
+        assert job.done_event.wait(10)
+
+        events = _drain_completion_queue()
+        assert len(events) == 1
+        evt = events[0]
+        assert job.status == "failed"
+        assert evt["status"] == "failed"
+        assert "http/2 stream closed with error code CANCEL (0x8)" in evt["error"]
+        assert evt["result"]["success"] is False
+        assert evt["result"]["status"] == "failed"
+        assert "http/2 stream closed" in evt["result"]["error"]
+        # The delivered text names the failure in the header, not just the
+        # stitched summary body.
+        assert "status: failed" in evt["summary"]
+        assert "run failed:" in evt["summary"]
+        assert "http/2 stream closed" in evt["summary"].split("cursor's summary:")[0]
+
 
 # ---------------------------------------------------------------------------
 # acp_runner.run_acp — real subprocess round-trips against a fake ACP server
@@ -1538,6 +1653,35 @@ for line in sys.stdin:
                 time.sleep(0.2)
                 update({"sessionUpdate": "agent_message_chunk",
                         "content": {"type": "text", "text": "still going"}})
+        elif MODE == "middie":
+            # Transport drop: stream one chunk mid-work, then die without
+            # ever resolving session/prompt (no end_turn).
+            update({"sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "exploring"}})
+            sys.exit(1)
+        elif MODE == "slowtool":
+            # One long LOCAL tool call: tool_call starts, then total ACP
+            # silence while the "command" runs for well past the inactivity
+            # threshold, then the terminal update + end_turn.
+            update({"sessionUpdate": "tool_call", "toolCallId": "t-slow",
+                    "title": "`npx tsc --noEmit`", "kind": "execute",
+                    "status": "pending", "rawInput": {"command": "npx tsc --noEmit"}})
+            time.sleep(2.5)
+            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-slow",
+                    "status": "completed",
+                    "rawOutput": {"exitCode": 0, "stdout": "ok", "stderr": ""}})
+            send({"jsonrpc": "2.0", "id": prompt_id,
+                  "result": {"stopReason": "end_turn"}})
+        elif MODE == "toolhang":
+            # A tool call that FINISHES, then true silence: no pending call
+            # remains, so the inactivity watchdog must still fire.
+            update({"sessionUpdate": "tool_call", "toolCallId": "t-done",
+                    "title": "`ls`", "kind": "execute", "status": "pending",
+                    "rawInput": {"command": "ls"}})
+            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-done",
+                    "status": "completed",
+                    "rawOutput": {"exitCode": 0, "stdout": "", "stderr": ""}})
+            # then hang: keep reading, never resolve the prompt
         elif MODE in ("happy", "load", "loadfail"):
             update({"sessionUpdate": "tool_call", "toolCallId": "t1",
                     "title": "Edit File", "kind": "edit", "status": "pending",
@@ -1626,6 +1770,47 @@ class TestAcpRunner:
         assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
         assert not any(k == "acp.error" for k, _ in events)
 
+    def test_pending_tool_call_suspends_the_inactivity_watchdog(
+        self, tmp_path, monkeypatch
+    ):
+        """Live repro (`run.failed: ACP run timed out: no activity for
+        600s` while cursor waited on a 10–25 min local typecheck): a run
+        that is silent because ONE tool call is still in flight is busy,
+        not hung — it must survive well past the inactivity threshold and
+        complete normally once the call finishes."""
+        _install_fake_acp(tmp_path, monkeypatch, "slowtool")
+        t0 = time.monotonic()
+        # Tool-call silence is ~2.5s against a 1s inactivity threshold.
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.0,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert elapsed > 2.0, "tool call finished before the threshold — inconclusive"
+        assert not any(k == "acp.error" for k, _ in events)
+        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
+        finished = [o for k, o in events if k == "acp.update"
+                    and o.get("sessionUpdate") == "tool_call_update"
+                    and o.get("status") == "completed"]
+        assert finished, "the pending tool call never completed in the replay"
+
+    def test_true_silence_after_a_finished_tool_call_still_times_out(
+        self, tmp_path, monkeypatch
+    ):
+        """The suspension is scoped to IN-FLIGHT calls only: once the tool
+        call completes and real silence follows, the existing inactivity
+        semantics still kill the run."""
+        _install_fake_acp(tmp_path, monkeypatch, "toolhang")
+        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
+        t0 = time.monotonic()
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.0,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert events[-1][0] == "acp.error"
+        assert events[-1][1]["timeout"] is True
+        assert "no activity for 1s" in events[-1][1]["error"]
+        assert elapsed < 20, f"timeout kill did not tear down ({elapsed:.1f}s)"
+
     def test_max_wall_ceiling_kills_a_runaway_stream(self, tmp_path, monkeypatch):
         """A run that streams forever never trips the inactivity watchdog —
         the max_wall_s hard ceiling is the safety net, and the error says so."""
@@ -1652,6 +1837,24 @@ class TestAcpRunner:
         assert events[-1][0] == "acp.error"
         assert events[-1][1]["timeout"] is True
         assert "no activity for 1s" in events[-1][1]["error"]
+
+    def test_process_death_midprompt_is_an_error_not_a_result(
+        self, tmp_path, monkeypatch
+    ):
+        """cursor-agent dying mid-prompt (no end_turn) must surface as
+        acp.error — the shape the normalizer classifies as run.failed —
+        never as an acp.result completion."""
+        _install_fake_acp(tmp_path, monkeypatch, "middie")
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
+                                     cancel_check=lambda: False))
+        assert not any(k == "acp.result" for k, _ in events)
+        assert events[-1][0] == "acp.error"
+        assert "connection" in events[-1][1]["error"].lower()
+        # And the normalizer turns that into a failed run.
+        envs = gc_events.AcpNormalizer().normalize(*events[-1])
+        assert envs[0]["event"] == "run.failed"
+        assert envs[0]["status"] == "failed"
 
     def test_dead_binary_raises_actionable_acp_error(self, tmp_path, monkeypatch):
         _install_fake_acp(tmp_path, monkeypatch, "die")

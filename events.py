@@ -25,6 +25,7 @@ Canonical envelope::
 from __future__ import annotations
 
 import difflib
+import re
 import time
 from typing import Any, Dict, List, Tuple
 
@@ -342,6 +343,36 @@ def normalize_harness(event_key: str, data: Dict[str, Any]) -> List[Dict[str, An
 _ACP_EDIT_KINDS = {"edit", "write", "delete"}
 _ACP_NOISE_UPDATES = {"available_commands_update", "session_info_update", "plan"}
 
+# Transport-level failure signatures. Observed live (2026-07-03): when the
+# model stream behind cursor-agent dies mid-run, cursor-agent streams the
+# error text as an ordinary ``agent_message_chunk`` (e.g. "RetriableError:
+# [canceled] http/2 stream closed with error code CANCEL (0x8)") and STILL
+# resolves ``session/prompt`` with ``stopReason: "end_turn"`` — a clean
+# completion from ACP's point of view. Detect those signatures in the FINAL
+# contiguous content segment (anything the agent streamed after its last
+# tool/thought activity) so the run is classified failed instead of
+# completed. A signature that appears earlier and is followed by more
+# activity means cursor recovered — that run stays a normal completion.
+_TRANSPORT_ERROR_RE = re.compile(
+    r"(?:\bRetriableError\b|\bConnectError\b|\bECONNRESET\b"
+    r"|http/2 stream closed|stream closed with error code"
+    r"|\bconnection (?:closed|reset|refused|lost)\b|socket hang up)",
+    re.IGNORECASE,
+)
+# How much trailing content to keep for the transport-error scan; error
+# chunks are short, this only needs to survive delta splitting.
+_TRANSPORT_SCAN_CHARS = 4_000
+
+
+def _transport_error_line(text: str) -> str:
+    """The line of ``text`` carrying a transport-error signature, or ""."""
+    match = _TRANSPORT_ERROR_RE.search(text)
+    if not match:
+        return ""
+    start = text.rfind("\n", 0, match.start()) + 1
+    end = text.find("\n", match.end())
+    return text[start : end if end >= 0 else len(text)].strip()
+
 
 def unified_diff_text(before: str, after: str, path: str) -> Tuple[str, int, int]:
     """Unified diff text plus (added, removed) line counts."""
@@ -387,6 +418,11 @@ class AcpNormalizer:
     def __init__(self) -> None:
         # toolCallId → {kind, title, command, started (monotonic)}
         self._calls: Dict[str, Dict[str, Any]] = {}
+        # Tail of the FINAL contiguous content segment: agent_message_chunk
+        # deltas accumulate here and any tool/thought activity resets it, so
+        # at end_turn it holds only what the agent streamed last. Scanned
+        # for transport-error signatures (see _TRANSPORT_ERROR_RE).
+        self._final_content_tail = ""
 
     # -- event entry point ---------------------------------------------------
 
@@ -413,6 +449,20 @@ class AcpNormalizer:
         if event_key == "acp.result":
             stop = str(data.get("stopReason") or "")
             if stop == "end_turn":
+                transport_error = _transport_error_line(self._final_content_tail)
+                if transport_error:
+                    # The "clean" end_turn is a lie: the stream died and
+                    # cursor-agent narrated the transport error as its last
+                    # message. Classify the run failed, error first-class.
+                    return [
+                        lifecycle(
+                            "run.failed",
+                            status="failed",
+                            error=transport_error,
+                            transport_error=True,
+                            stop_reason=stop,
+                        )
+                    ]
                 return [lifecycle("run.completed", status="completed", stop_reason=stop)]
             if stop == "cancelled":
                 return [
@@ -457,17 +507,24 @@ class AcpNormalizer:
             return []
 
         if variant == "agent_thought_chunk":
+            self._final_content_tail = ""  # thought after content: not final
             text = _acp_text(upd)
             return [lifecycle("reasoning", text=text)] if text else []
 
         if variant == "agent_message_chunk":
             text = _acp_text(upd)
+            if text:
+                self._final_content_tail = (
+                    self._final_content_tail + text
+                )[-_TRANSPORT_SCAN_CHARS:]
             return [content_delta(text)] if text else []
 
         if variant == "tool_call":
+            self._final_content_tail = ""  # tool activity: content wasn't final
             return self._tool_call(upd)
 
         if variant == "tool_call_update":
+            self._final_content_tail = ""
             return self._tool_call_update(upd)
 
         # Unknown variant: opaque passthrough so nothing is silently dropped.
