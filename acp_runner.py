@@ -56,8 +56,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 
-from plugins.ghost_cursor.events import unified_diff_text
-from plugins.ghost_cursor.runner import (
+from .events import unified_diff_text
+from .runner import (
     CURSOR_AGENT_BIN,
     DEFAULT_TIMEOUT_S,
     TERM_GRACE_S,

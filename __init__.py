@@ -68,11 +68,11 @@ import os
 import time
 from typing import Any, Dict, Optional
 
-from plugins.ghost_cursor import acp_runner as _acp
-from plugins.ghost_cursor import events as _events
-from plugins.ghost_cursor import handles as _handles
-from plugins.ghost_cursor import jobs as _jobs
-from plugins.ghost_cursor import runner as _runner
+from . import acp_runner as _acp
+from . import events as _events
+from . import handles as _handles
+from . import jobs as _jobs
+from . import runner as _runner
 
 logger = logging.getLogger(__name__)
 
