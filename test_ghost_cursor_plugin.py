@@ -2121,8 +2121,8 @@ class TestEventLogIntegration:
         paged back through cursor_status."""
         big = "y" * 50_000
 
-        def replay(task, workdir, timeout=0.0, cancel_check=None,
-                   session_id=None, model=None):
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, session_id=None, model=None):
             yield ("acp.session", {"sessionId": "s-bigout", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
             yield ("acp.update", {
