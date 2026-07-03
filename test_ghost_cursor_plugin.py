@@ -2426,13 +2426,34 @@ class _FakeRun:
 class _FakeAgent:
     def __init__(self, agent_id="agent-fake-1", model_id="fake-model", runs=None):
         self.agent_id = agent_id
-        self.model = SimpleNamespace(id=model_id)
+        self.model = SimpleNamespace(id=model_id) if model_id else None
         self.sent = []
         self._runs = list(runs or [])
 
     def send(self, message, *a, **kw):
+        # Real bridge behavior (verified in the vendored @cursor/sdk source,
+        # sendImpl): a LOCAL agent handle with no model rejects every send
+        # with a non-retryable error — there is no conversation-model
+        # fallback. A resumed handle only has a model if the resume options
+        # carried one (see _FakeAgents.resume), so a model-less resume makes
+        # every follow-up send fail exactly like the live bridge did.
+        if self.model is None:
+            raise _sdk_error(
+                "Local SDK agents require an explicit `model`. Pass "
+                '`model: { id: "<model-id>" }` to Agent.create() or to '
+                "send(), or run this agent in cloud mode.",
+                is_retryable=False,
+            )
         self.sent.append(message)
         return self._runs.pop(0)
+
+
+def _sdk_error(text, is_retryable=False, retry_after=None):
+    err = RuntimeError(text)
+    err.is_retryable = is_retryable
+    if retry_after is not None:
+        err.retry_after = retry_after
+    return err
 
 
 class _FakeAgents:
@@ -2443,10 +2464,16 @@ class _FakeAgents:
         self.resume_error = resume_error
         self.create_error = create_error
 
-    def resume(self, agent_id, *a, **kw):
-        self.resume_calls.append(agent_id)
+    def resume(self, agent_id, options=None, *a, **kw):
+        self.resume_calls.append({"agent_id": agent_id, "options": options})
         if self.resume_error is not None:
             raise self.resume_error
+        # Real bridge behavior (verified): the resumed handle's model comes
+        # ONLY from the resume options — the stored conversation model is
+        # NOT rehydrated ("agent.model is None on resume unless you pass
+        # model again", SDK docs).
+        model = (options or {}).get("model")
+        self._agent.model = SimpleNamespace(id=model) if model else None
         return self._agent
 
     def create(self, **kw):
@@ -2663,12 +2690,72 @@ class TestSdkRunner:
         events = list(gc_sdk.run_sdk(
             "follow up", str(tmp_path),
             inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            agent_id="agent-prior",
+            agent_id="agent-prior", model="gpt-5.3-codex",
         ))
-        assert client.agents.resume_calls == ["agent-prior"]
+        assert [c["agent_id"] for c in client.agents.resume_calls] == ["agent-prior"]
         assert client.agents.create_calls == []
         assert events[0][1]["resumed"] is True
         assert events[0][1]["agentId"] == "agent-prior"
+
+    def test_resume_resupplies_the_model_so_followup_sends_work(
+        self, tmp_path, monkeypatch
+    ):
+        """Live-bridge regression (e2e test_followup_send_carries_context):
+        a resumed LOCAL agent handle carries NO model unless the resume
+        options pass one again, and a model-less handle rejects every send
+        with the non-retryable "Local SDK agents require an explicit
+        `model`" error. Two sequential sends on one agent — create+send,
+        then resume+send — must both finish."""
+        agent = _FakeAgent(agent_id="agent-multi",
+                           runs=[_FakeRun(_happy_script()),
+                                 _FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+
+        first = list(gc_sdk.run_sdk(
+            "Create calc.py with add(a, b).", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            model="gpt-5.4-nano",
+        ))
+        assert first[-1] == ("sdk.result", {"status": "finished"})
+
+        second = list(gc_sdk.run_sdk(
+            "Add subtract(a, b) to calc.py.", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-multi", model="gpt-5.4-nano",
+        ))
+        # The resume re-supplied the model on its options...
+        assert client.agents.resume_calls == [
+            {"agent_id": "agent-multi", "options": {"model": "gpt-5.4-nano"}}
+        ]
+        # ...so the follow-up send succeeded instead of failing the run.
+        assert not [o for k, o in second if k == "sdk.error"]
+        assert second[-1] == ("sdk.result", {"status": "finished"})
+        assert agent.sent == [
+            "Create calc.py with add(a, b).",
+            "Add subtract(a, b) to calc.py.",
+        ]
+
+    def test_resume_without_recorded_model_falls_back_to_default(
+        self, tmp_path, monkeypatch
+    ):
+        """No model threaded on the follow-up (nothing recorded on the
+        handle, no config): the resume still must carry SOME model — the
+        same DEFAULT_MODEL fallback the create path uses — or the send is
+        rejected by the bridge."""
+        agent = _FakeAgent(agent_id="agent-prior",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "follow up", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-prior",
+        ))
+        assert client.agents.resume_calls[0]["options"] == {
+            "model": gc_runner.DEFAULT_MODEL
+        }
+        assert events[-1] == ("sdk.result", {"status": "finished"})
 
     def test_failed_resume_falls_back_to_fresh_agent(self, tmp_path, monkeypatch):
         agent = _FakeAgent(agent_id="agent-fresh",
@@ -2680,7 +2767,7 @@ class TestSdkRunner:
             inactivity_timeout_s=30.0, cancel_check=lambda: False,
             agent_id="agent-gone",
         ))
-        assert client.agents.resume_calls == ["agent-gone"]
+        assert [c["agent_id"] for c in client.agents.resume_calls] == ["agent-gone"]
         assert len(client.agents.create_calls) == 1
         assert events[0][1]["resumed"] is False
         assert events[0][1]["agentId"] == "agent-fresh"

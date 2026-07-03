@@ -353,12 +353,24 @@ class _SdkWorker:
         If the resume fails (expired/unknown agent), fall back to a fresh
         create so the task still runs, just without prior context — the
         ``sdk.session`` event's ``resumed`` field reports what happened.
+
+        The resume MUST re-supply ``model``: a resumed agent handle carries
+        no model (``agent.model is None on resume unless you pass model
+        again`` — SDK docs, verified in the bridge source), and a local
+        agent whose handle has no model rejects every ``send`` with the
+        non-retryable "Local SDK agents require an explicit ``model``"
+        error. This is what broke all follow-up sends (e2e
+        test_followup_send_carries_context): first send worked because
+        create passes the model; the second send resumed without one.
         """
         if self._resume_agent_id:
             try:
                 agent = _call_with_retries(
                     "agents.resume",
-                    lambda: client.agents.resume(self._resume_agent_id),
+                    lambda: client.agents.resume(
+                        self._resume_agent_id,
+                        {"model": self._model or DEFAULT_MODEL},
+                    ),
                 )
                 return agent, True
             except Exception as exc:
