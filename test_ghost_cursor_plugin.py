@@ -34,6 +34,7 @@ from types import SimpleNamespace
 import pytest
 
 import plugins.ghost_cursor as gc
+from plugins.ghost_cursor import eventlog as gc_eventlog
 from plugins.ghost_cursor import (
     CURSOR_SEND_SCHEMA,
     CURSOR_START_SCHEMA,
@@ -273,14 +274,17 @@ def _drain_completion_queue():
 
 @pytest.fixture
 def clean_state(monkeypatch):
-    """Fresh job registry + handle table + drained completion queue."""
+    """Fresh job registry + handle table + event-log writer state + drained
+    completion queue."""
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
     monkeypatch.setattr(gc_handles, "_table", {})
     monkeypatch.setattr(gc_handles, "_loaded", False)
+    gc_eventlog._reset_for_tests()
     yield gc_jobs.registry
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
+    gc_eventlog._reset_for_tests()
 
 
 def _wait_until(cond, timeout=10.0, interval=0.01):
@@ -1773,3 +1777,414 @@ class TestProgressBuffer:
         assert "before" not in line and "after" not in line
         assert line["path"] == "/r/f.py"
         assert len(line["diff"]) <= gc_jobs._BUFFER_DIFF_CHARS + 40
+
+
+# ---------------------------------------------------------------------------
+# eventlog.py — per-session JSONL spill log: creation, pagination, compaction
+# ---------------------------------------------------------------------------
+
+def _log_lines(sid):
+    path = gc_eventlog.log_path(sid)
+    assert path is not None and path.is_file(), f"no spill log for {sid!r}"
+    return [json.loads(l) for l in path.read_text("utf-8").splitlines() if l.strip()]
+
+
+class TestEventLog:
+    def test_append_creates_jsonl_under_hermes_home(
+        self, clean_state, _isolate_hermes_home
+    ):
+        gc_eventlog.append("s-log", {"kind": "content", "delta": "hi"})
+        path = gc_eventlog.log_path("s-log")
+        assert path == (
+            _isolate_hermes_home / "state" / "ghost_cursor" / "logs" / "s-log.jsonl"
+        )
+        lines = _log_lines("s-log")
+        assert len(lines) == 1
+        assert lines[0]["seq"] == 0
+        assert lines[0]["ts"] > 0
+        assert lines[0]["kind"] == "content"
+        assert lines[0]["delta"] == "hi"
+
+    def test_seq_is_monotonic_and_survives_a_process_restart(self, clean_state):
+        for i in range(3):
+            gc_eventlog.append("s-seq", {"kind": "content", "delta": f"e{i}"})
+        # Simulate a fresh process: the writer must re-derive next_seq from
+        # the file tail, not restart at 0.
+        gc_eventlog._reset_for_tests()
+        gc_eventlog.append("s-seq", {"kind": "content", "delta": "e3"})
+        assert [l["seq"] for l in _log_lines("s-seq")] == [0, 1, 2, 3]
+
+    def test_unsafe_handle_characters_cannot_escape_the_logs_dir(self, clean_state):
+        gc_eventlog.append("../../evil/sid", {"kind": "content", "delta": "x"})
+        path = gc_eventlog.log_path("../../evil/sid")
+        assert path.parent == gc_eventlog.logs_dir()
+        assert path.is_file()
+
+    def test_append_never_raises_without_a_session_id(self, clean_state):
+        gc_eventlog.append("", {"kind": "content", "delta": "x"})
+        gc_eventlog.append(None, {"kind": "content", "delta": "x"})
+
+    def test_stats_reports_path_and_total_events(self, clean_state):
+        assert gc_eventlog.stats("s-none") is None
+        for i in range(5):
+            gc_eventlog.append("s-st", {"kind": "content", "delta": str(i)})
+        stats = gc_eventlog.stats("s-st")
+        assert stats["path"] == str(gc_eventlog.log_path("s-st"))
+        assert stats["total_events"] == 5
+
+    def test_read_page_slices_by_seq(self, clean_state):
+        for i in range(30):
+            gc_eventlog.append("s-page", {"kind": "content", "delta": f"event {i:02d}"})
+
+        page = gc_eventlog.read_page("s-page", offset=10, limit=5)
+        assert [e["seq"] for e in page["events"]] == [10, 11, 12, 13, 14]
+        assert page["events"][0]["delta"] == "event 10"
+        assert page["offset"] == 10 and page["limit"] == 5
+        assert page["total_events"] == 30
+        assert page["log_path"] == str(gc_eventlog.log_path("s-page"))
+
+        # Last (partial) page, then past-the-end.
+        assert [e["seq"] for e in gc_eventlog.read_page(
+            "s-page", offset=28, limit=10)["events"]] == [28, 29]
+        assert gc_eventlog.read_page("s-page", offset=100, limit=10)["events"] == []
+
+    def test_read_page_defaults_and_bad_params_are_forgiving(self, clean_state):
+        for i in range(3):
+            gc_eventlog.append("s-def", {"kind": "content", "delta": str(i)})
+        page = gc_eventlog.read_page("s-def")
+        assert len(page["events"]) == 3
+        page = gc_eventlog.read_page("s-def", offset="junk", limit="junk")
+        assert page["offset"] == 0 and page["limit"] == gc_eventlog.DEFAULT_PAGE_LIMIT
+        assert gc_eventlog.read_page("s-def", offset=-5, limit=0)["limit"] == 1
+        assert gc_eventlog.read_page(
+            "s-def", limit=10_000)["limit"] == gc_eventlog.MAX_PAGE_LIMIT
+        assert gc_eventlog.read_page("s-missing") is None
+
+    def test_oversized_fields_clip_inline_but_stay_full_in_the_jsonl(
+        self, clean_state
+    ):
+        big = "x" * (gc_eventlog.PAGE_FIELD_CHARS * 3)
+        gc_eventlog.append("s-big", {"kind": "tool_result", "id": "t1",
+                                     "status": "done", "output": big})
+        # Full fidelity on disk...
+        assert _log_lines("s-big")[0]["output"] == big
+        # ...clipped inline on the paged view, with a pointer to the log.
+        paged = gc_eventlog.read_page("s-big", offset=0, limit=1)["events"][0]
+        assert len(paged["output"]) < len(big)
+        assert paged["output"].startswith("x" * gc_eventlog.PAGE_FIELD_CHARS)
+        assert "truncated" in paged["output"]
+        assert paged["status"] == "done"  # small fields untouched
+
+    def test_log_compacts_to_head_plus_tail_at_the_byte_cap(
+        self, clean_state, monkeypatch
+    ):
+        monkeypatch.setattr(gc_eventlog, "MAX_LOG_BYTES", 20_000)
+        monkeypatch.setattr(gc_eventlog, "HEAD_RETAIN_BYTES", 5_000)
+        monkeypatch.setattr(gc_eventlog, "TAIL_RETAIN_BYTES", 10_000)
+
+        n = 300  # ~100 bytes/line → several compactions past the 20KB cap
+        for i in range(n):
+            gc_eventlog.append("s-cap", {"kind": "content",
+                                         "delta": f"event {i:03d} " + "p" * 60})
+
+        path = gc_eventlog.log_path("s-cap")
+        assert path.stat().st_size <= 20_000
+
+        lines = _log_lines("s-cap")
+        seqs = [l["seq"] for l in lines if isinstance(l.get("seq"), int)]
+        markers = [l for l in lines if l.get("kind") == "log_compaction"]
+        # Head (oldest) and tail (newest) both survive; the middle is gone.
+        assert seqs[0] == 0
+        assert seqs[-1] == n - 1
+        assert len(seqs) < n
+        assert markers, "compaction must leave a marker in the gap"
+        marker = markers[-1]
+        assert marker["dropped_events"] > 0
+        assert 0 < marker["first_dropped_seq"] <= marker["last_dropped_seq"] < n - 1
+        # Every retained line is still valid JSON with its ORIGINAL seq —
+        # compaction never renumbers.
+        assert seqs == sorted(seqs)
+        # total_events counts everything ever appended, dropped included.
+        assert gc_eventlog.stats("s-cap")["total_events"] == n
+
+    def test_read_page_reports_compaction_gaps_in_range(
+        self, clean_state, monkeypatch
+    ):
+        monkeypatch.setattr(gc_eventlog, "MAX_LOG_BYTES", 20_000)
+        monkeypatch.setattr(gc_eventlog, "HEAD_RETAIN_BYTES", 5_000)
+        monkeypatch.setattr(gc_eventlog, "TAIL_RETAIN_BYTES", 10_000)
+        for i in range(300):
+            gc_eventlog.append("s-gap", {"kind": "content",
+                                         "delta": f"event {i:03d} " + "p" * 60})
+        marker = [l for l in _log_lines("s-gap")
+                  if l.get("kind") == "log_compaction"][-1]
+        dropped_seq = marker["first_dropped_seq"]
+
+        page = gc_eventlog.read_page("s-gap", offset=dropped_seq, limit=5)
+        assert page["gaps"], "a page over dropped seqs must disclose the gap"
+        assert "compaction" in page["note"]
+        # A page fully inside the retained tail has no gap disclosure.
+        tail_page = gc_eventlog.read_page("s-gap", offset=295, limit=5)
+        assert len(tail_page["events"]) == 5
+        assert "gaps" not in tail_page
+
+
+# ---------------------------------------------------------------------------
+# Spill integration — runs stream to the JSONL log; cursor_status pages it
+# ---------------------------------------------------------------------------
+
+class TestEventLogIntegration:
+    def _run_to_completion(self, monkeypatch, tmp_path, sid="s-spill"):
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid=sid)
+        )
+        res = json.loads(cursor_start("t", repo=str(tmp_path)))
+        assert res["success"] is True
+        job = _job_for(sid)
+        assert job.done_event.wait(10)
+        return job
+
+    def test_run_streams_full_envelopes_to_the_session_log(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        job = self._run_to_completion(monkeypatch, tmp_path)
+        lines = _log_lines("s-spill")
+        # Every folded envelope landed, in order, seq from 0.
+        assert [l["seq"] for l in lines] == list(range(len(lines)))
+        assert len(lines) == job.progress_events
+        kinds = [l["kind"] for l in lines]
+        assert "lifecycle" in kinds and "tool_result" in kinds
+        # FULL fidelity: file_diff lines keep before/after content that the
+        # in-memory rolling buffer strips.
+        diffs = [l for l in lines if l["kind"] == "file_diff"]
+        assert diffs and all("before" in d and "after" in d for d in diffs)
+
+    def test_cursor_status_returns_log_path_and_total_event_count(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        self._run_to_completion(monkeypatch, tmp_path)
+        status = json.loads(cursor_status("s-spill"))
+        assert status["success"] is True
+        # Additive fields; the compact-tail shape is unchanged.
+        assert status["event_log"]["path"] == str(gc_eventlog.log_path("s-spill"))
+        assert status["event_log"]["total_events"] == status["progress_events"]
+        assert "progress_tail" in status and "events_page" not in status
+
+    def test_cursor_status_pages_the_persisted_log(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        self._run_to_completion(monkeypatch, tmp_path)
+        total = json.loads(cursor_status("s-spill"))["event_log"]["total_events"]
+
+        first = json.loads(cursor_status("s-spill", offset=0, limit=2))
+        page = first["events_page"]
+        assert [e["seq"] for e in page["events"]] == [0, 1]
+        assert page["total_events"] == total
+
+        rest = json.loads(cursor_status("s-spill", offset=2, limit=500))
+        assert [e["seq"] for e in rest["events_page"]["events"]] == list(
+            range(2, total)
+        )
+
+    def test_status_pages_across_a_process_restart(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The log outlives the process: a persisted handle with no live job
+        still exposes event_log + pagination."""
+        self._run_to_completion(monkeypatch, tmp_path)
+        gc_jobs.registry._reset_for_tests()
+        gc_eventlog._reset_for_tests()
+
+        status = json.loads(cursor_status("s-spill", offset=0, limit=3))
+        assert status["success"] is True
+        assert "not tracked live" in status["note"]
+        assert status["event_log"]["total_events"] > 0
+        assert [e["seq"] for e in status["events_page"]["events"]] == [0, 1, 2]
+
+    def test_paging_an_unknown_log_is_graceful(self, clean_state, tmp_path):
+        gc_handles.record("s-nolog", repo=str(tmp_path), status="completed")
+        status = json.loads(cursor_status("s-nolog", offset=0, limit=5))
+        assert status["success"] is True
+        assert "event_log" not in status
+        assert status["events_page"]["events"] == []
+        assert "no persisted event log" in status["events_page"]["note"]
+
+    def test_oversized_tool_output_full_in_log_clipped_on_page(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """>4KB per-event output: full in the JSONL, truncated inline when
+        paged back through cursor_status."""
+        big = "y" * 50_000
+
+        def replay(task, workdir, timeout=0.0, cancel_check=None,
+                   session_id=None, model=None):
+            yield ("acp.session", {"sessionId": "s-bigout", "cwd": str(workdir),
+                                   "model": "m", "resumed": False})
+            yield ("acp.update", {
+                "sessionUpdate": "tool_call", "toolCallId": "t1",
+                "title": "big", "kind": "execute", "status": "pending",
+                "rawInput": {"command": "generate"},
+            })
+            yield ("acp.update", {
+                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+                "status": "completed", "rawOutput": {"stdout": big},
+            })
+            yield ("acp.result", {"stopReason": "end_turn"})
+
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        assert json.loads(cursor_start("t", repo=str(tmp_path)))["success"] is True
+        assert _job_for("s-bigout").done_event.wait(10)
+
+        on_disk = [l for l in _log_lines("s-bigout") if l["kind"] == "tool_result"][0]
+        assert on_disk["output"] == big
+        paged = json.loads(cursor_status("s-bigout", offset=on_disk["seq"], limit=1))
+        out = paged["events_page"]["events"][0]["output"]
+        assert len(out) < len(big)
+        assert "truncated" in out
+
+
+# ---------------------------------------------------------------------------
+# Handle scoping — session_key isolation, scope='all', explicit-id crossing
+# ---------------------------------------------------------------------------
+
+class TestHandleScoping:
+    def _seed_two_sessions(self):
+        gc_handles.record("s-alice", repo="/r/a", status="running",
+                          session_key="gw:alice")
+        gc_handles.record("s-bob", repo="/r/b", status="completed",
+                          session_key="gw:bob")
+
+    def test_session_scope_isolates_two_session_keys(self, clean_handles):
+        self._seed_two_sessions()
+        assert gc_handles.known_handles(
+            scope="session", session_key="gw:alice") == ["s-alice"]
+        assert gc_handles.known_handles(
+            scope="session", session_key="gw:bob") == ["s-bob"]
+
+    def test_scope_all_sees_both(self, clean_handles):
+        self._seed_two_sessions()
+        assert set(gc_handles.known_handles(scope="all", session_key="gw:alice")) == {
+            "s-alice", "s-bob",
+        }
+
+    def test_explicit_id_lookup_crosses_scopes(self, clean_handles):
+        self._seed_two_sessions()
+        # get() takes no scope at all — an explicit handle is explicit intent.
+        assert gc_handles.get("s-bob")["session_key"] == "gw:bob"
+        assert gc_handles.get("s-alice")["repo"] == "/r/a"
+
+    def test_legacy_entries_without_session_key_belong_to_cli(self, clean_handles):
+        gc_handles.record("s-legacy", repo="/r", status="completed")  # no key
+        assert gc_handles.known_handles(scope="session", session_key="") == ["s-legacy"]
+        assert gc_handles.known_handles(scope="session", session_key="gw:x") == []
+
+    def test_unknown_scope_falls_back_to_session(self, clean_handles):
+        self._seed_two_sessions()
+        assert gc_handles.known_handles(
+            scope="everything", session_key="gw:alice") == ["s-alice"]
+
+    def test_dispatch_records_the_hermes_session_key_on_the_handle(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:alice")
+        monkeypatch.setattr(
+            gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid="s-mine")
+        )
+        assert json.loads(cursor_start("t", repo=str(tmp_path)))["success"] is True
+        assert _job_for("s-mine").done_event.wait(10)
+        assert gc_handles.get("s-mine")["session_key"] == "gw:alice"
+
+    def test_unknown_handle_hints_are_scoped_by_default(
+        self, clean_state, monkeypatch
+    ):
+        """Two Hermes sessions share the table: session A's error hints must
+        not leak session B's handles unless scope='all' is requested."""
+        gc_handles.record("s-mine", repo="/r", status="completed",
+                          session_key="gw:alice")
+        gc_handles.record("s-theirs", repo="/r", status="completed",
+                          session_key="gw:bob")
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:alice")
+
+        for res in (
+            json.loads(cursor_status("s-nope")),
+            json.loads(cursor_send("s-nope", "hi")),
+            json.loads(cursor_stop("s-nope")),
+        ):
+            assert res["success"] is False
+            assert res["known_sessions"] == ["s-mine"]
+
+        opened = json.loads(cursor_status("s-nope", scope="all"))
+        assert set(opened["known_sessions"]) == {"s-mine", "s-theirs"}
+
+    def test_explicit_status_lookup_crosses_hermes_sessions(
+        self, clean_state, monkeypatch
+    ):
+        gc_handles.record("s-theirs", repo="/r/b", status="completed",
+                          session_key="gw:bob", task="their task")
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:alice")
+        status = json.loads(cursor_status("s-theirs"))
+        assert status["success"] is True
+        assert status["status"] == "completed"
+        assert status["task"] == "their task"
+
+
+# ---------------------------------------------------------------------------
+# Handle pruning — age out old terminal entries; cap spares live handles
+# ---------------------------------------------------------------------------
+
+class TestHandlePrune:
+    def test_old_terminal_handles_age_out_on_write(self, clean_handles):
+        gc_handles.record("s-old-done", status="completed")
+        gc_handles._table["s-old-done"]["updated_at"] = (
+            time.time() - gc_handles.PRUNE_TERMINAL_AFTER_S - 60
+        )
+        gc_handles.record("s-fresh", status="running")
+        assert gc_handles.get("s-old-done") is None
+        assert gc_handles.get("s-fresh") is not None
+
+    def test_old_running_handles_are_not_aged_out(self, clean_handles):
+        """Age-based pruning only touches TERMINAL states — a long-running
+        (or stale-but-unresolved) handle is not silently forgotten."""
+        gc_handles.record("s-old-run", status="running")
+        gc_handles._table["s-old-run"]["updated_at"] = (
+            time.time() - gc_handles.PRUNE_TERMINAL_AFTER_S - 60
+        )
+        gc_handles.record("s-fresh", status="running")
+        assert gc_handles.get("s-old-run") is not None
+
+    def test_recent_terminal_handles_survive(self, clean_handles):
+        gc_handles.record("s-done", status="completed")
+        gc_handles.record("s-fresh", status="running")
+        assert gc_handles.get("s-done") is not None
+
+    def test_cap_evicts_terminal_entries_before_running_ones(
+        self, clean_handles, monkeypatch
+    ):
+        monkeypatch.setattr(gc_handles, "MAX_ENTRIES", 3)
+        now = time.time()
+        gc_handles.record("s-run-old", status="running")
+        gc_handles._table["s-run-old"]["updated_at"] = now - 300
+        gc_handles.record("s-done-new", status="completed")
+        gc_handles._table["s-done-new"]["updated_at"] = now - 10
+        gc_handles.record("s-run-new", status="running")
+        gc_handles._table["s-run-new"]["updated_at"] = now - 5
+        gc_handles.record("s-final", status="running")
+        # Over cap by one: the TERMINAL entry goes, even though a running
+        # entry is older — finished runs never push out live handles.
+        assert len(gc_handles._table) <= 3
+        assert gc_handles.get("s-done-new") is None
+        assert gc_handles.get("s-run-old") is not None
+        assert gc_handles.get("s-run-new") is not None
+        assert gc_handles.get("s-final") is not None
+
+    def test_cap_still_enforced_when_everything_is_running(
+        self, clean_handles, monkeypatch
+    ):
+        monkeypatch.setattr(gc_handles, "MAX_ENTRIES", 2)
+        for i in range(3):
+            gc_handles.record(f"s-run-{i}", status="running")
+            gc_handles._table[f"s-run-{i}"]["updated_at"] = float(i)
+        gc_handles.record("s-run-final", status="running")
+        assert len(gc_handles._table) <= 2
+        assert "s-run-final" in gc_handles._table
+        assert "s-run-0" not in gc_handles._table

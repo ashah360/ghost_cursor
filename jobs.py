@@ -63,6 +63,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from . import eventlog as _eventlog
 from . import handles as _handles
 
 logger = logging.getLogger(__name__)
@@ -71,6 +72,10 @@ logger = logging.getLogger(__name__)
 MAX_PROGRESS_CHARS = 200_000
 # How many finished jobs to retain for cursor_status queries.
 MAX_FINISHED_JOBS = 20
+# Envelopes produced before the ACP session (the spill-log key) exists are
+# held here, then flushed the moment the handle arrives. Bounded so a run
+# that never gets a session can't grow it forever.
+MAX_PENDING_SPILL = 1_000
 
 # Per-envelope trims for the rolling buffer (full-fidelity diffs live in the
 # job's ``files`` aggregation, same caps as the final result).
@@ -141,6 +146,7 @@ class CursorJob:
     cancelled: bool = False
     result: Optional[Dict[str, Any]] = None
     # --- control ---
+    _pending_spill: List[Dict[str, Any]] = field(default_factory=list, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     # Set the instant the ACP session is established (handle available).
@@ -194,6 +200,12 @@ class CursorJob:
         trimmed from the front at a line boundary. Full before/after file
         content is dropped (the diff carries the signal); diffs and shell
         output are clipped so one giant edit can't evict all history.
+
+        The UNCLIPPED envelope is also spilled to the per-session JSONL
+        event log (``eventlog.py``) so everything the compact buffer evicts
+        or trims stays recoverable and pageable via ``cursor_status``.
+        Envelopes that arrive before the session handle exists are held in
+        a bounded pending list and flushed the moment it does.
         """
         compact = {k: v for k, v in envelope.items() if k not in ("before", "after")}
         if isinstance(compact.get("diff"), str):
@@ -211,6 +223,20 @@ class CursorJob:
                 nl = cut.find("\n")
                 self.progress_buffer = cut[nl + 1:] if nl >= 0 else cut
             self.progress_events += 1
+            # Spill key: the established handle, else the requested resume
+            # handle (a continuation of session S belongs in S's log).
+            spill_sid = self.cursor_session_id or self.requested_session_id or ""
+            if spill_sid:
+                to_spill = self._pending_spill + [envelope]
+                self._pending_spill = []
+            else:
+                if len(self._pending_spill) < MAX_PENDING_SPILL:
+                    self._pending_spill.append(dict(envelope))
+                to_spill = []
+        # File I/O outside the job lock (eventlog serializes internally);
+        # only the worker thread appends progress, so order is preserved.
+        for env in to_spill:
+            _eventlog.append(spill_sid, env)
 
     # -- read-only view ---------------------------------------------------------
 

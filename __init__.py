@@ -69,6 +69,7 @@ import time
 from typing import Any, Dict, Optional
 
 from . import acp_runner as _acp
+from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
 from . import jobs as _jobs
@@ -206,13 +207,43 @@ CURSOR_STATUS_SCHEMA = {
         "so it is always safe to call mid-run. Returns the run status "
         "(running / completed / failed / cancelled / timeout), the "
         "assistant summary and files changed so far (with per-edit diffs), "
-        "the latest reasoning, the cursor session_id, and elapsed time. "
-        "Use it when the user asks how a delegated coding task is going."
+        "the latest reasoning, the cursor session_id, and elapsed time — "
+        "plus the path to the full persisted event log (JSONL) and its "
+        "total event count. Pass offset/limit to page through the "
+        "persisted event history (the default response only carries "
+        "compact tails). Use it when the user asks how a delegated coding "
+        "task is going."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "session_id": {"type": "string", "description": _HANDLE_DOC},
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "Optional. Page through the persisted event log: return "
+                    "events with seq >= offset (0-based). Providing offset "
+                    "and/or limit adds an `events_page` field to the result."
+                ),
+            },
+            "limit": {
+                "type": "integer",
+                "description": (
+                    "Optional. Max events per page (default 50, max 500). "
+                    "Used with `offset` to page through the event log."
+                ),
+            },
+            "scope": {
+                "type": "string",
+                "enum": ["session", "all"],
+                "description": (
+                    "Optional. Which handles the `known_sessions` hint in "
+                    "an unknown-handle error may list: 'session' (default) "
+                    "= only runs dispatched from this Hermes session, "
+                    "'all' = every recorded run. Explicit session_id "
+                    "lookups always resolve regardless of scope."
+                ),
+            },
         },
         "required": ["session_id"],
     },
@@ -269,6 +300,19 @@ def _resolve_session_key() -> str:
         return get_current_session_key(default="") or ""
     except Exception:
         return ""
+
+
+def _known_sessions(scope: str = "session") -> list:
+    """Scoped handle listing for actionable error messages.
+
+    Default scope "session": only handles dispatched from the CURRENT
+    Hermes session — with many concurrent sessions sharing the table, one
+    session's error hint must not leak (or suggest steering) another
+    session's runs. ``scope="all"`` opts into the global view.
+    """
+    return _handles.known_handles(
+        scope=scope, session_key=_resolve_session_key()
+    )
 
 
 def _configured_model() -> Optional[str]:
@@ -373,6 +417,11 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
                     status="running",
                     task=job.task[:200],
                     model=job.model or job.requested_model,
+                    # Scope tag: which Hermes session dispatched this run
+                    # ("" = CLI). Captured on the dispatching thread at
+                    # dispatch time (worker threads don't carry the
+                    # contextvar) and threaded through the job.
+                    session_key=job.session_key,
                 )
                 job.session_event.set()
             for envelope in normalizer.normalize(key, obj):
@@ -669,7 +718,7 @@ def cursor_send(
                     f"unknown cursor session '{sid}' — no active or "
                     "recorded run has that handle"
                 ),
-                "known_sessions": _handles.known_handles(),
+                "known_sessions": _known_sessions(),
                 "note": "Start a new run with cursor_start.",
             }, ensure_ascii=False)
         repo = str(entry["repo"])
@@ -702,12 +751,51 @@ def cursor_send(
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
-def cursor_status(session_id: str, **_kwargs: Any) -> str:
+def _event_log_extras(
+    sid: str, offset: Optional[Any], limit: Optional[Any]
+) -> Dict[str, Any]:
+    """Additive ``event_log`` (+ ``events_page`` when paging) fields.
+
+    ``event_log`` = {path, total_events} whenever the session has a
+    persisted JSONL log; ``events_page`` = one page over it when the caller
+    passed offset and/or limit. Both are additive — the compact-tail shape
+    is unchanged.
+    """
+    extras: Dict[str, Any] = {}
+    stats = _eventlog.stats(sid)
+    if stats is not None:
+        extras["event_log"] = stats
+    if offset is not None or limit is not None:
+        page = _eventlog.read_page(
+            sid,
+            offset=offset if offset is not None else 0,
+            limit=limit if limit is not None else _eventlog.DEFAULT_PAGE_LIMIT,
+        )
+        extras["events_page"] = page if page is not None else {
+            "events": [],
+            "total_events": 0,
+            "note": "no persisted event log for this session",
+        }
+    return extras
+
+
+def cursor_status(
+    session_id: str,
+    offset: Optional[int] = None,
+    limit: Optional[int] = None,
+    scope: str = "session",
+    **_kwargs: Any,
+) -> str:
     """Read-only snapshot for a cursor run (see CURSOR_STATUS_SCHEMA).
 
     STRICTLY READ-ONLY: only copies job state under its lock. It never
     sends ``session/cancel``, never touches the cancel event, never joins
     or signals the worker — polling a running run cannot affect it.
+
+    ``offset``/``limit`` page through the persisted JSONL event log
+    (additive ``events_page`` field). ``scope`` only affects the
+    ``known_sessions`` hint on an unknown handle; the explicit lookup
+    itself always crosses sessions.
     """
     sid = str(session_id or "").strip()
     if not sid:
@@ -720,11 +808,13 @@ def cursor_status(session_id: str, **_kwargs: Any) -> str:
             # Session not yet established for a just-dispatched resume.
             snap["session_id"] = sid
             snap["cursor_session_id"] = sid
+        snap.update(_event_log_extras(str(snap.get("session_id") or sid), offset, limit))
         return json.dumps({"success": True, **snap}, ensure_ascii=False, default=str)
 
     entry = _handles.get(sid)
     if entry is not None:
         # Known handle, but no live job in this process (e.g. restart).
+        # The JSONL event log persists, so history stays pageable here too.
         status = str(entry.get("status") or "unknown")
         if status == "running":
             # A dead process can't have left a live run behind.
@@ -736,6 +826,7 @@ def cursor_status(session_id: str, **_kwargs: Any) -> str:
             "repo": entry.get("repo", ""),
             "task": entry.get("task", ""),
             "model": entry.get("model", ""),
+            **_event_log_extras(sid, offset, limit),
             "note": (
                 "This handle is not tracked live in the current process; "
                 "showing its persisted record. Pass it to cursor_send or "
@@ -746,7 +837,7 @@ def cursor_status(session_id: str, **_kwargs: Any) -> str:
     return json.dumps({
         "success": False,
         "error": f"unknown cursor session '{sid}'",
-        "known_sessions": _handles.known_handles(),
+        "known_sessions": _known_sessions(scope),
     }, ensure_ascii=False)
 
 
@@ -776,7 +867,7 @@ def cursor_stop(session_id: str, **_kwargs: Any) -> str:
         return json.dumps({
             "success": False,
             "error": f"unknown cursor session '{sid}'",
-            "known_sessions": _handles.known_handles(),
+            "known_sessions": _known_sessions(),
         }, ensure_ascii=False)
 
     if job.status in _jobs.TERMINAL_STATUSES:
@@ -838,7 +929,12 @@ def _handle_cursor_send(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 def _handle_cursor_status(args: Dict[str, Any], **kwargs: Any) -> str:
-    return cursor_status(session_id=args.get("session_id", ""))
+    return cursor_status(
+        session_id=args.get("session_id", ""),
+        offset=args.get("offset"),
+        limit=args.get("limit"),
+        scope=args.get("scope", "session"),
+    )
 
 
 def _handle_cursor_stop(args: Dict[str, Any], **kwargs: Any) -> str:

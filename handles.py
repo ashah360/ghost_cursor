@@ -12,7 +12,19 @@ What this is NOT: there is no ``get_recent()``, no repo matching, no age
 window, no auto-resume. Lookup is by exact handle only. If the caller lost
 the handle, the run's completion delivery re-states it; nothing is guessed.
 
+Session scoping: each entry records the dispatching Hermes ``session_key``
+(empty string = CLI). LISTING (``known_handles``) is scoped to the caller's
+session_key by default (``scope="session"``); ``scope="all"`` opts into the
+global view. Direct ``get(session_id)`` lookups are deliberately UNSCOPED —
+an explicit handle is explicit intent, and cross-session continuation must
+keep working.
+
 Storage: ``<HERMES_HOME>/state/ghost_cursor_handles.json``.
+
+Bounded growth: terminal-state entries older than
+:data:`PRUNE_TERMINAL_AFTER_S` are dropped on every write, and the table is
+capped at :data:`MAX_ENTRIES` — evicting oldest TERMINAL entries first so a
+crowd of finished runs can never push out another session's live handle.
 
 Contract: never raises. A missing/corrupt/unwritable file degrades to the
 in-memory (process-local) view.
@@ -29,8 +41,18 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Retain this many handles in the file (pruned oldest-first by updated_at).
-MAX_ENTRIES = 50
+# Retain this many handles in the file. Sized for many concurrent Hermes
+# sessions sharing one table (the entries are small); terminal entries are
+# evicted before running ones, so the cap degrades gracefully under load.
+MAX_ENTRIES = 500
+# Terminal-state entries older than this are pruned on every write.
+PRUNE_TERMINAL_AFTER_S = 7 * 24 * 3600
+
+# Mirrors jobs.TERMINAL_STATUSES (duplicated to avoid a circular import —
+# jobs.py imports this module).
+_TERMINAL_STATUSES = ("completed", "failed", "cancelled", "timeout")
+
+VALID_SCOPES = ("session", "all")
 
 _lock = threading.Lock()
 _table: Dict[str, Dict[str, Any]] = {}
@@ -83,11 +105,31 @@ def _save_locked() -> None:
         logger.debug("ghost_cursor handle table save failed", exc_info=True)
 
 
-def _prune_locked() -> None:
+def _is_terminal(entry: Dict[str, Any]) -> bool:
+    return str(entry.get("status") or "") in _TERMINAL_STATUSES
+
+
+def _prune_locked(now: Optional[float] = None) -> None:
+    """Age out old terminal entries, then enforce the size cap.
+
+    Eviction order under the cap: oldest TERMINAL entries first; only when
+    the table is over cap with no terminal entries left do the oldest
+    non-terminal (running/unknown) entries go — a burst of finished runs
+    can't push out live handles.
+    """
+    now = time.time() if now is None else now
+    for key in [
+        k for k, e in _table.items()
+        if _is_terminal(e)
+        and now - float(e.get("updated_at") or 0.0) > PRUNE_TERMINAL_AFTER_S
+    ]:
+        _table.pop(key, None)
+
     if len(_table) <= MAX_ENTRIES:
         return
     by_age = sorted(
-        _table.items(), key=lambda kv: float(kv[1].get("updated_at") or 0.0)
+        _table.items(),
+        key=lambda kv: (not _is_terminal(kv[1]), float(kv[1].get("updated_at") or 0.0)),
     )
     for key, _ in by_age[: len(_table) - MAX_ENTRIES]:
         _table.pop(key, None)
@@ -114,7 +156,11 @@ def record(session_id: Optional[str], **fields: Any) -> None:
 
 
 def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """The persisted entry for ``session_id``, or None. Never raises."""
+    """The persisted entry for ``session_id``, or None. Never raises.
+
+    Deliberately UNSCOPED: an explicit handle is explicit intent, so direct
+    lookups resolve across Hermes sessions (see module docstring).
+    """
     try:
         if not session_id:
             return None
@@ -127,13 +173,34 @@ def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 
-def known_handles(limit: int = 10) -> List[str]:
-    """The most recently updated handles (for actionable error messages)."""
+def _in_scope(entry: Dict[str, Any], scope: str, session_key: str) -> bool:
+    if scope == "all":
+        return True
+    # Session scope: entries recorded by the same Hermes session. Entries
+    # written before session_key existed (legacy) count as CLI (key "").
+    return str(entry.get("session_key") or "") == session_key
+
+
+def known_handles(
+    limit: int = 10,
+    scope: str = "session",
+    session_key: str = "",
+) -> List[str]:
+    """The most recently updated handles (for actionable error messages).
+
+    ``scope="session"`` (default) lists only handles recorded by
+    ``session_key``; ``scope="all"`` lists everything. An unknown scope
+    value falls back to "session" — the conservative view.
+    """
     try:
+        scope = scope if scope in VALID_SCOPES else "session"
         with _lock:
             _load_locked()
             items = sorted(
-                _table.items(),
+                (
+                    kv for kv in _table.items()
+                    if _in_scope(kv[1], scope, str(session_key or ""))
+                ),
                 key=lambda kv: float(kv[1].get("updated_at") or 0.0),
                 reverse=True,
             )

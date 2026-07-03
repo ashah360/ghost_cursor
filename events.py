@@ -42,6 +42,11 @@ STATUS_ERROR = "error"
 # gateway (and the persisted session row for the final result) can absorb.
 MAX_CONTENT_CHARS = 200_000
 MAX_DIFF_CHARS = 100_000
+# Shell/tool output cap for the canonical envelope. Deliberately generous:
+# the envelope is the full-fidelity record that lands in the per-session
+# JSONL spill log (eventlog.py); the compact views (rolling buffer, status
+# tails, paged events) apply their own much smaller inline clips.
+MAX_OUTPUT_CHARS = 200_000
 
 
 def _clip(text: Any, limit: int) -> str:
@@ -223,11 +228,11 @@ def _tool_completed(data: Dict[str, Any]) -> List[Dict[str, Any]]:
     elif kind == TOOL_SHELL and success is not None:
         out = success.get("content") or success.get("output") or success.get("stdout")
         if isinstance(out, str) and out:
-            res_env["output"] = out[:4000]
+            res_env["output"] = _clip(out, MAX_OUTPUT_CHARS)
     elif is_error:
         err = result.get("error") or result.get("failure")
         if err:
-            res_env["output"] = str(err)[:4000]
+            res_env["output"] = _clip(str(err), MAX_OUTPUT_CHARS)
 
     return envelopes
 
@@ -559,7 +564,7 @@ class AcpNormalizer:
                 if isinstance(raw_out.get(k), str) and raw_out.get(k)
             ]
             if out_parts:
-                res_env["output"] = "\n".join(out_parts)[:4000]
+                res_env["output"] = _clip("\n".join(out_parts), MAX_OUTPUT_CHARS)
             if raw_out.get("exitCode") not in (None, 0):
                 res_env["status"] = STATUS_ERROR
 
