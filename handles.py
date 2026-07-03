@@ -1,10 +1,10 @@
 """Persistent handle table for cursor sessions — explicit handles, no heuristics.
 
-v0.3 replaces the old ``session_registry.py`` repo+timestamp auto-resume
-heuristic with EXPLICIT session handles: ``cursor_start`` returns the cursor
-``session_id`` and every other tool takes it back. This module is the tiny
-persistence layer under that model — a JSON file mapping
-``cursor_session_id -> {repo, status, task, model, updated_at, ...}`` so a
+EXPLICIT session handles, no auto-resume heuristics: ``cursor_create_session``
+mints a session NAME and every other tool takes it back (the cursor ACP
+UUID resolves as an alias). This module is the tiny persistence layer under
+that model — a JSON file mapping
+``session_name -> {repo, status, task, model, cursor_session_id, ...}`` so a
 handle minted on turn T is still resolvable on turn T+1 even across a process
 restart (the live job table in ``jobs.py`` is process-local).
 

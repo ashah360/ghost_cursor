@@ -1,11 +1,10 @@
 """Tests for the ghost_cursor plugin (v0.4 named-session surface).
 
-Seven tools: ``cursor_create_session`` / ``cursor_send_message`` /
-``cursor_status`` / ``cursor_stop`` / ``cursor_events`` / ``cursor_list``
-plus the deprecated ``cursor_start`` shim — all keyed on adjective-adjective-
-noun session names (cursor UUIDs resolve as aliases). Every tool returns
-plain text (labeled headers, prose, raw fenced diffs, TSV) — never JSON.
-Covered here:
+Six tools: ``cursor_create_session`` / ``cursor_send_message`` /
+``cursor_status`` / ``cursor_stop`` / ``cursor_events`` / ``cursor_list`` —
+all keyed on adjective-adjective-noun session names (cursor UUIDs resolve
+as aliases). Every tool returns plain text (labeled headers, prose, raw
+fenced diffs, TSV) — never JSON. Covered here:
 
 * ``events.AcpNormalizer`` — session/update → canonical envelope mapping
   against a CAPTURED fixture (``fixtures/acp_session_updates.jsonl``, real
@@ -50,13 +49,11 @@ from plugins.ghost_cursor import (
     CURSOR_EVENTS_SCHEMA,
     CURSOR_LIST_SCHEMA,
     CURSOR_SEND_SCHEMA,
-    CURSOR_START_SCHEMA,
     CURSOR_STATUS_SCHEMA,
     CURSOR_STOP_SCHEMA,
     EVENTS_TOOL_NAME,
     LIST_TOOL_NAME,
     SEND_TOOL_NAME,
-    START_TOOL_NAME,
     STATUS_TOOL_NAME,
     STOP_TOOL_NAME,
     TOOLSET,
@@ -64,7 +61,6 @@ from plugins.ghost_cursor import (
     _handle_cursor_events,
     _handle_cursor_list,
     _handle_cursor_send_message,
-    _handle_cursor_start,
     _handle_cursor_status,
     _handle_cursor_stop,
     check_cursor_available,
@@ -72,7 +68,6 @@ from plugins.ghost_cursor import (
     cursor_events,
     cursor_list,
     cursor_send_message,
-    cursor_start,
     cursor_status,
     cursor_stop,
     register,
@@ -419,13 +414,24 @@ def _assert_running_ack(ack):
     return ack
 
 
+def _created_name(ack):
+    assert ack.startswith("session: "), f"not a create ack: {ack!r}"
+    return ack.splitlines()[0].split("session: ", 1)[1]
+
+
+def _start_run(task, repo, model=None):
+    """Test setup shorthand: create a session + send the first message."""
+    name = _created_name(cursor_create_session(repo=repo, model=model))
+    return cursor_send_message(name, task)
+
+
 # ---------------------------------------------------------------------------
-# cursor_start — new runs: handle out, running status, delivery on completion
+# create + first send — new runs: ack out, running status, delivery on done
 # ---------------------------------------------------------------------------
 
-class TestCursorStartShim:
-    """cursor_start is a deprecated create+send shim — same background-run
-    plumbing, session-name handles, plain-text acks."""
+class TestFirstSendRun:
+    """The create + first-send flow: background-run plumbing, session-name
+    handles, plain-text acks."""
 
     def test_new_run_returns_running_ack_and_registers_named_handle(
         self, clean_state, monkeypatch, tmp_path
@@ -433,10 +439,9 @@ class TestCursorStartShim:
         release = threading.Event()
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-new"))
 
-        ack = cursor_start("add multiply", repo=str(tmp_path))
+        ack = _start_run("add multiply", repo=str(tmp_path))
         try:
             _assert_running_ack(ack)
-            assert "deprecated" in ack
 
             # Live job table is addressable by the cursor sid alias...
             job = _job_for("s-new")
@@ -464,7 +469,7 @@ class TestCursorStartShim:
         release = threading.Event()
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-done"))
 
-        _assert_running_ack(cursor_start("t", repo=str(tmp_path)))
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-done")
         release.set()
         assert job.done_event.wait(10)
@@ -500,7 +505,7 @@ class TestCursorStartShim:
         """The captured ACP stream flows through the job aggregation: both
         edits land in files_changed with diffs, prose lands in summary."""
         monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
-        cursor_start("add multiply", repo=str(tmp_path))
+        _start_run("add multiply", repo=str(tmp_path))
 
         job = _job_for("s-fixture")
         assert job.done_event.wait(10)
@@ -527,7 +532,7 @@ class TestCursorStartShim:
             )
 
         monkeypatch.setattr(gc_acp, "run_acp", failing)
-        out = cursor_start("t", repo=str(tmp_path))
+        out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
         assert "handshake" in out
         # Errors are prose sentences with a next step, not codes.
@@ -550,7 +555,7 @@ class TestCursorStartShim:
             yield  # pragma: no cover — make it a generator
 
         monkeypatch.setattr(gc_acp, "run_acp", never_session)
-        out = cursor_start("t", repo=str(tmp_path))
+        out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
         assert "did not establish" in out
         job = gc_jobs.registry.list_jobs()[-1]
@@ -558,37 +563,6 @@ class TestCursorStartShim:
         assert job.done_event.wait(10)
         # Never armed → no delivery for the wedged attempt.
         assert _drain_completion_queue() == []
-
-    def test_empty_task_is_a_clean_error(self, clean_state):
-        assert "task is required" in cursor_start("   ")
-
-    def test_missing_repo_is_a_clean_error(self, clean_state, monkeypatch):
-        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
-        assert "not an existing directory" in cursor_start(
-            "t", repo="/definitely/not/a/dir"
-        )
-
-    def test_no_resolvable_workspace_repo_is_a_clean_error(
-        self, clean_state, monkeypatch
-    ):
-        monkeypatch.setattr(gc, "_default_repo", lambda: None)
-        out = cursor_start("t")
-        assert "no workspace repo resolvable" in out
-        assert gc.REPO_ENV_VAR in out
-
-    def test_handler_maps_all_args(self, clean_state, monkeypatch, tmp_path):
-        gc_handles.record("s-prior", repo=str(tmp_path), status="completed")
-        seq = _AcpSequence(_gated_replay_factory(_preset_event(), sid="s-h"))
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
-        out = _handle_cursor_start({
-            "task": "handler task", "repo": str(tmp_path),
-            "model": "handler-model", "session_id": "s-prior",
-        })
-        assert "no session named" not in out
-        assert seq.calls[0]["task"] == "handler task"
-        assert seq.calls[0]["session_id"] == "s-prior"
-        assert seq.calls[0]["model"] == "handler-model"
-        _job_for("s-h").done_event.wait(10)
 
 
 def _preset_event():
@@ -598,11 +572,11 @@ def _preset_event():
 
 
 # ---------------------------------------------------------------------------
-# cursor_start(session_id=...) — explicit resume (session/load), no heuristics
+# resume via cursor_send_message — explicit session/load, no heuristics
 # ---------------------------------------------------------------------------
 
-class TestCursorStartResume:
-    def test_explicit_session_threads_the_resume_id_to_run_acp(
+class TestSendMessageResume:
+    def test_pre_v04_handle_threads_the_resume_id_to_run_acp(
         self, clean_state, monkeypatch, tmp_path
     ):
         """A pre-v0.4 handle (keyed by the raw cursor sid, no alias field)
@@ -612,7 +586,7 @@ class TestCursorStartResume:
         seq = _AcpSequence(_gated_replay_factory(release, sid="s-prior"))
         monkeypatch.setattr(gc_acp, "run_acp", seq)
 
-        ack = cursor_start("continue it", repo=str(tmp_path), session="s-prior")
+        ack = cursor_send_message("s-prior", "continue it")
         try:
             _assert_running_ack(ack)
             assert "sent to s-prior" in ack
@@ -621,30 +595,6 @@ class TestCursorStartResume:
         finally:
             release.set()
         assert _job_for("s-prior").done_event.wait(10)
-
-    def test_start_into_a_running_session_interrupts_like_send(
-        self, clean_state, monkeypatch, tmp_path
-    ):
-        """v0.4: the shim is create+send, so targeting a live session takes
-        send's interrupt + re-prompt semantics (the ack says so)."""
-        release2 = threading.Event()
-        seq = _AcpSequence(
-            _gated_replay_factory(threading.Event(), sid="s-live"),
-            _gated_replay_factory(release2, sid="s-live", early_edit=False),
-        )
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
-        _assert_running_ack(cursor_start("task A", repo=str(tmp_path)))
-        first_job = _job_for("s-live")
-        try:
-            ack = cursor_start("task B", repo=str(tmp_path), session="s-live")
-            _assert_running_ack(ack)
-            assert "interrupted mid-run" in ack
-            assert first_job.status == "cancelled"
-            assert seq.calls[1]["session_id"] == "s-live"
-            assert seq.calls[1]["task"] == "task B"
-        finally:
-            release2.set()
-        assert gc_jobs.registry.get_by_session("s-live").done_event.wait(10)
 
     def test_expired_handle_falls_back_to_fresh_session(
         self, clean_state, monkeypatch, tmp_path
@@ -662,7 +612,7 @@ class TestCursorStartResume:
 
         gc_handles.record("s-expired", repo=_resolved(tmp_path), status="completed")
         monkeypatch.setattr(gc_acp, "run_acp", fallback_replay)
-        cursor_start("t", repo=str(tmp_path), session="s-expired")
+        cursor_send_message("s-expired", "t")
         job = _job_for("s-fresh")
         assert job.done_event.wait(10)
         assert job.result["session_id"] == "s-fresh"
@@ -680,7 +630,7 @@ class TestModelParam:
     def _run_and_capture(self, monkeypatch, tmp_path, sid, **start_kwargs):
         seq = _AcpSequence(_gated_replay_factory(_preset_event(), sid=sid))
         monkeypatch.setattr(gc_acp, "run_acp", seq)
-        cursor_start("t", repo=str(tmp_path), **start_kwargs)
+        _start_run("t", repo=str(tmp_path), **start_kwargs)
         _job_for(sid).done_event.wait(10)
         return seq.calls[0]
 
@@ -712,7 +662,7 @@ class TestModelParam:
         release = threading.Event()
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-m5"))
-        ack = cursor_start("t", repo=str(tmp_path), model="composer-x")
+        ack = _start_run("t", repo=str(tmp_path), model="composer-x")
         try:
             _assert_running_ack(ack)
             job = _job_for("s-m5")
@@ -739,7 +689,7 @@ class TestCursorSendMessage:
         )
         monkeypatch.setattr(gc_acp, "run_acp", seq)
 
-        _assert_running_ack(cursor_start("task A", repo=str(tmp_path)))
+        _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
         first_job = _job_for("s-send")
         name = first_job.session_name
         # Let the early edit land so the interrupted partial work is real.
@@ -784,7 +734,7 @@ class TestCursorSendMessage:
         )
         monkeypatch.setattr(gc_acp, "run_acp", seq)
 
-        cursor_start("task A", repo=str(tmp_path))
+        _start_run("task A", repo=str(tmp_path))
         first_job = _job_for("s-f")
         assert first_job.done_event.wait(10)
         _drain_completion_queue()
@@ -891,7 +841,7 @@ class TestCursorStatusReadOnly:
         release = threading.Event()
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-ro"))
 
-        _assert_running_ack(cursor_start("long task", repo=str(tmp_path)))
+        _assert_running_ack(_start_run("long task", repo=str(tmp_path)))
         job = _job_for("s-ro")
         name = job.session_name
         assert _wait_until(lambda: job.files)  # first diff landed
@@ -928,7 +878,7 @@ class TestCursorStatusReadOnly:
     ):
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(_preset_event(),
                                                                      sid="s-fin"))
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for("s-fin")
         assert job.done_event.wait(10)
 
@@ -949,7 +899,7 @@ class TestCursorStatusReadOnly:
         monkeypatch.setattr(gc_acp, "run_acp",
                             _gated_replay_factory(release, sid="s-act"))
 
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for("s-act")
         assert _wait_until(lambda: job.last_event_at is not None)
 
@@ -1034,7 +984,7 @@ class TestCursorStop:
         release = threading.Event()  # never set: only the cancel ends the run
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-stop"))
 
-        _assert_running_ack(cursor_start("t", repo=str(tmp_path)))
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-stop")
         name = job.session_name
         assert _wait_until(lambda: job.files)  # partial edit landed
@@ -1060,7 +1010,7 @@ class TestCursorStop:
     ):
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(_preset_event(),
                                                                      sid="s-idem"))
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for("s-idem")
         assert job.done_event.wait(10)
         _drain_completion_queue()
@@ -1111,12 +1061,12 @@ class TestSameRepoConcurrency:
     ):
         release = threading.Event()
         monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-a"))
-        first = cursor_start("task A", repo=str(tmp_path))
+        first = _start_run("task A", repo=str(tmp_path))
         try:
             _assert_running_ack(first)
             name = _job_for("s-a").session_name
 
-            second = cursor_start("task B", repo=str(tmp_path))
+            second = _start_run("task B", repo=str(tmp_path))
             # Actionable prose: names the ACTIVE session so the caller can
             # steer/inspect it instead.
             assert "cannot start" in second
@@ -1143,8 +1093,8 @@ class TestSameRepoConcurrency:
         )
         monkeypatch.setattr(gc_acp, "run_acp", seq)
 
-        res_a = cursor_start("a", repo=str(repo_a))
-        res_b = cursor_start("b", repo=str(repo_b))
+        res_a = _start_run("a", repo=str(repo_a))
+        res_b = _start_run("b", repo=str(repo_b))
         try:
             _assert_running_ack(res_a)
             _assert_running_ack(res_b)
@@ -1160,10 +1110,10 @@ class TestSameRepoConcurrency:
             _gated_replay_factory(_preset_event(), sid="s-two"),
         )
         monkeypatch.setattr(gc_acp, "run_acp", seq)
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         assert _job_for("s-one").done_event.wait(10)
 
-        second = cursor_start("t2", repo=str(tmp_path))
+        second = _start_run("t2", repo=str(tmp_path))
         assert "already running" not in second  # no rejection once settled
         assert _job_for("s-two").done_event.wait(10)
 
@@ -1298,7 +1248,7 @@ class TestGitFallback:
             yield ("acp.result", {"stopReason": "end_turn"})
 
         monkeypatch.setattr(gc_acp, "run_acp", shell_edit_replay)
-        cursor_start("edit via shell", repo=str(git_repo))
+        _start_run("edit via shell", repo=str(git_repo))
         job = _job_for("s-git")
         assert job.done_event.wait(10)
 
@@ -1331,7 +1281,7 @@ class TestGitFallback:
             yield ("acp.result", {"stopReason": "end_turn"})
 
         monkeypatch.setattr(gc_acp, "run_acp", stream_and_shell)
-        cursor_start("t", repo=str(git_repo))
+        _start_run("t", repo=str(git_repo))
         job = _job_for("s-win")
         assert job.done_event.wait(10)
         assert job.result["files_changed_count"] == 1
@@ -1349,7 +1299,7 @@ class TestGitFallback:
 
 class TestAllTerminalStatesDeliver:
     def _run_armed(self, monkeypatch, tmp_path, sid, terminal_event):
-        """Dispatch through cursor_start so delivery gets armed; the replay
+        """Dispatch through create + first send so delivery gets armed; the replay
         emits ``terminal_event`` only after the running handle was returned
         (deterministic — the run cannot finalize before arming)."""
         release = threading.Event()
@@ -1361,7 +1311,7 @@ class TestAllTerminalStatesDeliver:
             yield terminal_event
 
         monkeypatch.setattr(gc_acp, "run_acp", replay)
-        res = cursor_start("t", repo=str(tmp_path))
+        res = _start_run("t", repo=str(tmp_path))
         assert "running in background" in res, f"run never armed: {res}"
         job = _job_for(sid)
         release.set()
@@ -1714,7 +1664,7 @@ class TestEstablishSession:
 # ---------------------------------------------------------------------------
 
 class TestRegistration:
-    def test_register_wires_seven_tools_into_ghost_cursor_toolset(self):
+    def test_register_wires_six_tools_into_ghost_cursor_toolset(self):
         calls = []
         ctx = SimpleNamespace(register_tool=lambda **kw: calls.append(kw))
         register(ctx)
@@ -1723,7 +1673,6 @@ class TestRegistration:
         assert set(by_name) == {
             CREATE_TOOL_NAME, SEND_TOOL_NAME, STATUS_TOOL_NAME,
             STOP_TOOL_NAME, EVENTS_TOOL_NAME, LIST_TOOL_NAME,
-            START_TOOL_NAME,
         }
         for name, schema, required in (
             (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, []),
@@ -1732,7 +1681,6 @@ class TestRegistration:
             (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, ["session"]),
             (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, ["session"]),
             (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, []),
-            (START_TOOL_NAME, CURSOR_START_SCHEMA, ["task"]),
         ):
             entry = by_name[name]
             assert entry["toolset"] == TOOLSET
@@ -1750,16 +1698,6 @@ class TestRegistration:
         desc = CURSOR_CREATE_SCHEMA["description"].lower()
         assert "dispatches nothing" in desc
         assert "lazily" in desc
-
-    def test_start_schema_is_marked_deprecated(self):
-        desc = CURSOR_START_SCHEMA["description"]
-        assert desc.startswith("DEPRECATED")
-        assert "cursor_create_session" in desc
-        assert "cursor_send_message" in desc
-        props = CURSOR_START_SCHEMA["parameters"]["properties"]
-        for optional in ("session", "model", "repo"):
-            assert props[optional]["type"] == "string"
-            assert optional not in CURSOR_START_SCHEMA["parameters"]["required"]
 
     def test_events_schema_documents_paging_semantics(self):
         desc = CURSOR_EVENTS_SCHEMA["description"]
@@ -2124,7 +2062,7 @@ class TestEventLogIntegration:
         monkeypatch.setattr(
             gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid=sid)
         )
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for(sid)
         assert job.done_event.wait(10)
         return job
@@ -2210,7 +2148,7 @@ class TestEventLogIntegration:
             yield ("acp.result", {"stopReason": "end_turn"})
 
         monkeypatch.setattr(gc_acp, "run_acp", replay)
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for("s-bigout")
         assert job.done_event.wait(10)
 
@@ -2270,7 +2208,7 @@ class TestHandleScoping:
         monkeypatch.setattr(
             gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid="s-mine")
         )
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         assert _job_for("s-mine").done_event.wait(10)
         assert gc_handles.get("s-mine")["session_key"] == "gw:alice"
 
@@ -2420,11 +2358,6 @@ class TestSessionNames:
 # ---------------------------------------------------------------------------
 # cursor_create_session — lazy named handles + UUID alias resolution
 # ---------------------------------------------------------------------------
-
-def _created_name(ack):
-    assert ack.startswith("session: "), f"not a create ack: {ack!r}"
-    return ack.splitlines()[0].split("session: ", 1)[1]
-
 
 class TestCursorCreateSession:
     def test_creates_a_named_handle_and_dispatches_nothing(
@@ -2661,7 +2594,7 @@ class TestCursorList:
         release = threading.Event()
         monkeypatch.setattr(gc_acp, "run_acp",
                             _gated_replay_factory(release, sid="s-live-list"))
-        cursor_start("t", repo=str(tmp_path))
+        _start_run("t", repo=str(tmp_path))
         job = _job_for("s-live-list")
         try:
             assert _wait_until(lambda: job.files)

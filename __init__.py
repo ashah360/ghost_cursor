@@ -1,6 +1,6 @@
 """Ghost ⇄ Cursor delegation plugin — bundled, auto-loaded.
 
-v0.4: explicit named sessions + plain-text tool output. Seven tools in the
+v0.4: explicit named sessions + plain-text tool output. Six tools in the
 ``ghost_cursor`` toolset:
 
 * ``cursor_create_session(repo?, model?)`` — mint a named session handle
@@ -20,7 +20,9 @@ v0.4: explicit named sessions + plain-text tool output. Seven tools in the
   tool_use / content / lifecycle); limit clamps at 500.
 * ``cursor_list(scope='session'|'all')`` — TSV listing of session handles,
   scoped to the current Hermes session by default.
-* ``cursor_start(task, ...)`` — DEPRECATED shim: create + send in one call.
+
+(v0.3's ``cursor_start``/``cursor_send`` are gone — create + send replaced
+them outright; pre-launch, no deprecation shim.)
 
 Handle model (v0.4)
 -------------------
@@ -83,7 +85,6 @@ STATUS_TOOL_NAME = "cursor_status"
 STOP_TOOL_NAME = "cursor_stop"
 EVENTS_TOOL_NAME = "cursor_events"
 LIST_TOOL_NAME = "cursor_list"
-START_TOOL_NAME = "cursor_start"  # deprecated shim
 TOOLSET = "ghost_cursor"
 
 # Env var naming is Threshold's (the Ghost frontend), not HERMES_* — it points
@@ -316,48 +317,6 @@ CURSOR_LIST_SCHEMA = {
         "required": [],
     },
 }
-
-CURSOR_START_SCHEMA = {
-    "name": START_TOOL_NAME,
-    "description": (
-        "DEPRECATED — use cursor_create_session + cursor_send_message "
-        "instead; this shim just performs both in one call (creates a "
-        "named session and sends `task` as its first message) and will be "
-        "removed in a future version. Optionally pass `session` to send "
-        "into an existing session instead of creating one."
-    ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "task": {
-                "type": "string",
-                "description": "The coding instruction to carry out.",
-            },
-            "repo": {
-                "type": "string",
-                "description": (
-                    "Absolute path to the repository to work in. Optional — "
-                    "defaults to the configured workspace repo."
-                ),
-            },
-            "model": {
-                "type": "string",
-                "description": "Optional cursor-agent model override.",
-            },
-            "session": {
-                "type": "string",
-                "description": (
-                    "Optional. An existing session handle (name or UUID "
-                    "alias) — the task continues that session instead of "
-                    "creating a new one."
-                ),
-            },
-            **_TIMEOUT_PROPERTIES,
-        },
-        "required": ["task"],
-    },
-}
-
 
 def _default_repo() -> Optional[str]:
     """Resolve the default workspace repo: env var, then terminal cwd."""
@@ -650,7 +609,7 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Dispatch plumbing shared by cursor_send_message and the cursor_start shim
+# Dispatch plumbing behind cursor_send_message
 # ---------------------------------------------------------------------------
 
 def _dispatch_run(
@@ -1136,53 +1095,6 @@ def cursor_list(scope: str = "session", **_kwargs: Any) -> str:
     return _render.list_text(rows)
 
 
-def cursor_start(
-    task: str,
-    repo: Optional[str] = None,
-    model: Optional[str] = None,
-    session: Optional[str] = None,
-    session_id: Optional[str] = None,
-    inactivity_timeout_s: Optional[float] = None,
-    max_wall_s: Optional[float] = None,
-    timeout: Optional[float] = None,
-    **_kwargs: Any,
-) -> str:
-    """DEPRECATED shim: cursor_create_session + cursor_send_message in one
-    call. ``session``/``session_id`` sends into an existing session instead
-    of creating one. ``timeout`` is the pre-inactivity alias for
-    ``inactivity_timeout_s``.
-    """
-    if not str(task or "").strip():
-        return "task is required — describe the coding work to delegate."
-
-    inactivity = (
-        inactivity_timeout_s if inactivity_timeout_s is not None else timeout
-    )
-    ident = str(session or session_id or "").strip()
-    if ident:
-        name = _resolve_session(ident)
-        if name is None:
-            return _unknown_session_text(ident)
-        entry = _handles.get(name) or {}
-    else:
-        create_ack = cursor_create_session(repo=repo, model=model)
-        if not create_ack.startswith("session: "):
-            return create_ack  # repo-resolution error, already prose
-        name = create_ack.splitlines()[0].split("session: ", 1)[1].strip()
-        entry = _handles.get(name) or {}
-
-    if model:
-        entry = {**entry, "model": model}
-    result = _send_to_session(
-        name, entry, str(task), inactivity, max_wall_s
-    )
-    return (
-        _render_send_result(name, result)
-        + "\nnote: cursor_start is deprecated — use cursor_create_session "
-        "+ cursor_send_message."
-    )
-
-
 # ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
@@ -1227,20 +1139,8 @@ def _handle_cursor_list(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_list(scope=args.get("scope", "session"))
 
 
-def _handle_cursor_start(args: Dict[str, Any], **kwargs: Any) -> str:
-    return cursor_start(
-        task=args.get("task", ""),
-        repo=args.get("repo"),
-        model=args.get("model"),
-        session=args.get("session"),
-        session_id=args.get("session_id"),
-        inactivity_timeout_s=args.get("inactivity_timeout_s"),
-        max_wall_s=args.get("max_wall_s"),
-    )
-
-
 def register(ctx) -> None:
-    """Register the 7 cursor tools. Called once by the plugin loader."""
+    """Register the 6 cursor tools. Called once by the plugin loader."""
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),
@@ -1248,7 +1148,6 @@ def register(ctx) -> None:
         (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, _handle_cursor_stop, "🛑"),
         (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, _handle_cursor_events, "📜"),
         (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, _handle_cursor_list, "📋"),
-        (START_TOOL_NAME, CURSOR_START_SCHEMA, _handle_cursor_start, "🖱️"),
     ):
         ctx.register_tool(
             name=name,

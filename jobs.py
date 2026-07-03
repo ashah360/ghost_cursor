@@ -1,12 +1,13 @@
 """Job table for cursor runs — one entry per dispatched run, keyed by handle.
 
-v0.3 session-handle model
--------------------------
+v0.4 named-session model
+------------------------
 Every cursor run executes as a background :class:`CursorJob` on a worker
-thread. The SINGLE public handle for a run is the cursor ``session_id``
-(minted by ACP ``session/new``, surfaced at the ``acp.session`` event):
-``cursor_start`` returns it, and ``cursor_send`` / ``cursor_status`` /
-``cursor_stop`` take it back. This registry is the in-process job table
+thread. The SINGLE public handle for a run is the session NAME minted by
+``cursor_create_session`` (``job.session_name``); the cursor ``session_id``
+from ACP ``session/new`` rides along as an alias. ``cursor_send_message``
+dispatches into it, and ``cursor_status`` / ``cursor_stop`` /
+``cursor_events`` take it back. This registry is the in-process job table
 behind that handle — rolling progress buffer, status, files-changed
 aggregation, and deliver-on-complete. A tiny JSON persistence layer
 (``handles.py``) mirrors handle → status/repo across process restarts;
