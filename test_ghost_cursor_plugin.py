@@ -503,7 +503,9 @@ class TestFirstSendRun:
         self, clean_state, monkeypatch, tmp_path
     ):
         """The captured ACP stream flows through the job aggregation: both
-        edits land in files_changed with diffs, prose lands in summary."""
+        edits land in files_changed with diffs, and the summary is the
+        FINAL content block of the turn (the wrap-up message), not every
+        interstitial fragment fused together."""
         monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
         _start_run("add multiply", repo=str(tmp_path))
 
@@ -521,7 +523,13 @@ class TestFirstSendRun:
         assert calc["status"] == "M"
         assert "multiply" in calc["diff"]
         assert by_path["/tmp/acp_probe/repo/notes.txt"]["status"] == "A"
-        assert "subtract" in result["summary"]
+        # The capture's final message block is the notes.txt wrap-up.
+        assert result["summary"].startswith("Both done")
+        assert "not deleted or touched" in result["summary"]
+        # Earlier narration blocks ("Added `subtract`…", "I'll run `ls -…")
+        # are NOT concatenated into the summary.
+        assert "subtract" not in result["summary"]
+        assert "I'll run" not in result["summary"]
 
     def test_handshake_failure_reports_in_turn_and_never_delivers(
         self, clean_state, monkeypatch, tmp_path
@@ -569,6 +577,108 @@ def _preset_event():
     evt = threading.Event()
     evt.set()
     return evt
+
+
+# ---------------------------------------------------------------------------
+# completion summary — the final content block, not fused narration
+# ---------------------------------------------------------------------------
+
+def _narration_chunk(text):
+    return ("acp.update", {
+        "sessionUpdate": "agent_message_chunk",
+        "content": {"type": "text", "text": text},
+    })
+
+
+def _tool_round(call_id):
+    return [
+        ("acp.update", {
+            "sessionUpdate": "tool_call", "toolCallId": call_id,
+            "title": "Read file", "kind": "read", "status": "pending",
+            "rawInput": {},
+        }),
+        ("acp.update", {
+            "sessionUpdate": "tool_call_update", "toolCallId": call_id,
+            "status": "completed",
+        }),
+    ]
+
+
+class TestCompletionSummary:
+    """Live repro: the delivered summary was every interstitial narration
+    fragment glued with no separators — "…the leftover spike file.Now let
+    me explore the relevant code…" — instead of the final wrap-up message."""
+
+    def _run_replay(self, monkeypatch, tmp_path, sid, events):
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, session_id=None, model=None):
+            yield ("acp.session", {"sessionId": sid, "cwd": str(workdir),
+                                   "model": "m"})
+            yield from events
+
+        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for(sid)
+        assert job.done_event.wait(10)
+        return job
+
+    def test_summary_is_the_final_content_block_not_fused_narration(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        events = [
+            _narration_chunk(
+                "I'll start by reading the brief and the leftover spike file."
+            ),
+            *_tool_round("t1"),
+            _narration_chunk("Now let me explore the relevant code..."),
+            *_tool_round("t2"),
+            _narration_chunk("Now let me read the actual services..."),
+            *_tool_round("t3"),
+            # The final wrap-up streams as multiple deltas of ONE message —
+            # those must join raw, not with injected separators.
+            _narration_chunk("Implemented the retry wrapper in servi"),
+            _narration_chunk("ces/http.py and added regression tests."),
+            ("acp.result", {"stopReason": "end_turn"}),
+        ]
+        job = self._run_replay(monkeypatch, tmp_path, "s-sum", events)
+
+        summary = job.result["summary"]
+        assert summary == (
+            "Implemented the retry wrapper in services/http.py "
+            "and added regression tests."
+        )
+        # None of the interstitial narration fragments leak in.
+        assert "I'll start by reading" not in summary
+        assert "Now let me explore" not in summary
+        # And in particular nothing fuses sentence-to-sentence.
+        assert "file.Now" not in summary
+
+        # The delivered completion carries the same final-block summary.
+        events_out = _drain_completion_queue()
+        assert len(events_out) == 1
+        delivered = events_out[0]["summary"]
+        assert "cursor's summary:" in delivered
+        assert "Implemented the retry wrapper" in delivered
+        assert "file.Now" not in delivered
+
+    def test_no_final_message_falls_back_to_separated_blocks(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A turn that does not END on a content block has no wrap-up to
+        prefer: the fallback keeps every block, joined with blank lines so
+        sentences never fuse."""
+        events = [
+            _narration_chunk("Reading the brief."),
+            *_tool_round("t1"),
+            _narration_chunk("Exploring the services."),
+            *_tool_round("t2"),  # turn ends right after tool activity
+            ("acp.result", {"stopReason": "end_turn"}),
+        ]
+        job = self._run_replay(monkeypatch, tmp_path, "s-fall", events)
+
+        summary = job.result["summary"]
+        assert summary == "Reading the brief.\n\nExploring the services."
+        assert "brief.Exploring" not in summary
 
 
 # ---------------------------------------------------------------------------

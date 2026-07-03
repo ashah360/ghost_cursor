@@ -486,10 +486,20 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
             diff = str(envelope.get("diff") or "")
             if diff:
                 entry["diff"] = diff[:_RESULT_DIFF_CHARS]
+            job.segment_open = False
         elif kind == "content":
             delta = str(envelope.get("delta") or "")
             if delta:
-                job.assistant_parts.append(delta)
+                # Contiguous deltas extend the open block; anything else
+                # (tool activity, reasoning) closed it, so a fresh block
+                # starts here. summary_text() prefers the final block.
+                if job.segment_open and job.assistant_segments:
+                    job.assistant_segments[-1].append(delta)
+                else:
+                    job.assistant_segments.append([delta])
+                    job.segment_open = True
+        elif kind in ("tool_use", "tool_result"):
+            job.segment_open = False
         elif kind == "lifecycle":
             event = envelope.get("event")
             if event == "run.completed":
@@ -502,6 +512,7 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 text = str(envelope.get("text") or "")
                 if text:
                     job.reasoning_tail = (job.reasoning_tail + text)[-4000:]
+                job.segment_open = False
 
 
 def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
@@ -579,7 +590,9 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         files_changed = sorted(
             (dict(f) for f in job.files.values()), key=lambda f: f["path"]
         )
-        prose = "".join(job.assistant_parts).strip()
+        # The FINAL content block (the wrap-up message) when the turn ended
+        # on one; joined blocks otherwise — see CursorJob.summary_text.
+        prose = job.summary_text()
         completed = job.completed
         run_error = job.run_error
         timed_out = job.timed_out
