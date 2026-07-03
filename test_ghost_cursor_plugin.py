@@ -74,6 +74,7 @@ from plugins.ghost_cursor import (
 )
 from plugins.ghost_cursor import acp_runner as gc_acp
 from plugins.ghost_cursor import events as gc_events
+from plugins.ghost_cursor import sdk_runner as gc_sdk
 from plugins.ghost_cursor import handles as gc_handles
 from plugins.ghost_cursor import jobs as gc_jobs
 from plugins.ghost_cursor import names as gc_names
@@ -2928,3 +2929,184 @@ class TestCursorList:
                           session_key="gw:other")
         assert "theirs-owl" in _handle_cursor_list({"scope": "all"})
         assert "theirs-owl" not in _handle_cursor_list({})
+
+
+# ---------------------------------------------------------------------------
+# sdk_runner.run_sdk — faked cursor-sdk bridge/client (no network, no bridge)
+# ---------------------------------------------------------------------------
+
+def _sdk_msg(**kw):
+    """A fake SDKMessage: plain-attribute object, converted defensively by
+    the runner (real messages are frozen dataclasses — same shape)."""
+    return SimpleNamespace(**kw)
+
+
+class _FakeStream:
+    """A scriptable run event stream.
+
+    ``script`` items are either fake SDKMessages (wrapped in RunStreamEvent
+    envelopes with sequential offsets), Exception instances (raised from
+    next() — a stream drop), or callables (invoked, e.g. to block on a
+    gate). ``observe(after_offset=...)`` resumes after the given offset,
+    skipping any Exception items at the resume point (the drop is gone).
+    """
+
+    def __init__(self, run, script):
+        self._run = run
+        self._script = list(script)
+
+    def _iter(self, start_idx):
+        i = start_idx
+        while i < len(self._script):
+            item = self._script[i]
+            i += 1
+            if isinstance(item, Exception):
+                raise item
+            if callable(item):
+                item = item()
+                if item is None:
+                    continue
+            if self._run.cancel_event.is_set():
+                self._run.status = "cancelled"
+                return
+            yield SimpleNamespace(
+                kind="message", offset=str(i - 1), sdk_message=item
+            )
+        self._run.status = self._run.final_status
+
+    def events(self):
+        return self._iter(0)
+
+    def observe(self, after_offset=None):
+        self._run.observe_calls.append(after_offset)
+        start = 0 if after_offset is None else int(after_offset) + 1
+        # The dropped stream's poison pill is not replayed on re-attach.
+        while start < len(self._script) and isinstance(self._script[start], Exception):
+            start += 1
+        return self._iter(start)
+
+
+class _FakeRun:
+    def __init__(self, script, final_status="finished"):
+        self.status = "running"
+        self.final_status = final_status
+        self.cancel_event = threading.Event()
+        self.observe_calls = []
+        self._stream = _FakeStream(self, script)
+
+    def events(self):
+        return self._stream.events()
+
+    def observe(self, after_offset=None):
+        return self._stream.observe(after_offset=after_offset)
+
+    def cancel(self):
+        self.cancel_event.set()
+
+
+class _FakeAgent:
+    def __init__(self, agent_id="agent-fake-1", model_id="fake-model", runs=None):
+        self.agent_id = agent_id
+        self.model = SimpleNamespace(id=model_id)
+        self.sent = []
+        self._runs = list(runs or [])
+
+    def send(self, message, *a, **kw):
+        self.sent.append(message)
+        return self._runs.pop(0)
+
+
+class _FakeAgents:
+    def __init__(self, agent, resume_error=None, create_error=None):
+        self._agent = agent
+        self.resume_calls = []
+        self.create_calls = []
+        self.resume_error = resume_error
+        self.create_error = create_error
+
+    def resume(self, agent_id, *a, **kw):
+        self.resume_calls.append(agent_id)
+        if self.resume_error is not None:
+            raise self.resume_error
+        return self._agent
+
+    def create(self, **kw):
+        self.create_calls.append(kw)
+        if self.create_error is not None:
+            err, self.create_error = self.create_error, None
+            raise err
+        return self._agent
+
+
+class _FakeClient:
+    def __init__(self, agent, **kw):
+        self.agents = _FakeAgents(agent, **kw)
+
+
+def _install_fake_sdk(monkeypatch, client):
+    """Route run_sdk at a fake bridge client, offline-safe."""
+    monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+    monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+    monkeypatch.setattr(gc_sdk, "get_bridge", lambda workspace: client)
+
+
+def _happy_script(workdir="/w"):
+    """assistant text + one tool call round-trip + wrap-up text."""
+    return [
+        _sdk_msg(type="assistant",
+                 message=SimpleNamespace(content=[
+                     SimpleNamespace(type="text", text="working on it")])),
+        _sdk_msg(type="tool_call", call_id="t1", name="shell",
+                 status="running", args={"command": "ls -la"}, result=None),
+        _sdk_msg(type="tool_call", call_id="t1", name="shell",
+                 status="completed", args={"command": "ls -la"},
+                 result={"exitCode": 0, "stdout": "calc.py"}),
+        _sdk_msg(type="assistant",
+                 message=SimpleNamespace(content=[
+                     SimpleNamespace(type="text", text="all done")])),
+    ]
+
+
+class TestSdkRunner:
+    def test_happy_path_yields_session_messages_result(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk("do it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
+                                     cancel_check=lambda: False))
+        keys = [k for k, _ in events]
+        assert keys[0] == "sdk.session"
+        assert events[0][1]["agentId"] == "agent-fake-1"
+        assert events[0][1]["model"] == "fake-model"
+        assert events[0][1]["resumed"] is False
+        messages = [o for k, o in events if k == "sdk.message"]
+        assert [m["type"] for m in messages] == [
+            "assistant", "tool_call", "tool_call", "assistant"
+        ]
+        # Message payloads arrive as plain dicts, nested objects included.
+        assert messages[0]["message"]["content"][0]["text"] == "working on it"
+        assert messages[2]["result"]["stdout"] == "calc.py"
+        assert keys[-1] == "sdk.result"
+        assert events[-1][1]["status"] == "finished"
+        assert agent.sent == ["do it"]
+
+    def test_missing_api_key_raises_actionable_error(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CURSOR_API_KEY", raising=False)
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        with pytest.raises(gc_sdk.SdkRunnerError) as err:
+            list(gc_sdk.run_sdk("t", str(tmp_path)))
+        assert "CURSOR_API_KEY" in str(err.value)
+
+    def test_missing_sdk_package_raises_actionable_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: False)
+        with pytest.raises(gc_sdk.SdkRunnerError) as err:
+            list(gc_sdk.run_sdk("t", str(tmp_path)))
+        assert "pip install cursor-sdk" in str(err.value)
+
+    def test_empty_task_and_bad_repo_preflight(self, tmp_path, monkeypatch):
+        _install_fake_sdk(monkeypatch, _FakeClient(_FakeAgent()))
+        with pytest.raises(gc_runner.HarnessError):
+            list(gc_sdk.run_sdk("   ", str(tmp_path)))
+        with pytest.raises(gc_runner.HarnessError):
+            list(gc_sdk.run_sdk("t", str(tmp_path / "nope")))
