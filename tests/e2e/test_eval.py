@@ -23,6 +23,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -110,6 +111,8 @@ def test_plugin_run_is_clean_by_llm_judge(tmp_path):
 
     spec = importlib.util.spec_from_file_location("gc_eval", _find_plugin_init())
     gc = importlib.util.module_from_spec(spec)
+    # Relative intra-package imports need the package registered before exec.
+    sys.modules[spec.name] = gc
     spec.loader.exec_module(gc)
     gc._resolve_progress_callback = lambda: None
     gc._resolve_session_key = lambda: f"eval-{int(time.time())}"

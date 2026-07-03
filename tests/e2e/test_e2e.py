@@ -22,6 +22,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -97,6 +98,10 @@ def gc(monkeypatch, tmp_path, request):
         monkeypatch.setenv("CURSOR_API_KEY", _REAL_CURSOR_KEY)
     spec = importlib.util.spec_from_file_location("gc_e2e", PLUGIN)
     mod = importlib.util.module_from_spec(spec)
+    # The plugin uses relative intra-package imports (it loads under
+    # hermes_plugins.<slug> in real Hermes), so the package must be in
+    # sys.modules before exec for `from . import ...` to resolve.
+    sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
     mod._resolve_progress_callback = lambda: None
     # unique key per test — prevents cross-test handle/concurrency collisions

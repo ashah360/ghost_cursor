@@ -63,7 +63,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from plugins.ghost_cursor import handles as _handles
+from . import handles as _handles
 
 logger = logging.getLogger(__name__)
 
