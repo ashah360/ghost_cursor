@@ -28,7 +28,7 @@ def _ensure_plugin_package() -> None:
     except ModuleNotFoundError:
         # Only shim when this conftest actually sits beside the plugin sources
         # (standalone repo layout), never from a copied spot in a Hermes tree.
-        if not (_here / "acp_runner.py").is_file():
+        if not (_here / "sdk_runner.py").is_file():
             raise
     import importlib.util
     import types

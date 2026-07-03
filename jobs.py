@@ -147,7 +147,7 @@ class CursorJob:
     # Wall-clock time of the last stream event received for this run (None
     # until the first event). Advisory only — feeds the last_activity_s
     # field of status snapshots so callers can flag silent runs; the
-    # actual inactivity watchdog lives in acp_runner.
+    # actual inactivity watchdog lives in sdk_runner.
     last_event_at: Optional[float] = None
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)

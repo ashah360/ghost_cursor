@@ -2,22 +2,23 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that lets your agent **delegate coding tasks to the [Cursor](https://cursor.com) agent** — and watch it work in real time.
 
-Registers a single tool, **`cursor_edit`**, that runs `cursor-agent` inside a target repo over **ACP** (Agent Client Protocol — JSON-RPC over stdio), streams per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and returns a structured summary of everything that changed.
+Registers six session tools that run Cursor agents inside a target repo over the **official [`cursor-sdk`](https://pypi.org/project/cursor-sdk/) python package**, stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
 
-Because it's an ordinary Hermes tool call inside a real session, the result **persists in the transcript and reloads for free** — and interrupts map to a native `session/cancel`.
+Because it's an ordinary Hermes tool call inside a real session, the result **persists in the transcript and reloads for free** — and interrupts map to a native `run.cancel()`.
 
-## Why ACP instead of scraping stdout
+## Why the official cursor-sdk
 
-The obvious way to drive `cursor-agent` from another program is `cursor-agent -p "<task>" --output-format stream-json` and parse its stdout. That works, but it's brittle: no structured cancellation, synthesized tool IDs, and it breaks the moment the output format shifts.
+Earlier versions drove `cursor-agent` over ACP (JSON-RPC on stdio) and, before that, scraped `--print` stdout. The SDK replaces both with a supported contract:
 
-`ghost_cursor` speaks **ACP** (`cursor-agent acp`) instead — a real JSON-RPC protocol:
+| | stdout scraping | ACP (v0.4) | cursor-sdk (this plugin) |
+|---|---|---|---|
+| Event format | freeform JSON, inferred | typed `session/update` | typed `SDKMessage` dataclasses |
+| Cancellation | `kill -9` the process | native `session/cancel` | native `run.cancel()` |
+| Resume | none | `session/load` (best effort) | `Agent.resume(agent_id)` |
+| Network drop mid-run | run lost | run lost | `run.observe(after_offset=…)` re-attach |
+| Transient failures | opaque | opaque | typed errors with `is_retryable` / `retry_after` |
 
-| | stdout scraping | ACP (this plugin) |
-|---|---|---|
-| Event format | freeform JSON text, inferred | typed `session/update` notifications |
-| Tool IDs | synthesized | real `toolCallId` from Cursor |
-| Cancellation | `kill -9` the process | native `session/cancel` |
-| Robustness | breaks on format change | versioned protocol contract |
+The SDK runs a local sidecar bridge (managed automatically) that owns agent state, so a dropped stream — or a restarted plugin process — can re-attach to a run that is still executing instead of losing it.
 
 The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
@@ -25,9 +26,9 @@ The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
 Four explicit tools mirroring Hermes's `terminal`/`process` split. The single handle is the cursor **`session_id`**, returned by `cursor_start` and passed to the rest.
 
-- **`cursor_start(task, repo, model?, session_id?, inactivity_timeout_s?, max_wall_s?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (ACP `session/load`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor-agent model (config fallback: `plugins.ghost_cursor.model`).
-- **`cursor_send(session_id, message, inactivity_timeout_s?, max_wall_s?)`** — steer / follow up. Honest semantics: Cursor's ACP has **no true queue** — this interrupts the current prompt (`session/cancel`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
-- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed, `last_activity_s` (seconds since the last ACP event — spot a silent run without touching it). Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
+- **`cursor_start(task, repo, model?, session_id?, inactivity_timeout_s?, max_wall_s?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (`Agent.resume`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor model (config fallback: `plugins.ghost_cursor.model`).
+- **`cursor_send(session_id, message, inactivity_timeout_s?, max_wall_s?)`** — steer / follow up. Honest semantics: there is **no true mid-run queue** — this interrupts the current run (`run.cancel()`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
+- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed, `last_activity_s` (seconds since the last stream event — spot a silent run without touching it). Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
 - **`cursor_stop(session_id)`** — graceful `session/cancel`, SIGKILL only on hang. Returns final status + partial `files_changed`.
 
 Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state (success/fail/error/timeout/cancel), **same-repo concurrency guard** (a second `cursor_start` on a repo with an active handle is rejected — two agents on one tree = corruption; different repos run in parallel), **handle persistence** across turns (a JSON table under `<HERMES_HOME>/state/`), **git-diff fallback** for shell-driven edits, and a **`check_fn`** so the tools only appear when `cursor-agent` is installed.
@@ -37,7 +38,8 @@ Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the age
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- [`cursor-agent`](https://cursor.com/cli) on `PATH`, logged in (`cursor-agent login`)
+- `pip install cursor-sdk` (python ≥ 3.10)
+- `CURSOR_API_KEY` exported (create one at the [Cursor dashboard](https://cursor.com/dashboard))
 - The target repo should be a git repo (enables the diff fallback)
 
 ## Install
@@ -47,7 +49,7 @@ Drop the plugin into your Hermes plugins directory and enable it:
 ```bash
 # 1. copy the plugin
 mkdir -p ~/.hermes/plugins/ghost_cursor
-cp __init__.py acp_runner.py events.py runner.py jobs.py handles.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
+cp __init__.py sdk_runner.py events.py runner.py jobs.py handles.py eventlog.py names.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
 
 # 2. enable it in ~/.hermes/config.yaml
 #    plugins:
@@ -61,8 +63,9 @@ hermes gateway restart
 Verify it registered:
 
 ```bash
-# cursor_start / cursor_send / cursor_status / cursor_stop should show up
-# as tools once cursor-agent is on PATH
+# cursor_create_session / cursor_send_message / cursor_status / cursor_stop /
+# cursor_events / cursor_list should show up as tools once cursor-sdk is
+# importable
 ```
 
 ## Usage
@@ -108,7 +111,7 @@ If the prior session is gone (Cursor restarted, id expired), call 2 transparentl
 
 ## Interject — steer a running task mid-flight
 
-Cursor's ACP has no true mid-prompt queue (a second prompt cancels and replaces the first), so "interject" is built as **stop + auto-resume**: when a `cursor_edit` run is interrupted, its cursor `session_id` is eagerly persisted to a small registry (keyed by the calling session + repo). The **next** `cursor_edit` in the same session/repo — with **no** explicit `session_id` — automatically continues that interrupted cursor session, folding your new instruction in with full prior context.
+Cursor has no true mid-prompt queue (a second prompt cancels and replaces the first), so "interject" is built as **stop + auto-resume**: when a `cursor_edit` run is interrupted, its cursor `session_id` is eagerly persisted to a small registry (keyed by the calling session + repo). The **next** `cursor_edit` in the same session/repo — with **no** explicit `session_id` — automatically continues that interrupted cursor session, folding your new instruction in with full prior context.
 
 So the flow is: run a task → interrupt it → send a nudge → it picks up the same cursor session and keeps going. No id-threading required. Guards: auto-resume only fires for a recently interrupted run (≤10 min, cancelled/running) — a cleanly *completed* run is never auto-resumed, so an unrelated next task starts fresh. Passing `session_id` explicitly always overrides. The result reports `auto_resumed: true` when this kicked in.
 
@@ -127,12 +130,12 @@ Why this matters: a synchronous tool holds the conversation turn open for the wh
 
 ## Timeouts — inactivity, not wall clock
 
-Timeouts are **inactivity-based**: a run that keeps streaming ACP events (reasoning, tool calls, content) is alive and is never killed for total elapsed time. Only a *silent* run is treated as hung.
+Timeouts are **inactivity-based**: a run that keeps streaming events (reasoning, tool calls, content) is alive and is never killed for total elapsed time. Only a *silent* run is treated as hung.
 
-- **`inactivity_timeout_s`** — abort after this many seconds with **no ACP events**; any streamed activity resets the clock. Default **600** (10 min of silence); **0 disables** the watchdog.
+- **`inactivity_timeout_s`** — abort after this many seconds with **no stream events**; any streamed activity resets the clock. Default **600** (10 min of silence); **0 disables** the watchdog.
 - **`max_wall_s`** — optional hard ceiling on **total** run time, a safety net for runaways that stream forever without finishing. Default **0 (disabled)**.
 
-Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last ACP event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the ACP runner.
+Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last stream event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the SDK runner.
 
 The old `timeout` parameter is kept as a deprecated alias for `inactivity_timeout_s`.
 
@@ -150,9 +153,9 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 
 | File | Role |
 |---|---|
-| `__init__.py` | Plugin entry — registers `cursor_edit`, resolves the progress callback, builds the result |
-| `acp_runner.py` | ACP client — spawns `cursor-agent acp`, JSON-RPC over stdio, maps `session/update` → envelopes, native cancel |
-| `events.py` | Canonical envelope builders + `session/update` → envelope mapping |
+| `__init__.py` | Plugin entry — registers the six tools, resolves the progress callback, builds results |
+| `sdk_runner.py` | cursor-sdk transport — bridge lifecycle, Agent create/resume, event streaming, observe() re-attach, bounded retries, watchdogs, native cancel |
+| `events.py` | Canonical envelope builders + `SDKMessage` → envelope mapping |
 | `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |
 | `plugin.yaml` | Plugin manifest |
 | `test_ghost_cursor_plugin.py` | Tests |
@@ -166,7 +169,7 @@ MIT — see [LICENSE](LICENSE).
 Two GitHub Actions workflows (`.github/workflows/`):
 
 - **`unit`** (every push/PR, blocking) — the 110 hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
-- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes + the real `cursor-agent` binary and exercises every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
+- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes + the real `cursor-sdk` and exercises every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
 
 Set the repo secret **`CURSOR_API_KEY`** for the e2e job. Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env in `e2e.yml` (default `gpt-5.4-nano-low` — cheap + fast; verify the slug with `cursor-agent models`).
 

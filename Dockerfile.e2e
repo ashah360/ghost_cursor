@@ -1,5 +1,5 @@
 # Reproduce the ghost_cursor e2e environment locally — real Hermes + real
-# cursor-agent, no mocks. Mirrors what the GitHub Actions e2e job does.
+# cursor-sdk, no mocks. Mirrors what the GitHub Actions e2e job does.
 #
 #   docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
 #   docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
@@ -19,11 +19,8 @@ RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent /opt/hermes
 WORKDIR /opt/hermes-agent
 RUN uv sync --frozen || uv sync || pip install -e .
 
-# Real cursor-agent binary
-RUN curl https://cursor.com/install -fsS | bash
-ENV PATH="/root/.local/bin:${PATH}"
-# Symlink into a standard path so login shells (bash -lc) find it too
-RUN ln -sf /root/.local/bin/cursor-agent /usr/local/bin/cursor-agent
+# Official cursor-sdk (the transport; brings the local bridge with it)
+RUN uv add cursor-sdk || uv pip install cursor-sdk
 
 # pytest into the uv project env (it's not a Hermes dep)
 RUN uv add --dev pytest || uv pip install pytest

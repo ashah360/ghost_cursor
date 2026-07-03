@@ -53,6 +53,6 @@ jobs:
           python -m pip install -U pip pytest pytest-timeout
           uv sync --frozen || uv sync || pip install -e .
 
-      - name: Unit tests (110, hermetic; hard per-test timeout so a hang fails fast)
+      - name: Unit tests (hermetic; hard per-test timeout so a hang fails fast)
         working-directory: hermes-agent
         run: uv run --with pytest --with pytest-timeout pytest tests/plugins/test_ghost_cursor_plugin.py -q -p no:cacheprovider --timeout=60 --timeout-method=thread
