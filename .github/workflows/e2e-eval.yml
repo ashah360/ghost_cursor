@@ -1,0 +1,81 @@
+name: e2e-eval
+
+# Shape 2 — E2E EVAL (quality): LLM-as-judge on a real plugin run.
+# Runs a real cursor task through the plugin, captures the full context
+# (result + status + final files), and asks a cheap judge model whether the
+# run went smoothly (no error leakage, coherent result, real change). Catches
+# soft regressions that pass/fail assertions miss. Blocking on PRs to main.
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "30 7 * * *"
+
+concurrency:
+  group: e2e-eval-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GHOST_CURSOR_TEST_MODEL: gpt-5.4-nano
+      GHOST_CURSOR_JUDGE_MODEL: gpt-5.4-nano
+      GHOST_CURSOR_E2E: "1"
+      CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: ghost_cursor }
+      - uses: actions/checkout@v4
+        with: { repository: NousResearch/hermes-agent, path: hermes-agent }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Install cursor-agent
+        run: |
+          curl https://cursor.com/install -fsS | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          sudo ln -sf "$HOME/.local/bin/cursor-agent" /usr/local/bin/cursor-agent || true
+
+      - name: Verify cursor auth (fail fast)
+        run: |
+          set -euo pipefail
+          cd /tmp
+          out=$(cursor-agent --api-key "$CURSOR_API_KEY" -p "reply with exactly: CI-OK" \
+            --model "$GHOST_CURSOR_TEST_MODEL" --output-format json --force --trust 2>&1 || true)
+          echo "$out" | grep -q '"is_error":false' || { echo "cursor auth failed"; exit 1; }
+
+      - name: Install plugin + eval into the Hermes tree
+        run: |
+          set -euo pipefail
+          mkdir -p hermes-agent/plugins/ghost_cursor hermes-agent/tests/plugins/e2e
+          cp ghost_cursor/*.py hermes-agent/plugins/ghost_cursor/
+          cp ghost_cursor/test_ghost_cursor_plugin.py hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
+          cp ghost_cursor/conftest.py hermes-agent/tests/plugins/conftest.py
+          cp -r ghost_cursor/fixtures hermes-agent/tests/plugins/fixtures 2>/dev/null || true
+          cp ghost_cursor/tests/e2e/test_eval.py hermes-agent/tests/plugins/e2e/
+          rm -f hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py hermes-agent/plugins/ghost_cursor/conftest.py
+
+      - name: Install deps
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          python -m pip install -U pip pytest pytest-timeout
+          uv sync --frozen || uv sync || pip install -e .
+
+      - name: E2E eval — LLM judge on a real plugin run
+        working-directory: hermes-agent
+        env:
+          PYTHONPATH: ${{ github.workspace }}/hermes-agent
+          GHOST_CURSOR_PLUGIN_INIT: ${{ github.workspace }}/hermes-agent/plugins/ghost_cursor/__init__.py
+        run: |
+          set -euo pipefail
+          uv run --with pytest --with pytest-timeout pytest tests/plugins/e2e/test_eval.py -q -v \
+            -p no:cacheprovider --timeout=300 --timeout-method=thread
