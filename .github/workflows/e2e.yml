@@ -63,15 +63,22 @@ jobs:
           set -euo pipefail
           mkdir -p hermes-agent/plugins/ghost_cursor
           cp ghost_cursor/*.py hermes-agent/plugins/ghost_cursor/
-          # tests live in the repo; run them against the installed plugin
+          # unit test + its fixtures + conftest (name MUST stay conftest.py)
+          cp ghost_cursor/test_ghost_cursor_plugin.py hermes-agent/tests/plugins/test_ghost_cursor_plugin.py
+          cp ghost_cursor/conftest.py hermes-agent/tests/plugins/conftest.py
+          cp -r ghost_cursor/fixtures hermes-agent/tests/plugins/fixtures 2>/dev/null || true
+          # e2e suite
           mkdir -p hermes-agent/tests/plugins/e2e
           cp -r ghost_cursor/tests/e2e/* hermes-agent/tests/plugins/e2e/ 2>/dev/null || true
+          # drop stray copies the *.py glob pulled into the plugin dir
+          rm -f hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py \
+                hermes-agent/plugins/ghost_cursor/conftest.py
 
       - name: Install Python deps (real Hermes deps the plugin touches)
         working-directory: hermes-agent
         run: |
           set -euo pipefail
-          python -m pip install -U pip pytest
+          python -m pip install -U pip pytest pytest-timeout
           # The plugin imports hermes_constants + tools.* + hermes_cli.config.
           # A full `uv sync` installs the whole core; do it so imports are real.
           uv sync --frozen || uv sync || pip install -e .
@@ -80,9 +87,7 @@ jobs:
         working-directory: hermes-agent
         run: |
           set -euo pipefail
-          cp ../ghost_cursor/test_ghost_cursor_plugin.py tests/plugins/test_ghost_cursor_plugin.py
-          cp ../ghost_cursor/conftest.py tests/plugins/conftest_ghost_cursor.py || true
-          uv run pytest tests/plugins/test_ghost_cursor_plugin.py -q
+          uv run --with pytest --with pytest-timeout pytest tests/plugins/test_ghost_cursor_plugin.py -q -p no:cacheprovider --timeout=60 --timeout-method=thread
 
       - name: E2E tests (real cursor + real hermes, every input shape)
         working-directory: hermes-agent
@@ -90,4 +95,4 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
         run: |
           set -euo pipefail
-          uv run pytest tests/plugins/e2e/test_e2e.py -q -v
+          uv run --with pytest --with pytest-timeout pytest tests/plugins/e2e/test_e2e.py -q -v -p no:cacheprovider --timeout=300 --timeout-method=thread
