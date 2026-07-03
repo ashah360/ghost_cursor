@@ -93,6 +93,10 @@ _POLL_S = 0.2
 # with run.observe(after_offset=...) before declaring the run failed. Any
 # successfully received event resets the counter.
 MAX_STREAM_REATTACHES = 5
+# Linear backoff step between re-attach attempts (attempt N sleeps N*step,
+# capped). Module-level so tests can zero it.
+_REATTACH_BACKOFF_S = 2.0
+_REATTACH_BACKOFF_CAP_S = 10.0
 # Bounded retries for transient create/resume/send failures (is_retryable).
 MAX_CALL_ATTEMPTS = 3
 
@@ -415,20 +419,28 @@ class _SdkWorker:
                     return  # cancel racing the stream teardown — settled below
                 if _run_status(run) in _TERMINAL_RUN_STATUSES:
                     return  # run is over; the stream just died reporting it
-                reattaches += 1
-                if reattaches > MAX_STREAM_REATTACHES:
-                    raise
                 logger.warning(
                     "cursor-sdk event stream dropped (%s: %s) — re-attaching "
-                    "via observe(after_offset=%r), attempt %d/%d",
+                    "via observe(after_offset=%r)",
                     type(exc).__name__, exc, last_offset,
-                    reattaches, MAX_STREAM_REATTACHES,
                 )
-                time.sleep(min(2.0 * reattaches, 10.0))
-                try:
-                    stream = iter(run.observe(after_offset=last_offset))
-                except Exception:
-                    continue  # next() raises again -> counted attempt
+                # A raised generator is spent (next() would yield a bogus
+                # StopIteration), so keep retrying observe() itself here
+                # until it hands back a live stream or the budget runs out.
+                while True:
+                    reattaches += 1
+                    if reattaches > MAX_STREAM_REATTACHES:
+                        raise
+                    time.sleep(
+                        min(_REATTACH_BACKOFF_S * reattaches, _REATTACH_BACKOFF_CAP_S)
+                    )
+                    if self._cancel_requested.is_set():
+                        return
+                    try:
+                        stream = iter(run.observe(after_offset=last_offset))
+                        break
+                    except Exception:
+                        logger.debug("observe re-attach failed", exc_info=True)
                 self._put(
                     "sdk.reattached",
                     {"offset": last_offset, "attempt": reattaches},

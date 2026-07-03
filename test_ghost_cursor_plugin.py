@@ -2958,21 +2958,27 @@ class _FakeStream:
     def _iter(self, start_idx):
         i = start_idx
         while i < len(self._script):
+            if self._run.cancel_event.is_set():
+                self._run.status = "cancelled"
+                return
             item = self._script[i]
             i += 1
             if isinstance(item, Exception):
                 raise item
             if callable(item):
                 item = item()
-                if item is None:
-                    continue
+            if item is None:
+                continue
             if self._run.cancel_event.is_set():
                 self._run.status = "cancelled"
                 return
             yield SimpleNamespace(
                 kind="message", offset=str(i - 1), sdk_message=item
             )
-        self._run.status = self._run.final_status
+        self._run.status = (
+            "cancelled" if self._run.cancel_event.is_set()
+            else self._run.final_status
+        )
 
     def events(self):
         return self._iter(0)
@@ -3110,6 +3116,303 @@ class TestSdkRunner:
             list(gc_sdk.run_sdk("   ", str(tmp_path)))
         with pytest.raises(gc_runner.HarnessError):
             list(gc_sdk.run_sdk("t", str(tmp_path / "nope")))
+
+    def test_bridge_launch_failure_raises_sdk_error(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+
+        def boom(workspace):
+            raise RuntimeError("no bridge binary")
+
+        monkeypatch.setattr(gc_sdk, "get_bridge", boom)
+        with pytest.raises(gc_sdk.SdkRunnerError) as err:
+            list(gc_sdk.run_sdk("t", str(tmp_path)))
+        assert "bridge" in str(err.value)
+
+    def test_nonretryable_create_failure_raises_actionable_error(
+        self, tmp_path, monkeypatch
+    ):
+        client = _FakeClient(
+            _FakeAgent(), create_error=RuntimeError("invalid model")
+        )
+        _install_fake_sdk(monkeypatch, client)
+        with pytest.raises(gc_sdk.SdkRunnerError) as err:
+            list(gc_sdk.run_sdk("t", str(tmp_path)))
+        assert "CURSOR_API_KEY" in str(err.value)
+        assert "invalid model" in str(err.value)
+
+    def test_native_cancel_resolves_run_cancelled(self, tmp_path, monkeypatch):
+        run = _FakeRun([])
+        blocker = lambda: run.cancel_event.wait(10) and None  # noqa: E731
+        run._stream._script[:] = [_sdk_msg(type="thinking", text="hm"), blocker]
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        polls = []
+
+        def cancel_after_two_polls():
+            polls.append(1)
+            return len(polls) > 2
+
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=cancel_after_two_polls,
+        ))
+        keys = [k for k, _ in events]
+        assert "sdk.session" in keys
+        assert events[-1] == ("sdk.result", {"status": "cancelled"})
+        assert run.cancel_event.is_set(), "cancel must reach run.cancel()"
+
+    def test_inactivity_watchdog_fires_on_true_silence(self, tmp_path, monkeypatch):
+        run = _FakeRun([])
+        blocker = lambda: run.cancel_event.wait(10)  # noqa: E731
+        run._stream._script[:] = [_sdk_msg(type="thinking", text="hm"), blocker]
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=0.4, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["timeout"] is True
+        assert "no activity" in obj["error"]
+        assert run.cancel_event.is_set(), "watchdog must cancel the live run"
+
+    def test_pending_tool_call_suspends_inactivity_clock(self, tmp_path, monkeypatch):
+        def slow_tool_result():
+            time.sleep(1.0)  # silent, but a tool call is in flight
+            return _sdk_msg(type="tool_call", call_id="t-slow", name="shell",
+                            status="completed",
+                            result={"exitCode": 0, "stdout": "ok"})
+
+        run = _FakeRun([
+            _sdk_msg(type="tool_call", call_id="t-slow", name="shell",
+                     status="running", args={"command": "npx tsc"}),
+            slow_tool_result,
+            _sdk_msg(type="assistant",
+                     message=SimpleNamespace(content=[
+                         SimpleNamespace(type="text", text="done")])),
+        ])
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=0.4, cancel_check=lambda: False,
+        ))
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_finished_tool_call_does_not_suspend_the_clock(
+        self, tmp_path, monkeypatch
+    ):
+        run = _FakeRun([])
+        blocker = lambda: run.cancel_event.wait(10)  # noqa: E731
+        run._stream._script[:] = [
+            _sdk_msg(type="tool_call", call_id="t-done", name="shell",
+                     status="running", args={"command": "ls"}),
+            _sdk_msg(type="tool_call", call_id="t-done", name="shell",
+                     status="completed", result={"exitCode": 0, "stdout": ""}),
+            blocker,  # true silence, no pending call
+        ]
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=0.4, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error" and obj["timeout"] is True
+
+    def test_max_wall_ceiling_kills_runaway_streams(self, tmp_path, monkeypatch):
+        def chatty():
+            time.sleep(0.05)
+            return _sdk_msg(type="thinking", text="still going")
+
+        run = _FakeRun([chatty] * 1000)
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        started = time.monotonic()
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, max_wall_s=0.6,
+            cancel_check=lambda: False,
+        ))
+        assert time.monotonic() - started < 10
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["timeout"] is True
+        assert "max wall time" in obj["error"]
+
+    def test_resume_uses_persisted_agent_id(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(agent_id="agent-prior",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "follow up", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-prior",
+        ))
+        assert client.agents.resume_calls == ["agent-prior"]
+        assert client.agents.create_calls == []
+        assert events[0][1]["resumed"] is True
+        assert events[0][1]["agentId"] == "agent-prior"
+
+    def test_failed_resume_falls_back_to_fresh_agent(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(agent_id="agent-fresh",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent, resume_error=RuntimeError("unknown agent"))
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "follow up", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-gone",
+        ))
+        assert client.agents.resume_calls == ["agent-gone"]
+        assert len(client.agents.create_calls) == 1
+        assert events[0][1]["resumed"] is False
+        assert events[0][1]["agentId"] == "agent-fresh"
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_model_and_cwd_thread_into_create(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(model_id="gpt-5.3-codex",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            model="gpt-5.3-codex",
+        ))
+        call = client.agents.create_calls[0]
+        assert call["model"] == "gpt-5.3-codex"
+        assert call["local"]["cwd"] == str(gc_runner.resolve_repo(str(tmp_path)))
+        assert events[0][1]["model"] == "gpt-5.3-codex"
+
+    def test_retryable_create_error_is_retried(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent, create_error=_RetryableError("bridge hiccup"))
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert len(client.agents.create_calls) == 2  # failed + retried
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_retryable_send_error_is_retried(self, tmp_path, monkeypatch):
+        run = _FakeRun(_happy_script())
+
+        class _FlakySendAgent(_FakeAgent):
+            def send(self, message, *a, **kw):
+                if not self.sent:
+                    self.sent.append(message)
+                    raise _RetryableError("http/2 stream reset")
+                return super().send(message, *a, **kw)
+
+        agent = _FlakySendAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert agent.sent == ["t", "t"]
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_dropped_stream_reattaches_via_observe_after_offset(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(gc_sdk, "_REATTACH_BACKOFF_S", 0.0)
+        run = _FakeRun([
+            _sdk_msg(type="thinking", text="before "),
+            _sdk_msg(type="thinking", text="the drop"),
+            ConnectionError("http/2 stream closed with error code CANCEL"),
+            _sdk_msg(type="thinking", text="after the drop"),
+            _sdk_msg(type="assistant",
+                     message=SimpleNamespace(content=[
+                         SimpleNamespace(type="text", text="all done")])),
+        ])
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        # Reconnected exactly where it left off — nothing lost, nothing
+        # duplicated, no synthetic user-visible messages.
+        assert run.observe_calls == ["1"]
+        texts = [o.get("text") for k, o in events
+                 if k == "sdk.message" and o.get("type") == "thinking"]
+        assert texts == ["before ", "the drop", "after the drop"]
+        reattached = [o for k, o in events if k == "sdk.reattached"]
+        assert len(reattached) == 1
+        assert reattached[0]["offset"] == "1"
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_reattach_budget_exhaustion_fails_the_run(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(gc_sdk, "_REATTACH_BACKOFF_S", 0.0)
+
+        class _DeadStreamRun(_FakeRun):
+            def observe(self, after_offset=None):
+                self.observe_calls.append(after_offset)
+                raise ConnectionError("bridge gone")
+
+        run = _DeadStreamRun([
+            _sdk_msg(type="thinking", text="hm"),
+            ConnectionError("stream dropped"),
+            _sdk_msg(type="thinking", text="never seen"),
+        ])
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert len(run.observe_calls) == gc_sdk.MAX_STREAM_REATTACHES
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert "stream failed mid-run" in obj["error"]
+
+    def test_bridge_is_cached_per_workspace_and_shutdown_closes(
+        self, tmp_path, monkeypatch
+    ):
+        launches = []
+
+        class _CloseableClient:
+            def __init__(self, ws):
+                self.ws = ws
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        def fake_launch_bridge(workspace=None, **kw):
+            client = _CloseableClient(workspace)
+            launches.append(client)
+            return client
+
+        monkeypatch.setattr(gc_sdk, "_bridges", {})
+        fake_mod = SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        )
+        import sys as _sys
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", fake_mod)
+
+        a1 = gc_sdk.get_bridge("/repo/a")
+        a2 = gc_sdk.get_bridge("/repo/a")
+        b1 = gc_sdk.get_bridge("/repo/b")
+        assert a1 is a2 and a1 is not b1
+        assert len(launches) == 2
+
+        gc_sdk.shutdown_bridges()
+        assert all(c.closed for c in launches)
+        assert gc_sdk.get_bridge("/repo/a") is not a1  # relaunches after shutdown
+
+
+class _RetryableError(Exception):
+    """Duck-typed CursorAgentError: retryable, no server retry_after."""
+
+    is_retryable = True
+    retry_after = "0"
 
 
 # ---------------------------------------------------------------------------
