@@ -1,13 +1,16 @@
 """End-to-end tests for ghost_cursor — NO MOCKS.
 
 Runs the real plugin against the real `cursor-agent` binary and the real Hermes
-core modules. Exercises every input shape of the v0.3 handle interface:
-cursor_start (new + resume), cursor_send, cursor_status (read-only), cursor_stop,
+core modules. Exercises every input shape of the v0.4 named-session interface:
+cursor_create_session (lazy), cursor_send_message (first task + resume),
+cursor_status (read-only), cursor_stop, cursor_events, cursor_list, the
 same-repo concurrency guard, and bogus-handle fallback.
 
 Assertions are INVARIANTS, not exact output (the model is nondeterministic):
-"a .py file exists / imports / defines X / a handle came back / status never
-cancels", never "the diff equals this fixture".
+"a .py file exists / imports / defines X / a named session came back / the
+status header says completed / status never cancels", never "the diff equals
+this fixture". Tool output is plain TEXT in v0.4 — assertions match header
+lines like 'status: completed', never JSON keys.
 
 Requires (skips cleanly if absent):
   - CURSOR_API_KEY in env
@@ -18,12 +21,10 @@ Model is pinned cheap via GHOST_CURSOR_TEST_MODEL (default gpt-5.4-nano-low) so
 CI stays fast + cheap. Tasks are trivially small so even a weak model nails them.
 """
 import importlib.util
-import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -45,6 +46,9 @@ pytestmark = pytest.mark.skipif(
     not (_run and _have_key and _have_bin),
     reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and install cursor-agent",
 )
+
+TERMINAL = ("completed", "failed", "cancelled", "timeout")
+
 
 def _find_plugin_init() -> Path:
     """Locate the ghost_cursor package __init__.py robustly.
@@ -70,10 +74,10 @@ def _find_plugin_init() -> Path:
         if root:
             candidates.append(Path(root) / "plugins" / "ghost_cursor" / "__init__.py")
     for c in candidates:
-        # a real plugin init defines cursor_start; the empty tests/plugins/__init__
-        # does not — so verify content, not just existence
+        # a real plugin init defines cursor_create_session; the empty
+        # tests/plugins/__init__ does not — verify content, not just existence
         try:
-            if c.is_file() and "def cursor_start" in c.read_text(encoding="utf-8"):
+            if c.is_file() and "def cursor_create_session" in c.read_text(encoding="utf-8"):
                 return c
         except Exception:
             continue
@@ -117,38 +121,57 @@ def _repo(tmp_path):
     return str(d)
 
 
-def _wait_done(gc, sid, timeout=180):
+def _create(gc, repo):
+    """cursor_create_session → the minted session name (from the text ack)."""
+    ack = gc._handle_cursor_create_session({"repo": repo, "model": CURSOR_MODEL})
+    assert ack.startswith("session: "), f"not a create ack: {ack!r}"
+    return ack.splitlines()[0].split("session: ", 1)[1].strip()
+
+
+def _send(gc, session, message):
+    return gc._handle_cursor_send_message({"session": session, "message": message})
+
+
+def _status_word(gc, session):
+    """The value of the 'status:' header line (or '' if the output is a
+    prose error like an unknown-session message)."""
+    out = gc._handle_cursor_status({"session": session})
+    first = out.splitlines()[0]
+    if first.startswith("status: "):
+        return first.split("status: ", 1)[1].strip()
+    return ""
+
+
+def _wait_done(gc, session, timeout=180):
     deadline = time.time() + timeout
     while time.time() < deadline:
-        s = json.loads(gc._handle_cursor_status({"session_id": sid}))
-        if s.get("status") in ("completed", "failed", "cancelled", "timeout"):
-            return s
+        word = _status_word(gc, session)
+        if word in TERMINAL:
+            return word
         time.sleep(4)
-    return json.loads(gc._handle_cursor_status({"session_id": sid}))
+    return _status_word(gc, session)
 
 
-def test_start_status_readonly_and_completion(gc, tmp_path):
-    """cursor_start returns a handle; polling status never cancels; run completes
-    and the file lands on disk."""
+def test_create_send_status_readonly_and_completion(gc, tmp_path):
+    """create mints a named session lazily; the first send starts the run;
+    polling status never cancels; the run completes and the file lands."""
     repo = _repo(tmp_path)
-    r = json.loads(gc._handle_cursor_start(
-        {"task": "Create calc.py with a function add(a, b) that returns a + b.",
-         "repo": repo, "model": CURSOR_MODEL}))
-    assert r.get("success") is True
-    sid = r.get("session_id")
-    assert sid, f"no handle returned: {r}"
-    assert r.get("status") == "running"
+    name = _create(gc, repo)
+    # Lazy: nothing terminal, nothing running — the handle merely exists.
+    assert _status_word(gc, name) not in TERMINAL
+
+    ack = _send(gc, name, "Create calc.py with a function add(a, b) that returns a + b.")
+    assert f"sent to {name}" in ack
+    assert "running in background" in ack
 
     # poll twice mid-run — must NOT cancel
-    seen_running = False
     for _ in range(2):
         time.sleep(6)
-        s = json.loads(gc._handle_cursor_status({"session_id": sid}))
-        if s.get("status") == "running":
-            seen_running = True
+        status = gc._handle_cursor_status({"session": name})
+        assert f"session: {name}" in status
     # whether or not we caught it running, the key invariant: status never killed it
-    final = _wait_done(gc, sid)
-    assert final.get("status") == "completed", f"run did not complete: {final}"
+    final = _wait_done(gc, name)
+    assert final == "completed", f"run did not complete: {final}"
 
     calc = Path(repo) / "calc.py"
     assert calc.exists(), "calc.py was not created"
@@ -156,18 +179,26 @@ def test_start_status_readonly_and_completion(gc, tmp_path):
     exec(calc.read_text(), ns)
     assert ns["add"](2, 3) == 5
 
+    # the persisted event history pages as text, keyed by the same name
+    events = gc._handle_cursor_events({"session": name})
+    assert events.startswith("events "), f"not an events page: {events[:80]!r}"
+    # the session shows up in the scoped TSV listing
+    listing = gc._handle_cursor_list({})
+    assert name in listing
+    assert listing.splitlines()[0].split("\t")[0].strip() == "session"
 
-def test_resume_carries_context(gc, tmp_path):
-    """Explicit resume: pass the handle back, second task builds on the first."""
+
+def test_followup_send_carries_context(gc, tmp_path):
+    """Second message on the SAME named session builds on the first task."""
     repo = _repo(tmp_path)
-    r1 = json.loads(gc._handle_cursor_start(
-        {"task": "Create calc.py with add(a, b).", "repo": repo, "model": CURSOR_MODEL}))
-    sid = r1["session_id"]
-    _wait_done(gc, sid)
-    r2 = json.loads(gc._handle_cursor_start(
-        {"task": "Add subtract(a, b) to calc.py in the same style.",
-         "repo": repo, "session_id": sid, "model": CURSOR_MODEL}))
-    _wait_done(gc, r2["session_id"])
+    name = _create(gc, repo)
+    _send(gc, name, "Create calc.py with add(a, b).")
+    assert _wait_done(gc, name) == "completed"
+
+    ack = _send(gc, name, "Add subtract(a, b) to calc.py in the same style.")
+    assert f"sent to {name}" in ack
+    assert _wait_done(gc, name) == "completed"
+
     calc = Path(repo) / "calc.py"
     ns = {}
     exec(calc.read_text(), ns)
@@ -175,40 +206,43 @@ def test_resume_carries_context(gc, tmp_path):
     assert ns["subtract"](5, 2) == 3
 
 
-def test_same_repo_second_start_rejected(gc, tmp_path):
-    """A second cursor_start on a repo with an active run is rejected."""
+def test_same_repo_second_run_rejected(gc, tmp_path):
+    """Sending into a second session on a repo with an active run is refused
+    with actionable prose naming the active session."""
     repo = _repo(tmp_path)
-    r1 = json.loads(gc._handle_cursor_start(
-        {"task": "Create a.py with a long docstring and function a().",
-         "repo": repo, "model": CURSOR_MODEL}))
-    sid = r1["session_id"]
-    # immediately try a second — should be rejected while the first runs
-    r2 = json.loads(gc._handle_cursor_start(
-        {"task": "Create b.py.", "repo": repo, "model": CURSOR_MODEL}))
-    assert r2.get("success") is False or r2.get("status") == "rejected", \
-        f"second start should be rejected: {r2}"
-    _wait_done(gc, sid)
+    first = _create(gc, repo)
+    _send(gc, first, "Create a.py with a long docstring and function a().")
+
+    second = _create(gc, repo)
+    out = _send(gc, second, "Create b.py.")
+    assert "already running" in out, f"second run should be refused: {out!r}"
+    assert first in out  # the refusal hands back the ACTIVE session's name
+    _wait_done(gc, first)
 
 
 def test_bogus_handle_is_graceful(gc):
-    """status/send/stop on an unknown handle degrade gracefully, no exception."""
-    for handler in (gc._handle_cursor_status, gc._handle_cursor_stop):
-        out = json.loads(handler({"session_id": "does-not-exist-xyz"}))
-        assert isinstance(out, dict)
-    out = json.loads(gc._handle_cursor_send(
-        {"session_id": "does-not-exist-xyz", "message": "hi"}))
-    assert isinstance(out, dict)
+    """status/send/stop/events on an unknown handle degrade to actionable
+    prose — no exception, no traceback."""
+    for handler in (
+        gc._handle_cursor_status,
+        gc._handle_cursor_stop,
+        gc._handle_cursor_events,
+    ):
+        out = handler({"session": "does-not-exist-xyz"})
+        assert "no session named 'does-not-exist-xyz'" in out
+    out = gc._handle_cursor_send_message(
+        {"session": "does-not-exist-xyz", "message": "hi"})
+    assert "no session named 'does-not-exist-xyz'" in out
 
 
 def test_stop_cancels_running(gc, tmp_path):
-    """cursor_stop on a running job cancels it gracefully."""
+    """cursor_stop on a running job cancels it gracefully and reports the
+    outcome as a status-headed text block."""
     repo = _repo(tmp_path)
-    r = json.loads(gc._handle_cursor_start(
-        {"task": "Create big.py with five functions, each with a long docstring.",
-         "repo": repo, "model": CURSOR_MODEL}))
-    sid = r["session_id"]
+    name = _create(gc, repo)
+    _send(gc, name, "Create big.py with five functions, each with a long docstring.")
     time.sleep(5)
-    out = json.loads(gc._handle_cursor_stop({"session_id": sid}))
-    assert isinstance(out, dict)
-    final = _wait_done(gc, sid, timeout=30)
-    assert final.get("status") in ("cancelled", "completed", "failed", "timeout")
+    out = gc._handle_cursor_stop({"session": name})
+    assert out.startswith("status: "), f"not a stop report: {out[:80]!r}"
+    final = _wait_done(gc, name, timeout=30)
+    assert final in TERMINAL

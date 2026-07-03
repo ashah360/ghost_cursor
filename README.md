@@ -25,9 +25,9 @@ The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
 Four explicit tools mirroring Hermes's `terminal`/`process` split. The single handle is the cursor **`session_id`**, returned by `cursor_start` and passed to the rest.
 
-- **`cursor_start(task, repo, model?, session_id?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (ACP `session/load`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor-agent model (config fallback: `plugins.ghost_cursor.model`).
-- **`cursor_send(session_id, message)`** — steer / follow up. Honest semantics: Cursor's ACP has **no true queue** — this interrupts the current prompt (`session/cancel`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
-- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed. Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
+- **`cursor_start(task, repo, model?, session_id?, inactivity_timeout_s?, max_wall_s?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (ACP `session/load`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor-agent model (config fallback: `plugins.ghost_cursor.model`).
+- **`cursor_send(session_id, message, inactivity_timeout_s?, max_wall_s?)`** — steer / follow up. Honest semantics: Cursor's ACP has **no true queue** — this interrupts the current prompt (`session/cancel`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
+- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed, `last_activity_s` (seconds since the last ACP event — spot a silent run without touching it). Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
 - **`cursor_stop(session_id)`** — graceful `session/cancel`, SIGKILL only on hang. Returns final status + partial `files_changed`.
 
 Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state (success/fail/error/timeout/cancel), **same-repo concurrency guard** (a second `cursor_start` on a repo with an active handle is rejected — two agents on one tree = corruption; different repos run in parallel), **handle persistence** across turns (a JSON table under `<HERMES_HOME>/state/`), **git-diff fallback** for shell-driven edits, and a **`check_fn`** so the tools only appear when `cursor-agent` is installed.
@@ -124,6 +124,17 @@ By default `cursor_edit` runs synchronously (best for quick edits — you see th
 - **Same-repo concurrency guard** — a second background run against a repo that already has an active job is rejected (two agents on one working tree = corruption).
 
 Why this matters: a synchronous tool holds the conversation turn open for the whole run, so messaging the agent mid-run triggers an interrupt that cancels the turn — and the cursor work with it. Background mode decouples the run from the turn, so "how's it going?" becomes a safe read instead of a kill.
+
+## Timeouts — inactivity, not wall clock
+
+Timeouts are **inactivity-based**: a run that keeps streaming ACP events (reasoning, tool calls, content) is alive and is never killed for total elapsed time. Only a *silent* run is treated as hung.
+
+- **`inactivity_timeout_s`** — abort after this many seconds with **no ACP events**; any streamed activity resets the clock. Default **600** (10 min of silence); **0 disables** the watchdog.
+- **`max_wall_s`** — optional hard ceiling on **total** run time, a safety net for runaways that stream forever without finishing. Default **0 (disabled)**.
+
+Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last ACP event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the ACP runner.
+
+The old `timeout` parameter is kept as a deprecated alias for `inactivity_timeout_s`.
 
 ## How live progress works (no core patch)
 
