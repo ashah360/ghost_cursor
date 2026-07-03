@@ -3110,3 +3110,218 @@ class TestSdkRunner:
             list(gc_sdk.run_sdk("   ", str(tmp_path)))
         with pytest.raises(gc_runner.HarnessError):
             list(gc_sdk.run_sdk("t", str(tmp_path / "nope")))
+
+
+# ---------------------------------------------------------------------------
+# events.SdkNormalizer — SDKMessage dicts → canonical envelopes
+# ---------------------------------------------------------------------------
+
+class TestSdkNormalizer:
+    def _norm(self):
+        return gc_events.SdkNormalizer()
+
+    def test_session_event_maps_to_run_started(self):
+        envs = self._norm().normalize(
+            "sdk.session",
+            {"agentId": "agent-1", "cwd": "/w", "model": "m", "resumed": False},
+        )
+        assert envs == [{
+            "source": "ghost", "kind": "lifecycle", "event": "run.started",
+            "model": "m", "cwd": "/w", "harness_session_id": "agent-1",
+        }]
+
+    def test_reattached_maps_to_log_only_lifecycle(self):
+        envs = self._norm().normalize(
+            "sdk.reattached", {"offset": "41", "attempt": 1}
+        )
+        assert envs[0]["event"] == "stream.reattached"
+        assert envs[0]["offset"] == "41"
+
+    def test_finished_maps_to_run_completed(self):
+        envs = self._norm().normalize("sdk.result", {"status": "finished"})
+        assert envs[0]["event"] == "run.completed"
+        assert envs[0]["status"] == "completed"
+
+    def test_cancelled_maps_to_run_failed_cancelled(self):
+        envs = self._norm().normalize("sdk.result", {"status": "cancelled"})
+        assert envs[0]["event"] == "run.failed"
+        assert envs[0]["cancelled"] is True
+        assert "cancel" in envs[0]["error"]
+
+    def test_expired_maps_to_run_failed_timeout(self):
+        envs = self._norm().normalize("sdk.result", {"status": "expired"})
+        assert envs[0]["event"] == "run.failed"
+        assert envs[0]["timeout"] is True
+
+    def test_error_status_maps_to_run_failed(self):
+        envs = self._norm().normalize("sdk.result", {"status": "error"})
+        assert envs[0]["event"] == "run.failed"
+        assert "error" in envs[0]["error"]
+
+    def test_sdk_error_maps_to_run_failed(self):
+        envs = self._norm().normalize(
+            "sdk.error", {"error": "cursor run timed out: no activity for 600s",
+                          "timeout": True}
+        )
+        assert envs[0]["event"] == "run.failed"
+        assert envs[0]["timeout"] is True
+
+    def test_assistant_message_maps_to_content(self):
+        envs = self._norm().normalize("sdk.message", {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "hello "},
+                                    {"type": "text", "text": "world"}]},
+        })
+        assert envs == [{
+            "source": "ghost", "kind": "content", "delta": "hello world",
+            "done": False,
+        }]
+
+    def test_thinking_maps_to_reasoning(self):
+        envs = self._norm().normalize("sdk.message", {
+            "type": "thinking", "text": "pondering notes.txt",
+        })
+        assert envs[0]["event"] == "reasoning"
+        assert envs[0]["text"] == "pondering notes.txt"
+
+    def test_noise_types_produce_no_envelopes(self):
+        norm = self._norm()
+        for mtype in ("system", "user", "request", "status"):
+            assert norm.normalize("sdk.message", {"type": mtype}) == []
+
+    def test_shell_tool_call_round_trip(self):
+        norm = self._norm()
+        started = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running", "args": {"command": "ls -la"},
+        })
+        assert started == [{
+            "source": "ghost", "kind": "tool_use", "id": "t1",
+            "tool": "shell", "status": "running", "title": "ls -la",
+            "command": "ls -la",
+        }]
+        done = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "completed",
+            "result": {"exitCode": 0, "stdout": "calc.py"},
+        })
+        assert done[0]["kind"] == "tool_result"
+        assert done[0]["status"] == "done"
+        assert "calc.py" in done[0]["output"]
+        assert isinstance(done[0]["durationMs"], int)
+
+    def test_repeated_running_messages_are_deduped(self):
+        norm = self._norm()
+        first = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running", "args": {},
+        })
+        assert len(first) == 1
+        again = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running", "args": {"command": "ls"},
+        })
+        assert again == []
+
+    def test_nonzero_exit_code_marks_result_error(self):
+        norm = self._norm()
+        norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t8", "name": "shell",
+            "status": "running", "args": {"command": "false"},
+        })
+        envs = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t8", "name": "shell",
+            "status": "completed",
+            "result": {"exitCode": 1, "stdout": "", "stderr": "nope"},
+        })
+        assert envs[0]["status"] == "error"
+        assert "nope" in envs[0]["output"]
+
+    def test_error_status_tool_call_maps_to_error_result(self):
+        norm = self._norm()
+        norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t9", "name": "shell",
+            "status": "running", "args": {"command": "boom"},
+        })
+        envs = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "t9", "name": "shell",
+            "status": "error", "result": "command not found: boom",
+        })
+        assert envs[0]["kind"] == "tool_result"
+        assert envs[0]["status"] == "error"
+        assert "not found" in envs[0]["output"]
+
+    def test_edit_tool_full_content_yields_file_diff(self):
+        norm = self._norm()
+        norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "e1", "name": "edit_file",
+            "status": "running", "args": {"path": "/w/calc.py"},
+        })
+        envs = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "e1", "name": "edit_file",
+            "status": "completed",
+            "result": {"path": "/w/calc.py",
+                       "beforeFullFileContent": "a\n",
+                       "afterFullFileContent": "a\nb\n"},
+        })
+        assert envs[0]["kind"] == "tool_result"
+        assert envs[0]["additions"] == 1 and envs[0]["deletions"] == 0
+        diff = envs[1]
+        assert diff["kind"] == "file_diff"
+        assert diff["path"] == "/w/calc.py"
+        assert diff["status"] == "M"
+        assert "+b" in diff["diff"]
+
+    def test_edit_tool_old_new_text_blocks_yield_file_diff(self):
+        norm = self._norm()
+        norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "e2", "name": "write",
+            "status": "running", "args": {"path": "/w/notes.txt"},
+        })
+        envs = norm.normalize("sdk.message", {
+            "type": "tool_call", "call_id": "e2", "name": "write",
+            "status": "completed",
+            "result": {"content": [{"path": "/w/notes.txt",
+                                    "oldText": "", "newText": "hello\n"}]},
+        })
+        diffs = [e for e in envs if e["kind"] == "file_diff"]
+        assert len(diffs) == 1
+        assert diffs[0]["status"] == "A"
+        assert diffs[0]["after"] == "hello\n"
+
+    def test_terminal_tool_call_without_start_synthesizes_tool_use(self):
+        envs = self._norm().normalize("sdk.message", {
+            "type": "tool_call", "call_id": "fast", "name": "shell",
+            "status": "completed", "args": {"command": "true"},
+            "result": {"exitCode": 0, "stdout": ""},
+        })
+        assert [e["kind"] for e in envs] == ["tool_use", "tool_result"]
+        assert envs[0]["status"] == "running"
+        assert envs[1]["status"] == "done"
+
+    def test_unstable_tool_payload_shapes_never_crash(self):
+        norm = self._norm()
+        for weird in (None, 42, "text", ["a", 1], {"nested": {"deep": object()}}):
+            envs = norm.normalize("sdk.message", {
+                "type": "tool_call", "call_id": f"w-{id(weird)}",
+                "name": "mystery", "status": "completed", "result": weird,
+            })
+            assert envs, "terminal tool_call must always render"
+            assert envs[-1]["kind"] == "tool_result"
+
+    def test_usage_maps_to_log_only_lifecycle(self):
+        envs = self._norm().normalize("sdk.message", {
+            "type": "usage", "usage": {"total_tokens": 1234},
+        })
+        assert envs[0]["event"] == "usage"
+        assert envs[0]["usage"]["total_tokens"] == 1234
+
+    def test_unknown_message_type_passes_through(self):
+        envs = self._norm().normalize("sdk.message", {"type": "mystery", "x": 1})
+        assert envs[0]["event"] == "passthrough"
+        assert envs[0]["name"] == "sdk.mystery"
+
+    def test_unknown_runner_event_passes_through(self):
+        envs = self._norm().normalize("sdk.wat", {"x": 1})
+        assert envs[0]["event"] == "passthrough"
+        assert envs[0]["name"] == "sdk.wat"

@@ -317,6 +317,358 @@ def normalize_harness(event_key: str, data: Dict[str, Any]) -> List[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
+# cursor-sdk normalization — sdk_runner.run_sdk event tuples
+# ---------------------------------------------------------------------------
+# SDKMessage shapes follow the official cursor-sdk docs (type discriminator:
+# system / user / assistant / thinking / tool_call / status / task / request
+# / usage). The envelope fields (type, call_id, name, status) are stable;
+# tool_call ``args`` and ``result`` payloads are EXPLICITLY UNSTABLE upstream
+# — everything below parses them defensively and never raises on an
+# unexpected shape.
+
+# Message types that never produce envelopes: the task echo, handshake
+# metadata, and transient status pings.
+_SDK_NOISE_TYPES = {"system", "user", "request", "status"}
+
+# tool_call names that mean a file edit (vs shell/read). Names are unstable
+# upstream, so this is a substring match, not an enum.
+_SDK_EDIT_NAME_HINTS = ("edit", "write", "delete", "apply_patch", "applypatch")
+
+_SDK_TERMINAL_TOOL_STATUSES = {"completed", "error", "failed", "cancelled"}
+
+
+def _first_str(data: Dict[str, Any], *keys: str) -> str:
+    """The first non-empty string value among ``keys``, else ""."""
+    for key in keys:
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def _sdk_tool_kind(name: str) -> str:
+    lowered = str(name or "").lower()
+    if any(hint in lowered for hint in _SDK_EDIT_NAME_HINTS):
+        return TOOL_FILE_EDIT
+    return TOOL_SHELL
+
+
+def _sdk_tool_title(name: str, kind: str, args: Dict[str, Any]) -> str:
+    path = _first_str(args, "path", "file_path", "filePath")
+    if kind == TOOL_FILE_EDIT:
+        return f"Editing {path}" if path else "File edit"
+    cmd = _first_str(args, "command", "cmd")
+    if cmd:
+        return cmd.strip().splitlines()[0][:120]
+    if "read" in str(name or "").lower() and path:
+        return f"Reading {path}"
+    return str(name or "").strip() or "Tool"
+
+
+def _sdk_assistant_text(msg: Dict[str, Any]) -> str:
+    """Concatenated text blocks from an assistant message, shape-tolerant."""
+    message = msg.get("message")
+    if isinstance(message, str):
+        return message
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    parts: List[str] = []
+    for block in content or []:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
+
+
+def _sdk_diff_entries(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Best-effort file_diff envelopes mined from a tool_call result.
+
+    The payload schema is unstable, so this probes the shapes seen from
+    cursor's edit tools (before/after full content, oldText/newText blocks,
+    pre-rendered diff strings) and returns [] rather than guessing. Runs
+    whose edits slip through entirely still land in files_changed via the
+    git fallback (sdk_runner.git_fallback_diffs).
+    """
+    candidates: List[Dict[str, Any]] = [result]
+    for key in ("success", "edit", "data"):
+        nested = result.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    for key in ("content", "diffs", "edits", "files"):
+        nested = result.get(key)
+        if isinstance(nested, list):
+            candidates.extend(b for b in nested if isinstance(b, dict))
+
+    entries: List[Dict[str, Any]] = []
+    for cand in candidates:
+        path = _first_str(cand, "path", "file_path", "filePath")
+        if not path:
+            continue
+        before = _first_str(cand, "beforeFullFileContent", "oldText", "before")
+        after = _first_str(cand, "afterFullFileContent", "newText", "after")
+        pre_rendered = _first_str(cand, "diffString", "diff")
+        if not (before or after or pre_rendered):
+            continue
+        if before or after:
+            diff_text, added, removed = unified_diff_text(before, after, path)
+        else:
+            diff_text = pre_rendered
+            added = sum(
+                1 for l in pre_rendered.splitlines()
+                if l.startswith("+") and not l.startswith("+++")
+            )
+            removed = sum(
+                1 for l in pre_rendered.splitlines()
+                if l.startswith("-") and not l.startswith("---")
+            )
+        if not diff_text:
+            continue
+        entries.append(
+            file_diff(
+                path=path,
+                before=before,
+                after=after,
+                diff=diff_text,
+                added=added,
+                removed=removed,
+            )
+        )
+    return entries
+
+
+def _sdk_output_text(result: Any) -> str:
+    """Shell/read output mined from a tool_call result, shape-tolerant."""
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return "" if result is None else str(result)
+    parts = [
+        str(result.get(k))
+        for k in ("stdout", "stderr", "content", "output", "text", "error")
+        if isinstance(result.get(k), str) and result.get(k)
+    ]
+    return "\n".join(parts)
+
+
+class SdkNormalizer:
+    """Stateful sdk_runner event → canonical-envelope mapper (one per run).
+
+    Stateful because tool_call completion messages must inherit the
+    kind/title resolved when the call started, and because durations are
+    measured client-side.
+    """
+
+    def __init__(self) -> None:
+        # call_id → {kind, title, command, started (monotonic)}
+        self._calls: Dict[str, Dict[str, Any]] = {}
+        # call_ids whose "running" tool_use envelope was already emitted
+        # (the SDK may re-emit running-status messages as args accumulate).
+        self._started: set = set()
+
+    # -- event entry point ---------------------------------------------------
+
+    def normalize(self, event_key: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Translate one sdk_runner event into canonical envelopes.
+
+        Args:
+            event_key: ``"sdk.session" | "sdk.message" | "sdk.reattached" |
+                "sdk.result" | "sdk.error"`` as yielded by
+                :func:`sdk_runner.run_sdk`.
+            data: For ``sdk.message``, the SDKMessage as a plain dict.
+        """
+        data = data if isinstance(data, dict) else {}
+
+        if event_key == "sdk.session":
+            return [
+                lifecycle(
+                    "run.started",
+                    model=data.get("model"),
+                    cwd=data.get("cwd"),
+                    harness_session_id=data.get("agentId"),
+                )
+            ]
+
+        if event_key == "sdk.reattached":
+            # Transparent stream recovery: JSONL-log signal only. The fold
+            # ignores unknown lifecycle events, so nothing user-visible
+            # changes — no synthetic messages, no re-prompt.
+            return [
+                lifecycle(
+                    "stream.reattached",
+                    offset=data.get("offset"),
+                    attempt=data.get("attempt"),
+                )
+            ]
+
+        if event_key == "sdk.result":
+            status = str(data.get("status") or "")
+            if status == "finished":
+                return [lifecycle("run.completed", status="completed",
+                                  run_status=status)]
+            if status == "cancelled":
+                return [
+                    lifecycle(
+                        "run.failed",
+                        status="failed",
+                        error="run cancelled (run.cancel)",
+                        cancelled=True,
+                    )
+                ]
+            if status == "expired":
+                return [
+                    lifecycle(
+                        "run.failed",
+                        status="failed",
+                        error="cursor run expired",
+                        timeout=True,
+                        run_status=status,
+                    )
+                ]
+            return [
+                lifecycle(
+                    "run.failed",
+                    status="failed",
+                    error=str(data.get("error") or "")
+                    or f"cursor run ended with status: {status or 'unknown'}",
+                    run_status=status,
+                )
+            ]
+
+        if event_key == "sdk.error":
+            return [
+                lifecycle(
+                    "run.failed",
+                    status="failed",
+                    error=data.get("error") or "cursor-sdk error",
+                    timeout=bool(data.get("timeout")),
+                )
+            ]
+
+        if event_key == "sdk.message":
+            return self._message(data)
+
+        # Unknown runner event: opaque passthrough so nothing is dropped.
+        return [lifecycle("passthrough", name=event_key, data=data)]
+
+    # -- SDKMessage types ------------------------------------------------------
+
+    def _message(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        mtype = str(msg.get("type") or "")
+
+        if mtype in _SDK_NOISE_TYPES:
+            return []
+
+        if mtype == "thinking":
+            text = msg.get("text")
+            if isinstance(text, str) and text:
+                return [lifecycle("reasoning", text=text)]
+            return []
+
+        if mtype == "assistant":
+            text = _sdk_assistant_text(msg)
+            return [content_delta(text)] if text else []
+
+        if mtype == "tool_call":
+            return self._tool_call(msg)
+
+        if mtype == "usage":
+            # Log-only: token accounting lands in the JSONL event log.
+            return [lifecycle("usage", usage=msg.get("usage"))]
+
+        if mtype == "task":
+            return [lifecycle("task", status=msg.get("status"),
+                              text=msg.get("text"))]
+
+        # Unknown message type: opaque passthrough.
+        return [lifecycle("passthrough", name=f"sdk.{mtype or 'message'}", data=msg)]
+
+    def _tool_call(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        call_id = str(msg.get("call_id") or "tool")
+        status = str(msg.get("status") or "")
+        if status in _SDK_TERMINAL_TOOL_STATUSES:
+            return self._tool_completed(call_id, status, msg)
+        return self._tool_started(call_id, msg)
+
+    def _tool_started(self, call_id: str, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if call_id in self._started:
+            return []  # re-emitted running message (args accumulating)
+        self._started.add(call_id)
+
+        name = str(msg.get("name") or "")
+        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        kind = _sdk_tool_kind(name)
+        title = _sdk_tool_title(name, kind, args)
+        state = {
+            "kind": kind,
+            "title": title,
+            "command": _first_str(args, "command", "cmd"),
+            "started": time.monotonic(),
+        }
+        self._calls[call_id] = state
+
+        env = _envelope(
+            "tool_use",
+            id=call_id,
+            tool=kind,
+            status=STATUS_RUNNING,
+            title=title,
+        )
+        if kind == TOOL_FILE_EDIT:
+            env["path"] = _first_str(args, "path", "file_path", "filePath")
+            env["additions"] = 0
+            env["deletions"] = 0
+        else:
+            env["command"] = state["command"]
+        return [env]
+
+    def _tool_completed(
+        self, call_id: str, status: str, msg: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        state = self._calls.get(call_id) or {}
+        kind = state.get("kind") or _sdk_tool_kind(str(msg.get("name") or ""))
+
+        envelopes: List[Dict[str, Any]] = []
+        if call_id not in self._started:
+            # Terminal message with no prior running message (observed on
+            # very fast calls): synthesize the tool_use so the pair renders.
+            envelopes.extend(self._tool_started(call_id, msg))
+
+        is_error = status in ("error", "failed", "cancelled")
+        res_env: Dict[str, Any] = _envelope(
+            "tool_result",
+            id=call_id,
+            status=STATUS_ERROR if is_error else STATUS_DONE,
+        )
+        started = state.get("started")
+        if isinstance(started, float):
+            res_env["durationMs"] = int((time.monotonic() - started) * 1000)
+
+        envelopes.append(res_env)
+
+        result = msg.get("result")
+        result_dict = result if isinstance(result, dict) else {}
+
+        diffs = _sdk_diff_entries(result_dict) if kind == TOOL_FILE_EDIT else []
+        if diffs:
+            res_env["additions"] = sum(d["added"] for d in diffs)
+            res_env["deletions"] = sum(d["removed"] for d in diffs)
+            envelopes.extend(diffs)
+        else:
+            out = _sdk_output_text(result)
+            if out:
+                res_env["output"] = _clip(out, MAX_OUTPUT_CHARS)
+            exit_code = result_dict.get("exitCode", result_dict.get("exit_code"))
+            if exit_code not in (None, 0):
+                res_env["status"] = STATUS_ERROR
+
+        return envelopes
+
+
+# ---------------------------------------------------------------------------
 # ACP (Agent Client Protocol) normalization — cursor-agent acp
 # ---------------------------------------------------------------------------
 # Field names below match CAPTURED session/update payloads from a real
