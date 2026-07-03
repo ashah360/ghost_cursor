@@ -2494,6 +2494,7 @@ def _install_fake_sdk(monkeypatch, client):
     monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
     monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
     monkeypatch.setattr(gc_sdk, "get_bridge", lambda workspace: client)
+    monkeypatch.setattr(gc_sdk, "_agents", {})  # isolate the handle cache
 
 
 def _happy_script(workdir="/w"):
@@ -2735,6 +2736,61 @@ class TestSdkRunner:
             "Create calc.py with add(a, b).",
             "Add subtract(a, b) to calc.py.",
         ]
+
+    def test_followup_send_reuses_the_live_agent_handle_without_resume(
+        self, tmp_path, monkeypatch
+    ):
+        """A follow-up in the SAME process reuses the live Agent handle
+        (the SDK's canonical multi-turn flow) instead of re-resuming: a
+        resume of an agent still registered on the live bridge makes the
+        bridge async-dispose the old handle, and that disposal path can
+        crash the bridge process (observed live 2026-07-03 as "peer closed
+        connection" then "connection refused" on every re-attach)."""
+        agent = _FakeAgent(agent_id="agent-live", model_id="fake-model",
+                           runs=[_FakeRun(_happy_script()),
+                                 _FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+
+        first = list(gc_sdk.run_sdk(
+            "task one", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert first[-1] == ("sdk.result", {"status": "finished"})
+
+        # Same requested model as the live handle → no resume RPC at all.
+        second = list(gc_sdk.run_sdk(
+            "task two", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-live", model="fake-model",
+        ))
+        assert client.agents.resume_calls == []
+        assert len(client.agents.create_calls) == 1
+        assert second[0][1]["resumed"] is True
+        assert second[-1] == ("sdk.result", {"status": "finished"})
+        assert agent.sent == ["task one", "task two"]
+
+    def test_followup_without_model_also_reuses_the_live_handle(
+        self, tmp_path, monkeypatch
+    ):
+        """No model requested on the follow-up: the live handle (which has
+        one) is reused as-is — never a model-less resume."""
+        agent = _FakeAgent(agent_id="agent-live",
+                           runs=[_FakeRun(_happy_script()),
+                                 _FakeRun(_happy_script())])
+        _install_fake_sdk(monkeypatch, (client := _FakeClient(agent)))
+
+        list(gc_sdk.run_sdk(
+            "task one", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        second = list(gc_sdk.run_sdk(
+            "task two", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-live",
+        ))
+        assert client.agents.resume_calls == []
+        assert second[-1] == ("sdk.result", {"status": "finished"})
 
     def test_resume_without_recorded_model_falls_back_to_default(
         self, tmp_path, monkeypatch

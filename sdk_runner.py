@@ -138,21 +138,66 @@ def _default_cancel_check() -> bool:
 # ---------------------------------------------------------------------------
 
 _bridges: Dict[str, Any] = {}
+# Live python Agent handles, keyed (workspace, agent_id). Reusing the SAME
+# handle for follow-up sends is the SDK's canonical multi-turn flow —
+# ``Agent.resume`` is for process restarts. It also matters for stability:
+# resuming an agent that is still registered on the SAME live bridge makes
+# the bridge re-register the id and async-dispose the previous handle
+# (bridge registry source), and that disposal path can crash the bridge
+# process mid-run (known upstream issue — see the bridge's
+# process-error-survivors module; observed live 2026-07-03 as the follow-up
+# send's stream dying with "peer closed connection" then "connection
+# refused"). Guarded by _bridges_lock.
+_agents: Dict[Tuple[str, str], Any] = {}
 _bridges_lock = threading.Lock()
+
+# The bridge's documented opt-in band-aid for the disposal crash above:
+# log uncaughtException/unhandledRejection and keep serving instead of
+# dying. A possibly-degraded bridge beats a dead one here — runs live in
+# the bridge process, and our streams re-attach transparently.
+_BRIDGE_SURVIVE_ENV = "CURSOR_SDK_BRIDGE_SURVIVE_UNCAUGHT"
+
+
+def _bridge_alive(client: Any) -> bool:
+    """Best-effort liveness probe for a cached bridge client."""
+    try:
+        ping = getattr(client, "ping", None)
+        if callable(ping):
+            ping()
+        return True
+    except Exception:
+        return False
 
 
 def get_bridge(workspace: str) -> Any:
-    """The (cached) bridge client for ``workspace``.
+    """The (cached, health-checked) bridge client for ``workspace``.
 
     Launches ``CursorClient.launch_bridge(workspace=...)`` on first use and
-    reuses the client for every later session on the same repo. Tests
-    monkeypatch this function with a fake client factory.
+    reuses the client for every later session on the same repo. A cached
+    bridge that stopped answering (crashed sidecar) is closed and
+    relaunched — its cached agent handles are dropped with it, so the next
+    run resumes from the bridge's on-disk state instead of sending into a
+    dead process forever. Tests monkeypatch this function with a fake
+    client factory.
     """
     key = str(workspace)
     with _bridges_lock:
         client = _bridges.get(key)
-        if client is not None:
+    if client is not None:
+        if _bridge_alive(client):
             return client
+        logger.warning(
+            "cursor-sdk bridge for %s stopped answering — relaunching", key
+        )
+        with _bridges_lock:
+            if _bridges.get(key) is client:
+                del _bridges[key]
+                _drop_agents_for_workspace_locked(key)
+        _close_client(client)
+
+    # The bridge process inherits our env (cursor_sdk builds the subprocess
+    # env from os.environ), so the opt-in must be set process-wide.
+    os.environ.setdefault(_BRIDGE_SURVIVE_ENV, "1")
     from cursor_sdk import CursorClient
 
     client = CursorClient.launch_bridge(workspace=key)
@@ -164,6 +209,26 @@ def get_bridge(workspace: str) -> Any:
             return existing
         _bridges[key] = client
     return client
+
+
+def _drop_agents_for_workspace_locked(workspace: str) -> None:
+    """Drop cached agent handles for ``workspace``. Caller holds _bridges_lock."""
+    for cache_key in [k for k in _agents if k[0] == workspace]:
+        del _agents[cache_key]
+
+
+def get_cached_agent(workspace: str, agent_id: str) -> Optional[Any]:
+    """The live Agent handle for (workspace, agent_id), if this process has one."""
+    with _bridges_lock:
+        return _agents.get((str(workspace), str(agent_id)))
+
+
+def cache_agent(workspace: str, agent_id: str, agent: Any) -> None:
+    """Remember a live Agent handle for follow-up sends (see _agents)."""
+    if not agent_id:
+        return
+    with _bridges_lock:
+        _agents[(str(workspace), str(agent_id))] = agent
 
 
 def _close_client(client: Any) -> None:
@@ -180,6 +245,7 @@ def shutdown_bridges() -> None:
     with _bridges_lock:
         clients = list(_bridges.values())
         _bridges.clear()
+        _agents.clear()
     for client in clients:
         _close_client(client)
 
@@ -346,24 +412,45 @@ class _SdkWorker:
 
     # -- agent establishment -------------------------------------------------
 
-    def _establish_agent(self, client: Any) -> Tuple[Any, bool]:
-        """Resume the persisted agent or create a fresh one.
+    def _establish_agent(self, client: Any) -> Tuple[Any, bool, bool]:
+        """The agent for this send: cached handle, resume, or fresh create.
 
-        When a resume id was provided, try ``client.agents.resume`` first.
-        If the resume fails (expired/unknown agent), fall back to a fresh
-        create so the task still runs, just without prior context — the
-        ``sdk.session`` event's ``resumed`` field reports what happened.
+        Returns ``(agent, resumed, from_cache)``.
 
-        The resume MUST re-supply ``model``: a resumed agent handle carries
-        no model (``agent.model is None on resume unless you pass model
-        again`` — SDK docs, verified in the bridge source), and a local
-        agent whose handle has no model rejects every ``send`` with the
-        non-retryable "Local SDK agents require an explicit ``model``"
-        error. This is what broke all follow-up sends (e2e
-        test_followup_send_carries_context): first send worked because
-        create passes the model; the second send resumed without one.
+        Multi-turn priority order (each step is a live-bridge lesson):
+
+        1. **Reuse the live Agent handle** from a previous run in this
+           process (the SDK's canonical follow-up flow: just call
+           ``agent.send`` again). Critically, this AVOIDS re-resuming an
+           agent that is still registered on the same live bridge — that
+           re-registration async-disposes the previous handle inside the
+           bridge, and the local-agent disposal path can crash the bridge
+           process mid-run (known upstream issue, documented in the
+           bridge's process-error-survivors module; observed live
+           2026-07-03: follow-up run's stream died with "peer closed
+           connection", then every re-attach got "connection refused").
+           Only reused when the requested model matches (or none was
+           requested) — an explicit model switch goes through resume.
+        2. **``client.agents.resume``** (process restart / no live handle).
+           The resume MUST re-supply ``model``: a resumed handle carries no
+           model ("agent.model is None on resume unless you pass model
+           again" — SDK docs, verified in the bridge source), and a local
+           agent whose handle has no model rejects every send with the
+           non-retryable "Local SDK agents require an explicit model"
+           error. That broke ALL follow-up sends before the handle cache
+           existed (e2e test_followup_send_carries_context).
+        3. **Fresh create** when the resume fails (expired/unknown agent)
+           so the task still runs, just without prior context — the
+           ``sdk.session`` event's ``resumed`` field reports what happened.
         """
         if self._resume_agent_id:
+            cached = get_cached_agent(str(self._workdir), self._resume_agent_id)
+            if cached is not None:
+                cached_model = str(
+                    getattr(getattr(cached, "model", None), "id", "") or ""
+                )
+                if not self._model or self._model == cached_model:
+                    return cached, True, True
             try:
                 agent = _call_with_retries(
                     "agents.resume",
@@ -372,7 +459,7 @@ class _SdkWorker:
                         {"model": self._model or DEFAULT_MODEL},
                     ),
                 )
-                return agent, True
+                return agent, True, False
             except Exception as exc:
                 logger.warning(
                     "cursor-sdk resume of agent %s failed (%s: %s) — "
@@ -388,7 +475,7 @@ class _SdkWorker:
                 local={"cwd": str(self._workdir)},
             ),
         )
-        return agent, False
+        return agent, False, False
 
     # -- cancellation --------------------------------------------------------
 
@@ -491,7 +578,7 @@ class _SdkWorker:
                 return
 
             try:
-                agent, resumed = self._establish_agent(client)
+                agent, resumed, from_cache = self._establish_agent(client)
             except Exception as exc:
                 self._put(
                     "sdk.fatal",
@@ -506,6 +593,8 @@ class _SdkWorker:
                 return
 
             agent_id = str(getattr(agent, "agent_id", "") or "")
+            if not from_cache:
+                cache_agent(str(self._workdir), agent_id, agent)
             model_sel = getattr(agent, "model", None)
             model_id = str(
                 getattr(model_sel, "id", None) or self._model or DEFAULT_MODEL
