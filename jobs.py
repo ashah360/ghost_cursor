@@ -65,6 +65,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import eventlog as _eventlog
 from . import handles as _handles
+from . import render as _render
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ def trim_result(result: Dict[str, Any]) -> Dict[str, Any]:
 class CursorJob:
     """One dispatched cursor run (always a background worker thread)."""
 
-    job_id: str  # internal dispatch id; the PUBLIC handle is cursor_session_id
+    job_id: str  # internal dispatch id; the PUBLIC handle is session_name
     task: str
     repo: str
     # Watchdog knobs (see acp_runner): abort after this much SILENCE (no ACP
@@ -128,6 +129,10 @@ class CursorJob:
     # total run time (0 = disabled).
     inactivity_timeout_s: float
     max_wall_s: float = 0.0
+    # v0.4 handle: the human slug minted by cursor_create_session (e.g.
+    # "playful-space-bunny"). The cursor ACP UUID (cursor_session_id below)
+    # stays a resolvable alias. Empty only for direct registry use in tests.
+    session_name: str = ""
     session_key: str = ""
     requested_session_id: Optional[str] = None
     requested_model: Optional[str] = None
@@ -232,9 +237,15 @@ class CursorJob:
                 nl = cut.find("\n")
                 self.progress_buffer = cut[nl + 1:] if nl >= 0 else cut
             self.progress_events += 1
-            # Spill key: the established handle, else the requested resume
-            # handle (a continuation of session S belongs in S's log).
-            spill_sid = self.cursor_session_id or self.requested_session_id or ""
+            # Spill key: the session NAME (stable across runs and ACP
+            # session ids, so one named session = one log). Fallbacks keep
+            # name-less jobs (direct registry use) spilling by cursor sid.
+            spill_sid = (
+                self.session_name
+                or self.cursor_session_id
+                or self.requested_session_id
+                or ""
+            )
             if spill_sid:
                 to_spill = self._pending_spill + [envelope]
                 self._pending_spill = []
@@ -264,6 +275,7 @@ class CursorJob:
                     entry["diff"] = _clip(entry["diff"], _PAYLOAD_DIFF_CHARS)
                 files.append(entry)
             snap: Dict[str, Any] = {
+                "session": self.session_name,
                 "session_id": self.cursor_session_id,
                 "status": self.status,
                 "repo": self.repo,
@@ -310,6 +322,7 @@ class CursorJobRegistry:
         repo: str,
         inactivity_timeout_s: float,
         max_wall_s: float = 0.0,
+        session_name: str = "",
         session_key: str = "",
         requested_session_id: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -328,6 +341,7 @@ class CursorJobRegistry:
             repo=repo,
             inactivity_timeout_s=inactivity_timeout_s,
             max_wall_s=max_wall_s,
+            session_name=session_name or "",
             session_key=session_key or "",
             requested_session_id=requested_session_id,
             requested_model=requested_model,
@@ -403,9 +417,19 @@ class CursorJobRegistry:
             deliver = job.deliver
         logger.info("Cursor job %s finished: %s (deliver=%s)", job.job_id, status, deliver)
         # Settle the persistent handle table so the handle stays resolvable
-        # (and correctly non-running) across process restarts.
-        if job.cursor_session_id:
-            _handles.record(job.cursor_session_id, status=status)
+        # (and correctly non-running) across process restarts. Keyed by the
+        # session NAME (v0.4 handle); name-less jobs fall back to the sid.
+        handle_key = job.session_name or job.cursor_session_id
+        if handle_key:
+            _handles.record(
+                handle_key,
+                status=status,
+                cursor_session_id=job.cursor_session_id or None,
+                files_changed_count=result.get("files_changed_count"),
+                duration_s=round(
+                    (job.finished_at or time.time()) - job.created_at, 1
+                ),
+            )
         # Enqueue BEFORE signalling done: anyone who observes the job as
         # finished (waiters, tests, drains) must also find the completion
         # event already on the queue — no observe-then-miss window.
@@ -439,9 +463,11 @@ class CursorJobRegistry:
         payload_result = trim_result(result)
         evt = {
             "type": "async_delegation",
-            "delegation_id": job.cursor_session_id or job.job_id,
+            "delegation_id": (
+                job.session_name or job.cursor_session_id or job.job_id
+            ),
             "session_key": job.session_key,
-            "goal": f"cursor_start: {_clip(job.task, 200)}",
+            "goal": f"cursor: {_clip(job.task, 200)}",
             "context": None,
             "toolsets": None,
             "role": "cursor",
@@ -471,41 +497,40 @@ class CursorJobRegistry:
 
     @staticmethod
     def _completion_summary(job: CursorJob, result: Dict[str, Any]) -> str:
-        """Human-readable completion block, distinct per terminal state."""
-        lines = [
-            f"Cursor run finished — status: {job.status}.",
-            f"Repo: {job.repo}",
-        ]
-        files = result.get("files_changed") or []
-        if files:
-            lines.append(f"Files changed ({len(files)}):")
-            for f in files[:20]:
-                if isinstance(f, dict):
-                    lines.append(
-                        f"  {f.get('status', 'M')} {f.get('path', '?')} "
-                        f"(+{f.get('added', 0)}/-{f.get('removed', 0)})"
-                    )
-            if len(files) > 20:
-                lines.append(f"  … and {len(files) - 20} more")
-        sid = result.get("session_id") or job.cursor_session_id
-        if sid:
-            lines.append(
-                f"Cursor session_id: {sid} — pass it to cursor_send for "
-                "follow-up work in this cursor session, or to "
-                "cursor_start(session_id=...) for a new task with this "
-                "session's context."
-            )
-        if result.get("error"):
-            lines.append(f"Error: {result['error']}")
-        lines.append("Final result:")
-        lines.append(json.dumps(trim_result(result), ensure_ascii=False, default=str))
-        return "\n".join(lines)
+        """The delivered completion message — the v0.4 plain-text format
+        (labeled headers, prose, raw fenced diffs; never a JSON blob)."""
+        name = job.session_name or job.cursor_session_id or job.job_id
+        text = _render.completion_text(
+            name=name,
+            status=job.status,
+            elapsed_s=(job.finished_at or time.time()) - job.created_at,
+            repo=job.repo,
+            summary=str(result.get("summary") or ""),
+            files=result.get("files_changed") or [],
+            error=str(result.get("error") or ""),
+        )
+        return (
+            f"{text}\n\nfollow up in this session: "
+            f"cursor_send_message('{name}', ...)"
+        )
 
     # -- queries ---------------------------------------------------------------
 
     def get(self, job_id: str) -> Optional[CursorJob]:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def get_by_name(self, session_name: str) -> Optional[CursorJob]:
+        """The newest job dispatched under a session name (v0.4 handle)."""
+        name = str(session_name or "").strip()
+        if not name:
+            return None
+        with self._lock:
+            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+        for job in jobs:
+            if job.session_name == name:
+                return job
+        return None
 
     def get_by_session(self, session_id: str) -> Optional[CursorJob]:
         """The newest job for a cursor session handle (explicit lookup only).

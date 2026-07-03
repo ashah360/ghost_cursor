@@ -155,8 +155,41 @@ def record(session_id: Optional[str], **fields: Any) -> None:
         logger.debug("ghost_cursor handle record failed", exc_info=True)
 
 
+def _resolve_locked(identifier: str) -> Optional[str]:
+    """Canonical handle name for ``identifier`` (name or UUID alias)."""
+    if identifier in _table:
+        return identifier
+    for name, entry in _table.items():
+        if (
+            isinstance(entry, dict)
+            and str(entry.get("cursor_session_id") or "") == identifier
+        ):
+            return name
+    return None
+
+
+def resolve(identifier: Optional[str]) -> Optional[str]:
+    """The canonical session NAME for a name-or-UUID identifier, or None.
+
+    v0.4 keys the table by human slug (``playful-space-bunny``); the cursor
+    ACP UUID is recorded on the entry as ``cursor_session_id`` and stays a
+    working alias — this is the lookup that makes UUIDs resolve everywhere
+    a name is accepted. Never raises.
+    """
+    try:
+        ident = str(identifier or "").strip()
+        if not ident:
+            return None
+        with _lock:
+            _load_locked()
+            return _resolve_locked(ident)
+    except Exception:
+        logger.debug("ghost_cursor handle resolve failed", exc_info=True)
+        return None
+
+
 def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """The persisted entry for ``session_id``, or None. Never raises.
+    """The persisted entry for a name or UUID alias, or None. Never raises.
 
     Deliberately UNSCOPED: an explicit handle is explicit intent, so direct
     lookups resolve across Hermes sessions (see module docstring).
@@ -166,7 +199,8 @@ def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
             return None
         with _lock:
             _load_locked()
-            entry = _table.get(str(session_id))
+            name = _resolve_locked(str(session_id).strip())
+            entry = _table.get(name) if name else None
         return dict(entry) if isinstance(entry, dict) else None
     except Exception:
         logger.debug("ghost_cursor handle lookup failed", exc_info=True)
@@ -205,5 +239,36 @@ def known_handles(
                 reverse=True,
             )
         return [k for k, _ in items[: max(int(limit), 0)]]
+    except Exception:
+        return []
+
+
+def entries(
+    scope: str = "session",
+    session_key: str = "",
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    """Scoped handle entries, most recently updated first (for cursor_list).
+
+    Each item is a copy of the persisted entry with the handle name added
+    under ``"session"``. Never raises.
+    """
+    try:
+        scope = scope if scope in VALID_SCOPES else "session"
+        with _lock:
+            _load_locked()
+            items = sorted(
+                (
+                    kv for kv in _table.items()
+                    if isinstance(kv[1], dict)
+                    and _in_scope(kv[1], scope, str(session_key or ""))
+                ),
+                key=lambda kv: float(kv[1].get("updated_at") or 0.0),
+                reverse=True,
+            )
+            return [
+                {"session": name, **entry}
+                for name, entry in items[: max(int(limit), 0)]
+            ]
     except Exception:
         return []

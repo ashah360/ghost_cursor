@@ -1,10 +1,13 @@
 name: ghost_cursor
-version: 0.3.0
-description: "Delegate coding tasks to the Cursor agent (cursor-agent CLI over ACP — JSON-RPC on stdio) via explicit session handles. Four tools mirroring the terminal/process split: `cursor_start` dispatches a run and returns its cursor session_id handle immediately (optional model override, optional session_id to continue a prior session via session/load); `cursor_send` steers or follows up (honest interrupt-and-re-prompt semantics — cursor has no queue); `cursor_status` is a strictly read-only progress view (never cancels); `cursor_stop` cancels gracefully (native session/cancel, SIGKILL only on hang) and returns partial results. Completions are delivered into the session on every terminal state via the shared completion queue, keyed by the handle. Same-repo concurrency guarded; different repos run in parallel. Tools gate on the cursor-agent binary being installed. BREAKING vs 0.2: cursor_edit and the repo+timestamp auto-resume registry are removed — resume is explicit via the handle."
+version: 0.4.0
+description: "Delegate coding tasks to the Cursor agent (cursor-agent CLI over ACP — JSON-RPC on stdio) via explicit NAMED sessions. `cursor_create_session` mints a memorable adjective-adjective-noun handle (e.g. playful-space-bunny; cursor session UUIDs resolve as aliases) and dispatches nothing — the ACP process spawns lazily on the first `cursor_send_message`, which carries ALL work: first message = the task, later messages = follow-ups (honest interrupt-and-re-prompt when a run is live). `cursor_status` is a strictly read-only progress view; `cursor_stop` cancels gracefully (native session/cancel, SIGKILL only on hang); `cursor_events` pages the per-session JSONL event log (tail by default, negative offsets, kind filter, 2KB inline clip + 20KB response cap); `cursor_list` shows session handles as TSV, scoped to the current Hermes session by default. ALL tool returns are plain text (labeled headers, prose, raw fenced diffs — never JSON blobs). Completions are delivered into the session on every terminal state via the shared completion queue. Same-repo concurrency guarded; different repos run in parallel; inactivity-based timeouts with an optional max-wall ceiling. Tools gate on the cursor-agent binary being installed. BREAKING vs 0.3: cursor_send is renamed cursor_send_message and keys on the session name; cursor_start remains only as a deprecated create+send shim."
 author: Arman
 kind: backend
 provides_tools:
-  - cursor_start
-  - cursor_send
+  - cursor_create_session
+  - cursor_send_message
   - cursor_status
   - cursor_stop
+  - cursor_events
+  - cursor_list
+  - cursor_start

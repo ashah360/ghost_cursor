@@ -52,6 +52,9 @@ _PAGE_CLIP_FIELDS = ("output", "diff", "before", "after", "delta", "text")
 DEFAULT_PAGE_LIMIT = 50
 MAX_PAGE_LIMIT = 500
 
+# cursor_events defaults: a bare call returns the last 10 events (tail).
+DEFAULT_EVENTS_LIMIT = 10
+
 _lock = threading.Lock()
 # Writer state keyed by str(path) (not session_id) so a relocated
 # HERMES_HOME — e.g. per-test temp homes — never reuses stale counters.
@@ -284,6 +287,102 @@ def read_page(
         return page
     except Exception:
         logger.debug("ghost_cursor event log read failed", exc_info=True)
+        return None
+
+
+def display_kind(record: Dict[str, Any]) -> str:
+    """The user-facing kind of one event record.
+
+    Reasoning rides as ``kind=lifecycle, event=reasoning`` in the envelope;
+    callers filter and read it as plain ``reasoning``.
+    """
+    kind = str(record.get("kind") or "?")
+    if kind == "lifecycle" and str(record.get("event") or "") == "reasoning":
+        return "reasoning"
+    return kind
+
+
+def read_events(
+    session_id: Optional[str],
+    offset: Any = -1,
+    limit: Any = DEFAULT_EVENTS_LIMIT,
+    kind: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """The cursor_events window over a session's persisted log.
+
+    Semantics (v0.4):
+
+    * ``kind`` filters first (on :func:`display_kind`, so ``reasoning``
+      works); the window then applies to the FILTERED sequence.
+    * ``offset >= 0`` pages forward: matching events with ``seq >= offset``,
+      up to ``limit`` of them.
+    * ``offset < 0`` indexes from the end, python-style: the window is the
+      up-to-``limit`` matching events ENDING at that position (``offset=-1``
+      = the last event). So the defaults ``offset=-1, limit=10`` are the
+      last 10 events, and ``offset=-11, limit=10`` is the page before that.
+    * ``limit`` clamps to ``MAX_PAGE_LIMIT`` (500).
+
+    Returns ``{"events", "offset", "limit", "kind", "total_events",
+    "total_matching", "log_path"}`` plus ``"gaps"`` when compaction dropped
+    events. Events carry their full (unclipped) fields — presentation clips
+    are the renderer's job. Returns None when the session has no log.
+    Never raises.
+    """
+    try:
+        path = log_path(session_id)
+        if path is None or not path.is_file():
+            return None
+        try:
+            off = int(offset)
+        except (TypeError, ValueError):
+            off = -1
+        try:
+            lim = min(max(int(limit), 1), MAX_PAGE_LIMIT)
+        except (TypeError, ValueError):
+            lim = DEFAULT_EVENTS_LIMIT
+
+        kind_filter = str(kind).strip() if kind else ""
+        matching: List[Dict[str, Any]] = []
+        gaps: List[Dict[str, Any]] = []
+        total = 0
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    record = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                seq = record.get("seq")
+                if isinstance(seq, int):
+                    total = max(total, seq + 1)
+                    if not kind_filter or display_kind(record) == kind_filter:
+                        matching.append(record)
+                elif record.get("kind") == "log_compaction":
+                    gaps.append(record)
+
+        if off >= 0:
+            forward = [r for r in matching if r["seq"] >= off]
+            window = forward[:lim]
+        else:
+            end = len(matching) + off + 1  # python-negative index, inclusive
+            end = max(min(end, len(matching)), 0)
+            window = matching[max(0, end - lim):end]
+
+        page: Dict[str, Any] = {
+            "events": window,
+            "offset": off,
+            "limit": lim,
+            "kind": kind_filter or None,
+            "total_events": total,
+            "total_matching": len(matching),
+            "log_path": str(path),
+        }
+        if gaps:
+            page["gaps"] = gaps
+        return page
+    except Exception:
+        logger.debug("ghost_cursor event log read_events failed", exc_info=True)
         return None
 
 
