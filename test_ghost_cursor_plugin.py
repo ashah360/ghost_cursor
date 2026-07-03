@@ -15,8 +15,9 @@ Four tools: ``cursor_start`` / ``cursor_send`` / ``cursor_status`` /
 * ``handles.py`` — the persistent handle table (explicit lookup only; the
   v0.2 auto-resume heuristic is gone by design).
 * ``acp_runner.run_acp`` — real subprocess round-trips against a fake ACP
-  server (happy path, native session/cancel, hang→timeout kill, dead binary,
-  session/load resume + fallback).
+  server (happy path, native session/cancel, silent-hang→inactivity kill,
+  slow-but-active run surviving past the old wall limit, max-wall ceiling
+  for runaway streams, dead binary, session/load resume + fallback).
 * The legacy ``--print`` runner + ``normalize_harness`` mapping (kept as
   fallback/reference — must stay importable and correct).
 
@@ -1317,7 +1318,7 @@ class TestAllTerminalStatesDeliver:
 # ---------------------------------------------------------------------------
 
 _FAKE_ACP = '''#!/usr/bin/env python3
-import json, sys
+import json, sys, time
 MODE = "__MODE__"
 
 def send(o):
@@ -1362,7 +1363,23 @@ for line in sys.stdin:
         prompt_id = msg["id"]
         update({"sessionUpdate": "agent_message_chunk",
                 "content": {"type": "text", "text": "working"}})
-        if MODE in ("happy", "load", "loadfail"):
+        if MODE == "slow":
+            # Slow but ACTIVE: keep streaming updates with gaps well under
+            # the inactivity threshold, for a total well past it.
+            for i in range(5):
+                time.sleep(0.5)
+                update({"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "step %d" % i}})
+            send({"jsonrpc": "2.0", "id": prompt_id,
+                  "result": {"stopReason": "end_turn"}})
+        elif MODE == "chatty":
+            # Runaway: streams updates forever, never finishes, never
+            # reads stdin again (so session/cancel goes unanswered).
+            while True:
+                time.sleep(0.2)
+                update({"sessionUpdate": "agent_message_chunk",
+                        "content": {"type": "text", "text": "still going"}})
+        elif MODE in ("happy", "load", "loadfail"):
             update({"sessionUpdate": "tool_call", "toolCallId": "t1",
                     "title": "Edit File", "kind": "edit", "status": "pending",
                     "rawInput": {}})
@@ -1391,7 +1408,8 @@ def _install_fake_acp(tmp_path, monkeypatch, mode):
 class TestAcpRunner:
     def test_happy_path_yields_session_updates_result(self, tmp_path, monkeypatch):
         _install_fake_acp(tmp_path, monkeypatch, "happy")
-        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=30.0,
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
                                      cancel_check=lambda: False))
         keys = [k for k, _ in events]
         assert keys[0] == "acp.session"
@@ -1408,7 +1426,8 @@ class TestAcpRunner:
         cancelled = {"flag": False}
         events = []
         t0 = time.monotonic()
-        for key, obj in gc_acp.run_acp("do it", str(tmp_path), timeout=30.0,
+        for key, obj in gc_acp.run_acp("do it", str(tmp_path),
+                                       inactivity_timeout_s=30.0,
                                        cancel_check=lambda: cancelled["flag"]):
             events.append((key, obj))
             if key == "acp.update":
@@ -1417,21 +1436,69 @@ class TestAcpRunner:
         assert events[-1] == ("acp.result", {"stopReason": "cancelled"})
         assert elapsed < 15, f"native cancel did not resolve promptly ({elapsed:.1f}s)"
 
-    def test_hang_times_out_and_kills(self, tmp_path, monkeypatch):
+    def test_silent_hang_is_killed_at_the_inactivity_limit(self, tmp_path, monkeypatch):
+        """A run with ZERO activity is hung: the inactivity watchdog kills
+        it and the error names the limit that fired."""
         _install_fake_acp(tmp_path, monkeypatch, "hang")
         monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
         t0 = time.monotonic()
-        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=1.0,
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.0,
                                      cancel_check=lambda: False))
         elapsed = time.monotonic() - t0
         assert events[-1][0] == "acp.error"
         assert events[-1][1]["timeout"] is True
+        assert "no activity for 1s" in events[-1][1]["error"]
         assert elapsed < 20, f"timeout kill did not tear down ({elapsed:.1f}s)"
+
+    def test_slow_but_active_run_is_not_killed(self, tmp_path, monkeypatch):
+        """Inactivity semantics: events keep arriving past the old wall
+        limit (total >> inactivity_timeout_s), so the run must complete —
+        activity resets the watchdog clock."""
+        _install_fake_acp(tmp_path, monkeypatch, "slow")
+        t0 = time.monotonic()
+        # Gaps between updates are 0.5s; total streaming is ~2.5s. Under the
+        # old wall-clock semantics a 1.5s timeout would have killed it.
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.5,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert elapsed > 1.5, "run finished before the old wall limit — inconclusive"
+        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
+        assert not any(k == "acp.error" for k, _ in events)
+
+    def test_max_wall_ceiling_kills_a_runaway_stream(self, tmp_path, monkeypatch):
+        """A run that streams forever never trips the inactivity watchdog —
+        the max_wall_s hard ceiling is the safety net, and the error says so."""
+        _install_fake_acp(tmp_path, monkeypatch, "chatty")
+        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
+        t0 = time.monotonic()
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
+                                     max_wall_s=1.5,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert events[-1][0] == "acp.error"
+        assert events[-1][1]["timeout"] is True
+        assert "exceeded max wall time (1s)" in events[-1][1]["error"]
+        assert elapsed < 20, f"wall-ceiling kill did not tear down ({elapsed:.1f}s)"
+
+    def test_legacy_timeout_kwarg_is_an_inactivity_alias(self, tmp_path, monkeypatch):
+        """Backward compat: the old ``timeout=`` kwarg still works, now with
+        inactivity semantics."""
+        _install_fake_acp(tmp_path, monkeypatch, "hang")
+        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
+        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=1.0,
+                                     cancel_check=lambda: False))
+        assert events[-1][0] == "acp.error"
+        assert events[-1][1]["timeout"] is True
+        assert "no activity for 1s" in events[-1][1]["error"]
 
     def test_dead_binary_raises_actionable_acp_error(self, tmp_path, monkeypatch):
         _install_fake_acp(tmp_path, monkeypatch, "die")
         with pytest.raises(gc_acp.AcpError) as exc_info:
-            list(gc_acp.run_acp("do it", str(tmp_path), timeout=10.0,
+            list(gc_acp.run_acp("do it", str(tmp_path),
+                                inactivity_timeout_s=10.0,
                                 cancel_check=lambda: False))
         assert "handshake" in str(exc_info.value)
 
@@ -1448,7 +1515,8 @@ class TestAcpRunner:
         fake server's session/new id) and resumed=True, with the replayed
         history flowing through as ordinary acp.update events."""
         _install_fake_acp(tmp_path, monkeypatch, "load")
-        events = list(gc_acp.run_acp("continue it", str(tmp_path), timeout=30.0,
+        events = list(gc_acp.run_acp("continue it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
                                      cancel_check=lambda: False,
                                      session_id="s-prior"))
         # Replayed history arrives BEFORE session/load resolves, so the
@@ -1466,7 +1534,8 @@ class TestAcpRunner:
         """Expired/unknown session id must not hard-fail: fall back to a
         fresh session/new and report resumed=False."""
         _install_fake_acp(tmp_path, monkeypatch, "loadfail")
-        events = list(gc_acp.run_acp("continue it", str(tmp_path), timeout=30.0,
+        events = list(gc_acp.run_acp("continue it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
                                      cancel_check=lambda: False,
                                      session_id="s-expired"))
         assert events[0][0] == "acp.session"
@@ -1477,7 +1546,8 @@ class TestAcpRunner:
     def test_no_session_id_creates_fresh_session(self, tmp_path, monkeypatch):
         """Omitting session_id keeps the one-shot behavior byte-identical."""
         _install_fake_acp(tmp_path, monkeypatch, "happy")
-        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=30.0,
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=30.0,
                                      cancel_check=lambda: False))
         assert events[0][1]["sessionId"] == "s-test"
         assert events[0][1]["resumed"] is False
@@ -1496,7 +1566,7 @@ class TestEstablishSession:
 
         client = gc_acp._AcpClient(
             task="t", workdir=Path("/w"), out_q=queue.Queue(),
-            cancel_requested=threading.Event(), timeout=60.0,
+            cancel_requested=threading.Event(),
             session_id=session_id,
         )
         calls = []
