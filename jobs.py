@@ -123,7 +123,11 @@ class CursorJob:
     job_id: str  # internal dispatch id; the PUBLIC handle is cursor_session_id
     task: str
     repo: str
-    timeout: float
+    # Watchdog knobs (see acp_runner): abort after this much SILENCE (no ACP
+    # events) — activity resets the clock — plus an optional hard ceiling on
+    # total run time (0 = disabled).
+    inactivity_timeout_s: float
+    max_wall_s: float = 0.0
     session_key: str = ""
     requested_session_id: Optional[str] = None
     requested_model: Optional[str] = None
@@ -134,6 +138,11 @@ class CursorJob:
     cursor_session_id: str = ""       # THE handle, set at acp.session
     resumed: bool = False
     model: str = ""                   # actual model reported by acp.session
+    # Wall-clock time of the last ACP event received for this run (None
+    # until the first event). Advisory only — feeds the last_activity_s
+    # field of status snapshots so callers can flag silent runs; the
+    # actual inactivity watchdog lives in acp_runner.
+    last_event_at: Optional[float] = None
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     assistant_parts: List[str] = field(default_factory=list)
@@ -260,6 +269,13 @@ class CursorJob:
                 "repo": self.repo,
                 "task": _clip(self.task, 400),
                 "elapsed_s": round((self.finished_at or now) - self.created_at, 1),
+                # Seconds since the last ACP event (advisory: lets callers
+                # flag a silent run without touching it). Frozen at
+                # finished_at for terminal runs; falls back to created_at
+                # before the first event arrives.
+                "last_activity_s": round(
+                    (self.finished_at or now) - (self.last_event_at or self.created_at), 1
+                ),
                 "cursor_session_id": self.cursor_session_id,
                 "resumed": self.resumed,
                 "model": self.model or (self.requested_model or ""),
@@ -292,7 +308,8 @@ class CursorJobRegistry:
         runner: Callable[[CursorJob], Dict[str, Any]],
         task: str,
         repo: str,
-        timeout: float,
+        inactivity_timeout_s: float,
+        max_wall_s: float = 0.0,
         session_key: str = "",
         requested_session_id: Optional[str] = None,
         requested_model: Optional[str] = None,
@@ -309,7 +326,8 @@ class CursorJobRegistry:
             job_id=f"cursor_{uuid.uuid4().hex[:8]}",
             task=task,
             repo=repo,
-            timeout=timeout,
+            inactivity_timeout_s=inactivity_timeout_s,
+            max_wall_s=max_wall_s,
             session_key=session_key or "",
             requested_session_id=requested_session_id,
             requested_model=requested_model,

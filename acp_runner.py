@@ -23,11 +23,20 @@ Yielded event tuples (consumed by ``events.AcpNormalizer``):
   :class:`AcpError` instead so the tool returns a clean, actionable error.
 
 Cancellation is native: the consumer-side loop polls ``cancel_check`` (by
-default the Hermes per-thread interrupt flag) and the overall deadline; on
-either trigger it sends the ``session/cancel`` notification, waits up to
+default the Hermes per-thread interrupt flag) and the run watchdogs; on any
+trigger it sends the ``session/cancel`` notification, waits up to
 ``CANCEL_GRACE_S`` for the prompt to resolve (observed: it resolves
 immediately with ``stopReason: "cancelled"``), then SIGKILLs the process
 group as a last resort.
+
+Run watchdogs are INACTIVITY-based, not wall-clock: a run that keeps
+streaming ACP events is alive and is never aborted for total elapsed time.
+The watchdog fires only after ``inactivity_timeout_s`` seconds of SILENCE
+(no ACP messages received at all — every ``session/update`` notification,
+agent request, and response resets the clock). A separate, optional
+``max_wall_s`` hard ceiling (disabled by default) is the safety net for
+true runaways that stream forever without finishing; the abort error names
+whichever limit fired.
 
 Client-side ACP methods cursor may call back are answered minimally:
 ``fs/read_text_file`` / ``fs/write_text_file`` are served from disk and
@@ -59,7 +68,6 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 from .events import unified_diff_text
 from .runner import (
     CURSOR_AGENT_BIN,
-    DEFAULT_TIMEOUT_S,
     TERM_GRACE_S,
     HarnessError,
     cursor_agent_available,  # noqa: F401  (re-exported for the tool gate)
@@ -68,6 +76,13 @@ from .runner import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Watchdog defaults. The inactivity threshold aborts a run only after this
+# much SILENCE (no ACP events received); streamed progress resets the clock,
+# so a long run that keeps working is never killed by it. The wall ceiling
+# caps TOTAL run time as a runaway safety net — 0 disables it.
+DEFAULT_INACTIVITY_TIMEOUT_S = 600.0
+DEFAULT_MAX_WALL_S = 0.0
 
 PROTOCOL_VERSION = 1
 INIT_TIMEOUT_S = 30.0
@@ -116,7 +131,6 @@ class _AcpClient:
         workdir: Path,
         out_q: "queue.Queue[Tuple[str, Dict[str, Any]]]",
         cancel_requested: threading.Event,
-        timeout: float,
         session_id: Optional[str] = None,
         model: Optional[str] = None,
     ) -> None:
@@ -124,7 +138,6 @@ class _AcpClient:
         self._workdir = workdir
         self._out_q = out_q
         self._cancel_requested = cancel_requested
-        self._timeout = timeout
         # Prior cursor session to continue via session/load (None = fresh).
         self._resume_session_id = session_id
         # Model override. INSTRUMENTED (2026-07-02, cursor-agent
@@ -139,6 +152,17 @@ class _AcpClient:
         # "cancel" | "timeout" — written by the consumer thread before it sets
         # cancel_requested (single write, read after the event fires).
         self.abort_reason: Optional[str] = None
+        # Human-readable detail naming WHICH watchdog fired ("no activity
+        # for Ns" vs "exceeded max wall time"). Same write discipline as
+        # abort_reason.
+        self.abort_detail: Optional[str] = None
+        # Monotonic timestamp of the last ACP message received from
+        # cursor-agent (any parsed JSON-RPC line: session/update
+        # notifications, agent requests, responses). Written by the reader
+        # task on the client loop thread, read by the consumer thread's
+        # inactivity watchdog — a plain float is fine, attribute writes are
+        # atomic under the GIL.
+        self.last_activity_monotonic: float = time.monotonic()
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._next_id = 0
@@ -151,6 +175,12 @@ class _AcpClient:
 
     def _put(self, key: str, obj: Dict[str, Any]) -> None:
         self._out_q.put((key, obj))
+
+    def _timeout_error(self) -> Dict[str, Any]:
+        """The acp.error payload for a watchdog abort — names which limit
+        fired (written into abort_detail by the consumer thread)."""
+        detail = self.abort_detail or "watchdog abort"
+        return {"error": f"ACP run timed out: {detail}", "timeout": True}
 
     async def _send(self, obj: Dict[str, Any]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
@@ -268,6 +298,10 @@ class _AcpClient:
             return  # non-JSON noise on stdout — skip
         if not isinstance(obj, dict):
             return
+        # Every ACP message received counts as activity for the inactivity
+        # watchdog — session/update notifications (reasoning deltas, tool
+        # calls, content), agent→client requests, and responses alike.
+        self.last_activity_monotonic = time.monotonic()
         try:
             await self._dispatch(obj)
         except Exception:
@@ -480,7 +514,8 @@ class _AcpClient:
 
                 try:
                     # No per-request timeout: the consumer loop owns the
-                    # overall deadline and triggers cancel/kill on expiry.
+                    # inactivity/max-wall watchdogs and triggers cancel/kill
+                    # when one fires.
                     result = await self._request(
                         "session/prompt",
                         {
@@ -491,25 +526,13 @@ class _AcpClient:
                     )
                     self._prompt_settled = True
                     if self.abort_reason == "timeout":
-                        self._put(
-                            "acp.error",
-                            {
-                                "error": f"ACP run timed out after {int(self._timeout)}s",
-                                "timeout": True,
-                            },
-                        )
+                        self._put("acp.error", self._timeout_error())
                     else:
                         self._put("acp.result", {"stopReason": result.get("stopReason")})
                 except Exception as exc:
                     self._prompt_settled = True
                     if self.abort_reason == "timeout":
-                        self._put(
-                            "acp.error",
-                            {
-                                "error": f"ACP run timed out after {int(self._timeout)}s",
-                                "timeout": True,
-                            },
-                        )
+                        self._put("acp.error", self._timeout_error())
                     elif self.abort_reason == "cancel":
                         # Connection died before the cancelled prompt resolved.
                         self._put("acp.result", {"stopReason": "cancelled"})
@@ -538,17 +561,35 @@ class _AcpClient:
 def run_acp(
     task: str,
     repo: str,
-    timeout: float = DEFAULT_TIMEOUT_S,
+    inactivity_timeout_s: Optional[float] = None,
+    max_wall_s: Optional[float] = None,
     cancel_check: Optional[Callable[[], bool]] = None,
     session_id: Optional[str] = None,
     model: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Run cursor-agent on ``task`` inside ``repo`` over ACP, yielding events.
 
     Yields ``("acp.session"|"acp.update"|"acp.result"|"acp.error", obj)``
     tuples (see module docstring). Polls ``cancel_check`` (default: the
-    Hermes per-thread interrupt flag) and the overall ``timeout`` between
-    events; both trigger a native ``session/cancel``.
+    Hermes per-thread interrupt flag) and the run watchdogs between events;
+    every trigger fires a native ``session/cancel``.
+
+    Watchdog semantics (inactivity-based, NOT wall-clock):
+
+    * ``inactivity_timeout_s`` — abort only after this many seconds with NO
+      ACP messages received. Streamed activity resets the clock, so a slow
+      but active run is never killed for total elapsed time. Default
+      ``DEFAULT_INACTIVITY_TIMEOUT_S`` (600s of silence); 0 disables.
+    * ``max_wall_s`` — optional hard ceiling on TOTAL run time, a safety
+      net for runaways that stream forever. Default ``DEFAULT_MAX_WALL_S``
+      (0 = disabled).
+    * ``timeout`` — DEPRECATED alias for ``inactivity_timeout_s`` (the old
+      wall-clock parameter, repurposed); used only when
+      ``inactivity_timeout_s`` is not given.
+
+    The abort error names whichever limit fired ("no activity for Ns" vs
+    "exceeded max wall time").
 
     ``session_id`` continues a prior cursor session via ``session/load``
     (multi-turn). If the load fails (expired/unknown id), the run falls back
@@ -570,6 +611,13 @@ def run_acp(
     if cancel_check is None:
         cancel_check = _default_cancel_check
 
+    inactivity_s = float(
+        inactivity_timeout_s
+        if inactivity_timeout_s is not None
+        else (timeout if timeout is not None else DEFAULT_INACTIVITY_TIMEOUT_S)
+    )
+    wall_s = float(max_wall_s if max_wall_s is not None else DEFAULT_MAX_WALL_S)
+
     out_q: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
     cancel_requested = threading.Event()
     client = _AcpClient(
@@ -577,7 +625,6 @@ def run_acp(
         workdir=workdir,
         out_q=out_q,
         cancel_requested=cancel_requested,
-        timeout=float(timeout),
         session_id=(str(session_id).strip() or None) if session_id else None,
         model=model,
     )
@@ -588,13 +635,24 @@ def run_acp(
     )
     thread.start()
 
-    deadline = time.monotonic() + float(timeout)
+    started = time.monotonic()
     fatal: Optional[str] = None
     try:
         while True:
             if not cancel_requested.is_set():
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if (
+                    inactivity_s > 0
+                    and now - client.last_activity_monotonic >= inactivity_s
+                ):
                     client.abort_reason = "timeout"
+                    client.abort_detail = f"no activity for {int(inactivity_s)}s"
+                    cancel_requested.set()
+                elif wall_s > 0 and now - started >= wall_s:
+                    client.abort_reason = "timeout"
+                    client.abort_detail = (
+                        f"exceeded max wall time ({int(wall_s)}s)"
+                    )
                     cancel_requested.set()
                 elif cancel_check():
                     client.abort_reason = "cancel"
