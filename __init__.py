@@ -5,14 +5,14 @@ v0.4: explicit named sessions + plain-text tool output. Six tools in the
 
 * ``cursor_create_session(repo?, model?)`` — mint a named session handle
   (adjective-adjective-noun slug, e.g. ``playful-space-bunny``). LAZY: it
-  dispatches nothing; the ACP process spawns on the first message.
+  dispatches nothing; the cursor agent spawns on the first message.
 * ``cursor_send_message(session, message)`` — ALL work goes through here.
   The first message on a fresh session is the task; later messages are
   follow-ups (or interrupt + re-prompt when the run is live — the ack says
   which). Cursor works in the background; the terminal result is delivered
   automatically on every outcome.
 * ``cursor_status(session)`` — strictly read-only snapshot (never cancels).
-* ``cursor_stop(session)`` — graceful native ``session/cancel``.
+* ``cursor_stop(session)`` — graceful native ``run.cancel()``.
 * ``cursor_events(session, offset=-1, limit=10, kind?)`` — dedicated pager
   over the per-session JSONL event log. Defaults = the last 10 events;
   negative offsets index from the end python-style; ``offset>=0`` pages
@@ -28,13 +28,14 @@ Handle model (v0.4)
 -------------------
 THE handle is the session name minted by ``cursor_create_session``
 (collision-checked against the persistent handle table, ``names.py``). The
-cursor ACP session UUID is recorded on the handle entry as an alias
-(``handles.resolve``), so UUIDs from older runs / completion payloads still
-resolve everywhere a name is accepted. The handle table (``handles.py``)
-persists name → repo/status/model/cursor_session_id across restarts; the
-in-process job table (``jobs.py``) keys live state by name; the JSONL event
-log (``eventlog.py``) is also keyed by name, so one named session = one log
-across resumes.
+cursor-sdk AGENT ID (``agent-<uuid>``) is recorded on the handle entry as an
+alias (``handles.resolve``), so ids from older runs / completion payloads
+still resolve everywhere a name is accepted. The handle table
+(``handles.py``) persists name → repo/status/model/cursor_session_id (the
+agent id) across restarts — ``Agent.resume(agent_id)`` continues the
+conversation even across a plugin/gateway restart; the in-process job table
+(``jobs.py``) keys live state by name; the JSONL event log (``eventlog.py``)
+is also keyed by name, so one named session = one log across resumes.
 
 Output contract (v0.4)
 ----------------------
@@ -56,19 +57,25 @@ result and the duplicate delivery is suppressed (``CursorJob.mark_handled``).
 
 Timeouts are INACTIVITY-based (``inactivity_timeout_s``: silence kills,
 activity resets the clock) with an optional ``max_wall_s`` hard ceiling —
-see ``acp_runner``. Model override precedence: explicit param >
-``plugins.ghost_cursor.model`` in config.yaml > cursor-agent's default,
-threaded as ``--model`` on the ``cursor-agent acp`` invocation.
+see ``sdk_runner``. Model override precedence: explicit param >
+``plugins.ghost_cursor.model`` in config.yaml > the plugin default,
+threaded as ``model=`` on ``Agent.create``.
+
+Transport (v0.5): the official ``cursor-sdk`` python package. One bridge
+sidecar per workspace (reused across sessions on the same repo, closed at
+process exit), agents resumed by persisted agent_id, event streams
+re-attached transparently via ``run.observe(after_offset=...)`` when a
+connection drops mid-run. Auth: the ``CURSOR_API_KEY`` env var.
 """
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
-from . import acp_runner as _acp
 from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
@@ -76,6 +83,7 @@ from . import jobs as _jobs
 from . import names as _names
 from . import render as _render
 from . import runner as _runner
+from . import sdk_runner as _sdk
 
 logger = logging.getLogger(__name__)
 
@@ -96,19 +104,19 @@ REPO_ENV_VAR = "THRESHOLD_WORKSPACE_REPO"
 # envelopes carry more (see events.MAX_DIFF_CHARS).
 _RESULT_DIFF_CHARS = 20_000
 
-# How long dispatching tools block waiting for the ACP session to be
-# established. Bounded by the acp_runner handshake timeouts (initialize 30s
-# + session/load 60s) plus slack; a healthy run yields it in seconds.
+# How long dispatching tools block waiting for the cursor agent to be
+# established. Bounded by the sdk_runner bridge-launch + create/resume
+# retry budget plus slack; a healthy run yields it in seconds.
 _HANDLE_WAIT_S = 150.0
 
 # How long cursor_send_message/cursor_stop wait for a cancelled run to
-# settle. Native session/cancel resolves ~immediately; the ceiling covers
-# the acp_runner CANCEL_GRACE_S (15s) + TERM_GRACE_S (10s) escalation.
+# settle. Native run.cancel() resolves ~immediately; the ceiling covers
+# the sdk_runner CANCEL_GRACE_S escalation.
 _INTERRUPT_WAIT_S = 40.0
 
 _SESSION_DOC = (
     "The session handle: the name returned by cursor_create_session (e.g. "
-    "'playful-space-bunny'). A cursor session UUID from an older run also "
+    "'playful-space-bunny'). A cursor agent id from an older run also "
     "resolves as an alias."
 )
 
@@ -120,10 +128,10 @@ _TIMEOUT_PROPERTIES = {
         "type": "number",
         "description": (
             "Optional. Abort the run only after this many seconds of "
-            "SILENCE (no ACP events from cursor). Any streamed activity — "
-            "reasoning, tool calls, content — resets the clock, so a long "
-            "run that keeps making progress is never killed by this limit. "
-            "0 disables the inactivity watchdog. Default: "
+            "SILENCE (no stream events from cursor). Any streamed activity "
+            "— reasoning, tool calls, content — resets the clock, so a "
+            "long run that keeps making progress is never killed by this "
+            "limit. 0 disables the inactivity watchdog. Default: "
             "plugins.ghost_cursor.inactivity_timeout_s in config.yaml, "
             "else 600."
         ),
@@ -163,7 +171,7 @@ CURSOR_CREATE_SCHEMA = {
             "model": {
                 "type": "string",
                 "description": (
-                    "Optional cursor-agent model override for this session "
+                    "Optional cursor model override for this session "
                     "(e.g. 'composer-2.5', 'gpt-5.3-codex'). Omit to use "
                     "the configured/default model."
                 ),
@@ -331,9 +339,14 @@ def _default_repo() -> Optional[str]:
 
 
 def check_cursor_available() -> bool:
-    """Tool gate: cursor-agent binary present + a workspace repo resolvable."""
+    """Tool gate: cursor-sdk importable + a workspace repo resolvable.
+
+    Deliberately does NOT gate on CURSOR_API_KEY: a missing key surfaces as
+    an actionable error on the first send instead of silently hiding the
+    toolset.
+    """
     try:
-        return _runner.cursor_agent_available() and _default_repo() is not None
+        return _sdk.sdk_available() and _default_repo() is not None
     except Exception:
         return False
 
@@ -395,7 +408,7 @@ def _resolve_inactivity_timeout(explicit: Optional[float]) -> float:
     return (
         configured
         if configured is not None
-        else _acp.DEFAULT_INACTIVITY_TIMEOUT_S
+        else _sdk.DEFAULT_INACTIVITY_TIMEOUT_S
     )
 
 
@@ -406,7 +419,7 @@ def _resolve_max_wall(explicit: Optional[float]) -> float:
     if explicit is not None:
         return float(explicit)
     configured = _configured_timeout("max_wall_s")
-    return configured if configured is not None else _acp.DEFAULT_MAX_WALL_S
+    return configured if configured is not None else _sdk.DEFAULT_MAX_WALL_S
 
 
 # ---------------------------------------------------------------------------
@@ -438,12 +451,12 @@ def _live_job(name: str, entry: Optional[Dict[str, Any]]) -> Optional["_jobs.Cur
 
 
 def _resume_sid(name: str, entry: Dict[str, Any]) -> Optional[str]:
-    """The cursor ACP session id to resume, or None for a fresh session.
+    """The cursor agent id to resume, or None for a fresh agent.
 
     A session that has run before carries its ``cursor_session_id`` alias.
     A pre-v0.4 entry keyed by the raw cursor UUID (no alias field, but a
     recorded run status) resumes by its own key. A freshly created (lazy,
-    never-run) session starts a new ACP session.
+    never-run) session starts a fresh agent.
     """
     sid = str(entry.get("cursor_session_id") or "").strip()
     if sid:
@@ -516,42 +529,42 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
 
 
 def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
-    """Run cursor-agent for ``job`` and build the final result dict.
+    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
 
     Runs on the job worker thread. Cancellation is the job's cancel event
-    (set by cursor_stop / cursor_send_message), which triggers cursor's
-    native ``session/cancel``. The cursor session id is persisted onto the
-    session's handle entry (as the UUID alias) the instant ACP establishes
-    it.
+    (set by cursor_stop / cursor_send_message), which triggers the native
+    ``run.cancel()``. The cursor agent id is persisted onto the session's
+    handle entry (as the alias) the instant the agent exists, so
+    ``Agent.resume`` keeps working across process restarts.
     """
     started = time.monotonic()
     workdir = job.repo
 
     # Pre-run git snapshot: fuels the fallback that populates files_changed
-    # when cursor edits through paths that emit no ACP diff content (e.g.
-    # shell commands).
-    git_before = _acp.git_status_snapshot(workdir)
+    # when cursor edits through paths that emit no parseable diff content
+    # in the stream (e.g. shell commands; tool payloads are unstable).
+    git_before = _sdk.git_status_snapshot(workdir)
 
-    normalizer = _events.AcpNormalizer()
+    normalizer = _events.SdkNormalizer()
     try:
-        for key, obj in _acp.run_acp(
+        for key, obj in _sdk.run_sdk(
             job.task,
             workdir,
             inactivity_timeout_s=float(job.inactivity_timeout_s),
             max_wall_s=float(job.max_wall_s),
             cancel_check=job.cancel_event.is_set,
-            session_id=job.requested_session_id,
+            agent_id=job.requested_session_id,
             model=job.requested_model,
         ):
             job.last_event_at = time.time()
-            if key == "acp.session":
-                sid = str(obj.get("sessionId") or "")
+            if key == "sdk.session":
+                sid = str(obj.get("agentId") or "")
                 with job._lock:
                     job.cursor_session_id = sid
                     job.resumed = bool(obj.get("resumed"))
                     job.model = str(obj.get("model") or "")
-                # Persist the handle the moment the ACP session exists —
-                # keyed by the session NAME, with the UUID as an alias.
+                # Persist the handle the moment the agent exists — keyed by
+                # the session NAME, with the agent id as an alias.
                 _handles.record(
                     job.session_name or sid,
                     repo=workdir,
@@ -564,8 +577,9 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
                 job.session_event.set()
             for envelope in normalizer.normalize(key, obj):
                 _fold_envelope(job, envelope)
-    except _acp.AcpError as exc:
-        # Hard ACP failure (handshake) — actionable error, no silent regress.
+    except _sdk.SdkRunnerError as exc:
+        # Hard SDK failure (bridge/create/auth) — actionable error, no
+        # silent regress.
         return {"success": False, "error": str(exc)}
     except _runner.HarnessError as exc:
         return {"success": False, "error": str(exc)}
@@ -574,12 +588,12 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         with job._lock:
             job.run_error = f"{type(exc).__name__}: {exc}"
 
-    # Git fallback: edits the ACP stream carried no diff for (shell-driven
+    # Git fallback: edits the stream carried no diff for (shell-driven
     # writes, kill-before-diff) still land in files_changed + progress.
     try:
         with job._lock:
             known_paths = set(job.files)
-        for fb in _acp.git_fallback_diffs(workdir, git_before):
+        for fb in _sdk.git_fallback_diffs(workdir, git_before):
             if fb["path"] not in known_paths:
                 _fold_envelope(job, _events.file_diff(**fb))
     except Exception:
@@ -636,8 +650,8 @@ def _dispatch_run(
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
-    Returns the internal result dict: the running shape once the ACP
-    session is established, the final result if the run terminated before
+    Returns the internal result dict: the running shape once the cursor
+    agent is established, the final result if the run terminated before
     a session existed (handshake failure) or terminated very fast, or the
     same-repo rejection.
     """
@@ -687,7 +701,7 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
         return {**_jobs.trim_result(job.result), "status": job.status}
 
     if not job.session_event.is_set():
-        # No session and not terminal — cursor-agent is wedged pre-handshake.
+        # No agent and not terminal — the bridge is wedged pre-create.
         # Cancel it (the worker's kill path takes over) and report.
         job.request_cancel()
         return {
@@ -695,7 +709,7 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
             "status": "failed",
             "session": job.session_name,
             "error": (
-                f"cursor-agent did not establish an ACP session within "
+                f"cursor did not establish an agent within "
                 f"{int(_HANDLE_WAIT_S)}s — cancelled the attempt"
             ),
             "repo": job.repo,
@@ -724,7 +738,7 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
 
 
 def _settle_job(job: "_jobs.CursorJob", wait_s: float = _INTERRUPT_WAIT_S) -> bool:
-    """Cancel ``job`` (native session/cancel) and wait for it to settle.
+    """Cancel ``job`` (native run.cancel()) and wait for it to settle.
 
     Delivery is suppressed first (mark_handled) because the caller reports
     the outcome in its own tool result. Returns True when the job reached a
@@ -860,8 +874,8 @@ def cursor_create_session(
     model: Optional[str] = None,
     **_kwargs: Any,
 ) -> str:
-    """Mint a named session handle. LAZY — no cursor process is spawned;
-    the ACP session starts on the first cursor_send_message."""
+    """Mint a named session handle. LAZY — no cursor agent is created;
+    the agent starts on the first cursor_send_message."""
     target_repo = (repo or "").strip() or _default_repo()
     if not target_repo:
         return (
@@ -949,7 +963,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
     """Read-only snapshot for a cursor session (see CURSOR_STATUS_SCHEMA).
 
     STRICTLY READ-ONLY: only copies job state under its lock. It never
-    sends ``session/cancel``, never touches the cancel event, never joins
+    sends ``run.cancel()``, never touches the cancel event, never joins
     or signals the worker — polling a running run cannot affect it.
     """
     ident = str(session or "").strip()
@@ -1016,10 +1030,9 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
 def cursor_stop(session: str, **_kwargs: Any) -> str:
     """Stop a session's run gracefully; report final status + partial work.
 
-    Graceful path: cursor's native ``session/cancel`` (the prompt resolves
-    with stopReason "cancelled" ~immediately); the acp_runner escalates to
-    a process-group SIGKILL only if cursor hangs past its grace window.
-    Idempotent on finished runs.
+    Graceful path: the SDK's native ``run.cancel()`` (the run resolves
+    with status "cancelled" ~immediately); the bridge owns the run, so
+    there is no process to kill on our side. Idempotent on finished runs.
     """
     ident = str(session or "").strip()
     if not ident:
@@ -1153,7 +1166,13 @@ def _handle_cursor_list(args: Dict[str, Any], **kwargs: Any) -> str:
 
 
 def register(ctx) -> None:
-    """Register the 6 cursor tools. Called once by the plugin loader."""
+    """Register the 6 cursor tools. Called once by the plugin loader.
+
+    Also arranges clean bridge shutdown: the plugin loader has no unload
+    hook, so the per-workspace cursor-sdk bridge sidecars are closed at
+    process exit.
+    """
+    atexit.register(_sdk.shutdown_bridges)
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),

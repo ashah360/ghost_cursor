@@ -1,7 +1,7 @@
 """Human-friendly session names — adjective-adjective-noun slugs.
 
 ``cursor_create_session`` mints one (e.g. ``playful-space-bunny``) as THE
-handle callers pass to every other tool. The cursor ACP session UUID stays
+handle callers pass to every other tool. The cursor agent id stays
 recorded on the handle entry as an alias (``handles.resolve``), so a UUID
 still resolves anywhere a name is accepted.
 

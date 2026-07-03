@@ -1,33 +1,35 @@
-"""Tests for the ghost_cursor plugin (v0.4 named-session surface).
+"""Tests for the ghost_cursor plugin (v0.5: cursor-sdk transport).
 
 Six tools: ``cursor_create_session`` / ``cursor_send_message`` /
 ``cursor_status`` / ``cursor_stop`` / ``cursor_events`` / ``cursor_list`` —
-all keyed on adjective-adjective-noun session names (cursor UUIDs resolve
-as aliases). Every tool returns plain text (labeled headers, prose, raw
-fenced diffs, TSV) — never JSON. Covered here:
+all keyed on adjective-adjective-noun session names (cursor agent ids
+resolve as aliases). Every tool returns plain text (labeled headers, prose,
+raw fenced diffs, TSV) — never JSON. Covered here:
 
-* ``events.AcpNormalizer`` — session/update → canonical envelope mapping
-  against a CAPTURED fixture (``fixtures/acp_session_updates.jsonl``, real
-  ``cursor-agent acp`` notifications, 2026-07-02).
+* ``sdk_runner.run_sdk`` — the cursor-sdk transport against a fully faked
+  bridge/client (happy path, native run.cancel, inactivity watchdog with
+  pending-tool-call suspension, max-wall ceiling, Agent.resume + fresh
+  fallback, bounded is_retryable retries, observe(after_offset) stream
+  re-attach, bridge caching/shutdown, missing-key/missing-sdk preflight).
+* ``events.SdkNormalizer`` — SDKMessage dicts → canonical envelope mapping,
+  including defensive parsing of the (explicitly unstable) tool_call
+  payload shapes, plus a full-run fixture replay
+  (``fixtures/sdk_stream.jsonl``).
 * The tool handlers — session lifecycle (create → lazy first send → status
   → stop/follow-up), the read-only guarantee of ``cursor_status``, the
-  same-repo concurrency guard, name minting + collision retry + UUID alias
-  resolution, ``cursor_events`` paging (tail defaults, negative offsets,
-  kind filter, 2KB inline clip, 20KB response cap), ``cursor_list`` TSV +
-  scoping, model threading, completion delivery on the shared
+  same-repo concurrency guard, name minting + collision retry + agent-id
+  alias resolution, ``cursor_events`` paging (tail defaults, negative
+  offsets, kind filter, 2KB inline clip, 20KB response cap), ``cursor_list``
+  TSV + scoping, model threading, completion delivery on the shared
   async-delegation rail, and actionable prose errors for bogus/expired
-  handles. The ACP layer is replayed with fast deterministic fakes (no live
-  cursor-agent).
+  handles. The SDK layer is replayed with fast deterministic fakes (no
+  live bridge, no network).
 * ``handles.py`` — the persistent handle table (explicit lookup only; the
   v0.2 auto-resume heuristic is gone by design).
-* ``acp_runner.run_acp`` — real subprocess round-trips against a fake ACP
-  server (happy path, native session/cancel, silent-hang→inactivity kill,
-  slow-but-active run surviving past the old wall limit, max-wall ceiling
-  for runaway streams, dead binary, session/load resume + fallback).
 * The legacy ``--print`` runner + ``normalize_harness`` mapping (kept as
   fallback/reference — must stay importable and correct).
 
-No live cursor-agent runs.
+No live cursor runs.
 """
 
 from __future__ import annotations
@@ -72,7 +74,6 @@ from plugins.ghost_cursor import (
     cursor_stop,
     register,
 )
-from plugins.ghost_cursor import acp_runner as gc_acp
 from plugins.ghost_cursor import events as gc_events
 from plugins.ghost_cursor import sdk_runner as gc_sdk
 from plugins.ghost_cursor import handles as gc_handles
@@ -82,7 +83,7 @@ from plugins.ghost_cursor import render as gc_render
 from plugins.ghost_cursor import runner as gc_runner
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cursor_stream.jsonl"
-ACP_FIXTURE = Path(__file__).parent / "fixtures" / "acp_session_updates.jsonl"
+SDK_FIXTURE = Path(__file__).parent / "fixtures" / "sdk_stream.jsonl"
 
 
 def _prepend_path_env(stub_dir):
@@ -99,35 +100,36 @@ def _prepend_path_env(stub_dir):
 
 
 # ---------------------------------------------------------------------------
-# ACP fixture replay helpers
+# SDK fixture replay helpers
 # ---------------------------------------------------------------------------
 
-def _acp_fixture_updates():
-    """The raw session/update payloads (params.update) from the capture."""
+def _sdk_fixture_messages():
+    """The SDKMessage dicts from the fixture stream."""
     return [
-        json.loads(line)["params"]["update"]
-        for line in ACP_FIXTURE.read_text().splitlines()
+        json.loads(line)
+        for line in SDK_FIXTURE.read_text().splitlines()
         if line.strip()
     ]
 
 
-def _acp_replay_events():
-    """A full run's worth of acp_runner events built from the capture."""
+def _sdk_replay_events():
+    """A full run's worth of sdk_runner events built from the fixture."""
     events = [(
-        "acp.session",
-        {"sessionId": "s-fixture", "cwd": "/tmp/acp_probe/repo", "model": "fake-model"},
+        "sdk.session",
+        {"agentId": "agent-fixture", "cwd": "/tmp/sdk_probe/repo",
+         "model": "fake-model", "resumed": False},
     )]
-    events.extend(("acp.update", upd) for upd in _acp_fixture_updates())
-    events.append(("acp.result", {"stopReason": "end_turn"}))
+    events.extend(("sdk.message", msg) for msg in _sdk_fixture_messages())
+    events.append(("sdk.result", {"status": "finished"}))
     return events
 
 
-def _replay_acp(*_args, **_kwargs):
-    yield from _acp_replay_events()
+def _replay_sdk(*_args, **_kwargs):
+    yield from _sdk_replay_events()
 
 
 def _normalize_all(events):
-    normalizer = gc_events.AcpNormalizer()
+    normalizer = gc_events.SdkNormalizer()
     envs = []
     for key, obj in events:
         envs.extend(normalizer.normalize(key, obj))
@@ -135,213 +137,7 @@ def _normalize_all(events):
 
 
 # ---------------------------------------------------------------------------
-# events.AcpNormalizer — captured session/update payloads → envelopes
-# ---------------------------------------------------------------------------
-
-class TestAcpNormalizer:
-    def _all_envelopes(self):
-        return _normalize_all(_acp_replay_events())
-
-    def test_every_envelope_carries_ghost_source(self):
-        envs = self._all_envelopes()
-        assert envs, "fixture produced no envelopes"
-        assert all(e.get("source") == "ghost" for e in envs)
-
-    def test_noise_updates_produce_no_envelopes(self):
-        normalizer = gc_events.AcpNormalizer()
-        for upd in _acp_fixture_updates():
-            if upd["sessionUpdate"] in ("available_commands_update", "session_info_update"):
-                assert normalizer.normalize("acp.update", upd) == []
-
-    def test_agent_thought_chunk_maps_to_reasoning(self):
-        reasoning = [
-            e for e in self._all_envelopes()
-            if e["kind"] == "lifecycle" and e.get("event") == "reasoning"
-        ]
-        assert reasoning
-        joined = "".join(e["text"] for e in reasoning)
-        assert "notes.txt" in joined  # real captured thought text
-
-    def test_agent_message_chunk_maps_to_content(self):
-        content = [e for e in self._all_envelopes() if e["kind"] == "content"]
-        assert any("subtract" in e["delta"] for e in content)
-
-    def test_tool_call_maps_to_tool_use_running(self):
-        uses = [e for e in self._all_envelopes() if e["kind"] == "tool_use"]
-        # capture: read + edit (run 1), execute + edit (run 2)
-        assert len(uses) == 4
-        assert all(u["status"] == "running" for u in uses)
-        edits = [u for u in uses if u["tool"] == "file-edit"]
-        shells = [u for u in uses if u["tool"] == "shell"]
-        assert len(edits) == 2 and len(shells) == 2
-        assert any(u.get("command") == "ls -la" for u in shells)
-
-    def test_tool_call_update_completed_maps_to_tool_result(self):
-        results = [e for e in self._all_envelopes() if e["kind"] == "tool_result"]
-        assert len(results) == 4
-        assert all(r["status"] == "done" for r in results)
-        # execute output surfaced from rawOutput.stdout
-        assert any("calc.py" in str(r.get("output", "")) for r in results)
-
-    def test_edit_diff_content_yields_file_diff_modified(self):
-        diffs = [e for e in self._all_envelopes() if e["kind"] == "file_diff"]
-        assert len(diffs) == 2
-        calc = next(d for d in diffs if d["path"].endswith("calc.py"))
-        assert calc["status"] == "M"
-        assert "multiply" in calc["after"]
-        assert "multiply" not in calc["before"]
-        assert calc["added"] == 8 and calc["removed"] == 0
-        assert "+def multiply(a, b):" in calc["diff"]
-
-    def test_new_file_diff_header_quirk_is_stripped(self):
-        # Captured new-file diff arrives as oldText="-- /dev/null\n" and
-        # newText prefixed with "++ b/<path>\n" — must clean to A-status.
-        diffs = [e for e in self._all_envelopes() if e["kind"] == "file_diff"]
-        notes = next(d for d in diffs if d["path"].endswith("notes.txt"))
-        assert notes["status"] == "A"
-        assert notes["before"] == ""
-        assert notes["after"] == "hello from acp"
-        assert "/dev/null" not in notes["after"]
-        assert "++ b/" not in notes["after"]
-
-    def test_in_progress_update_emits_nothing(self):
-        normalizer = gc_events.AcpNormalizer()
-        assert normalizer.normalize(
-            "acp.update",
-            {"sessionUpdate": "tool_call_update", "toolCallId": "x", "status": "in_progress"},
-        ) == []
-
-    def test_session_event_maps_to_run_started(self):
-        envs = gc_events.AcpNormalizer().normalize(
-            "acp.session", {"sessionId": "s1", "cwd": "/w", "model": "m"}
-        )
-        assert envs == [{
-            "source": "ghost", "kind": "lifecycle", "event": "run.started",
-            "model": "m", "cwd": "/w", "harness_session_id": "s1",
-        }]
-
-    def test_end_turn_maps_to_run_completed(self):
-        envs = gc_events.AcpNormalizer().normalize("acp.result", {"stopReason": "end_turn"})
-        assert envs[0]["event"] == "run.completed"
-
-    def test_cancelled_stop_reason_maps_to_run_failed(self):
-        envs = gc_events.AcpNormalizer().normalize("acp.result", {"stopReason": "cancelled"})
-        assert envs[0]["event"] == "run.failed"
-        assert envs[0]["cancelled"] is True
-        assert "cancel" in envs[0]["error"]
-
-    def test_acp_error_timeout_maps_to_run_failed(self):
-        envs = gc_events.AcpNormalizer().normalize(
-            "acp.error", {"error": "ACP run timed out after 600s", "timeout": True}
-        )
-        assert envs[0]["event"] == "run.failed"
-        assert envs[0]["timeout"] is True
-
-    def test_transport_error_before_end_turn_maps_to_run_failed(self):
-        """Live repro (2026-07-03): the model stream died mid-exploration;
-        cursor-agent streamed the RetriableError as its LAST message chunks
-        and still resolved session/prompt with end_turn. That end_turn must
-        classify as run.failed with the error line first-class."""
-        normalizer = gc_events.AcpNormalizer()
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "Now let me explore the relevant code"},
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call", "toolCallId": "t1",
-            "title": "Read file", "kind": "read", "status": "pending",
-            "rawInput": {},
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call_update", "toolCallId": "t1",
-            "status": "completed",
-        })
-        # The error arrives split across streamed deltas, like any message.
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text",
-                        "text": "RetriableError: [canceled] http/2 stream "},
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text",
-                        "text": "closed with error code CANCEL (0x8)"},
-        })
-        envs = normalizer.normalize("acp.result", {"stopReason": "end_turn"})
-        assert envs[0]["event"] == "run.failed"
-        assert envs[0]["status"] == "failed"
-        assert envs[0]["transport_error"] is True
-        assert (
-            "RetriableError: [canceled] http/2 stream closed with error "
-            "code CANCEL (0x8)" in envs[0]["error"]
-        )
-
-    def test_recovered_transport_error_still_completes(self):
-        """A transport error followed by MORE activity means cursor retried
-        and recovered — the eventual end_turn is a genuine completion."""
-        normalizer = gc_events.AcpNormalizer()
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text",
-                        "text": "RetriableError: [canceled] http/2 stream "
-                                "closed with error code CANCEL (0x8)"},
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call", "toolCallId": "t2",
-            "title": "`ls`", "kind": "execute", "status": "pending",
-            "rawInput": {"command": "ls"},
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call_update", "toolCallId": "t2",
-            "status": "completed",
-        })
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "All done, tests pass."},
-        })
-        envs = normalizer.normalize("acp.result", {"stopReason": "end_turn"})
-        assert envs[0]["event"] == "run.completed"
-        assert envs[0]["status"] == "completed"
-
-    def test_unknown_update_variant_passes_through(self):
-        envs = gc_events.AcpNormalizer().normalize(
-            "acp.update", {"sessionUpdate": "mystery_update", "x": 1}
-        )
-        assert len(envs) == 1
-        assert envs[0]["event"] == "passthrough"
-        assert envs[0]["name"] == "acp.mystery_update"
-
-    def test_failed_tool_status_maps_to_error_result(self):
-        normalizer = gc_events.AcpNormalizer()
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call", "toolCallId": "t9",
-            "title": "`boom`", "kind": "execute", "status": "pending",
-            "rawInput": {"command": "boom"},
-        })
-        envs = normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call_update", "toolCallId": "t9",
-            "status": "failed",
-        })
-        assert envs[0]["kind"] == "tool_result"
-        assert envs[0]["status"] == "error"
-
-    def test_nonzero_exit_code_marks_result_error(self):
-        normalizer = gc_events.AcpNormalizer()
-        normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call", "toolCallId": "t8",
-            "title": "`false`", "kind": "execute", "status": "pending",
-            "rawInput": {"command": "false"},
-        })
-        envs = normalizer.normalize("acp.update", {
-            "sessionUpdate": "tool_call_update", "toolCallId": "t8",
-            "status": "completed", "rawOutput": {"exitCode": 1, "stdout": "", "stderr": "nope"},
-        })
-        assert envs[0]["status"] == "error"
-        assert "nope" in envs[0]["output"]
-
-
-# ---------------------------------------------------------------------------
-# Tool-test plumbing — deterministic gated fakes for the ACP layer
+# Tool-test plumbing — deterministic gated fakes for the SDK layer
 # ---------------------------------------------------------------------------
 
 def _drain_completion_queue():
@@ -381,62 +177,60 @@ def _wait_until(cond, timeout=10.0, interval=0.01):
     return cond()
 
 
-def _gated_replay_factory(release, sid="s-run", early_edit=True, late_edit=True):
+def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=True):
     """A cancel-aware replay held open on ``release``.
 
-    Yields the ACP session (the handle), optionally one early file edit,
-    then blocks until ``release`` is set — honoring ``cancel_check`` the way
-    the real ``run_acp`` does (a cancel mid-run resolves with
-    ``stopReason: "cancelled"``). After release: an optional second edit,
-    a summary chunk, and a clean end_turn.
+    Yields the sdk.session event (the handle), optionally one early file
+    edit, then blocks until ``release`` is set — honoring ``cancel_check``
+    the way the real ``run_sdk`` does (a cancel mid-run resolves with
+    ``status: "cancelled"``). After release: an optional second edit, a
+    summary message, and a clean finished result.
     """
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-               cancel_check=None, session_id=None, model=None):
-        yield ("acp.session", {
-            "sessionId": sid, "cwd": str(workdir),
-            "model": model or "fake-model", "resumed": bool(session_id),
+               cancel_check=None, agent_id=None, model=None):
+        yield ("sdk.session", {
+            "agentId": sid, "cwd": str(workdir),
+            "model": model or "fake-model", "resumed": bool(agent_id),
         })
         if early_edit:
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call", "toolCallId": "t1",
-                "title": "Edit File", "kind": "edit", "status": "pending",
-                "rawInput": {},
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "edit_file",
+                "status": "running", "args": {"path": f"{workdir}/f1.py"},
             })
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "completed",
-                "content": [{"type": "diff", "path": f"{workdir}/f1.py",
-                             "oldText": "a\n", "newText": "a\nb\n"}],
+                "result": {"path": f"{workdir}/f1.py",
+                           "oldText": "a\n", "newText": "a\nb\n"},
             })
         while not release.is_set():
             if cancel_check and cancel_check():
-                yield ("acp.result", {"stopReason": "cancelled"})
+                yield ("sdk.result", {"status": "cancelled"})
                 return
             time.sleep(0.01)
         if late_edit:
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call", "toolCallId": "t2",
-                "title": "Edit File", "kind": "edit", "status": "pending",
-                "rawInput": {},
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t2", "name": "edit_file",
+                "status": "running", "args": {"path": f"{workdir}/f2.py"},
             })
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call_update", "toolCallId": "t2",
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t2", "name": "edit_file",
                 "status": "completed",
-                "content": [{"type": "diff", "path": f"{workdir}/f2.py",
-                             "oldText": "", "newText": "new\n"}],
+                "result": {"path": f"{workdir}/f2.py",
+                           "oldText": "", "newText": "new\n"},
             })
-        yield ("acp.update", {
-            "sessionUpdate": "agent_message_chunk",
-            "content": {"type": "text", "text": "all done"},
+        yield ("sdk.message", {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "all done"}]},
         })
-        yield ("acp.result", {"stopReason": "end_turn"})
+        yield ("sdk.result", {"status": "finished"})
 
     return replay
 
 
-class _AcpSequence:
-    """Route successive run_acp calls to successive replay factories,
+class _SdkSequence:
+    """Route successive run_sdk calls to successive replay factories,
     recording each call's kwargs for assertion."""
 
     def __init__(self, *factories):
@@ -444,17 +238,17 @@ class _AcpSequence:
         self.calls = []
 
     def __call__(self, task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                 cancel_check=None, session_id=None, model=None):
+                 cancel_check=None, agent_id=None, model=None):
         self.calls.append({
             "task": task, "workdir": str(workdir),
-            "session_id": session_id, "model": model,
+            "agent_id": agent_id, "model": model,
             "inactivity_timeout_s": inactivity_timeout_s,
             "max_wall_s": max_wall_s,
         })
         factory = self._factories.pop(0)
         return factory(task, workdir, inactivity_timeout_s=inactivity_timeout_s,
                        max_wall_s=max_wall_s, cancel_check=cancel_check,
-                       session_id=session_id, model=model)
+                       agent_id=agent_id, model=model)
 
 
 def _resolved(tmp_path):
@@ -504,7 +298,7 @@ class TestFirstSendRun:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-new"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-new"))
 
         ack = _start_run("add multiply", repo=str(tmp_path))
         try:
@@ -534,7 +328,7 @@ class TestFirstSendRun:
     ):
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:test:1")
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-done"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-done"))
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-done")
@@ -569,27 +363,27 @@ class TestFirstSendRun:
     def test_fixture_replay_run_aggregates_files_and_summary(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """The captured ACP stream flows through the job aggregation: both
+        """The fixture SDK stream flows through the job aggregation: both
         edits land in files_changed with diffs, and the summary is the
         FINAL content block of the turn (the wrap-up message), not every
         interstitial fragment fused together."""
-        monkeypatch.setattr(gc_acp, "run_acp", _replay_acp)
+        monkeypatch.setattr(gc_sdk, "run_sdk", _replay_sdk)
         _start_run("add multiply", repo=str(tmp_path))
 
-        job = _job_for("s-fixture")
+        job = _job_for("agent-fixture")
         assert job.done_event.wait(10)
         result = job.result
         assert result["success"] is True
         assert result["status"] == "completed"
-        assert result["session_id"] == "s-fixture"
+        assert result["session_id"] == "agent-fixture"
         assert result["resumed"] is False
         assert result["files_changed_count"] == 2
         by_path = {f["path"]: f for f in result["files_changed"]}
-        calc = by_path["/tmp/acp_probe/repo/calc.py"]
+        calc = by_path["/tmp/sdk_probe/repo/calc.py"]
         assert calc["added"] == 8 and calc["removed"] == 0
         assert calc["status"] == "M"
         assert "multiply" in calc["diff"]
-        assert by_path["/tmp/acp_probe/repo/notes.txt"]["status"] == "A"
+        assert by_path["/tmp/sdk_probe/repo/notes.txt"]["status"] == "A"
         # The capture's final message block is the notes.txt wrap-up.
         assert result["summary"].startswith("Both done")
         assert "not deleted or touched" in result["summary"]
@@ -602,14 +396,14 @@ class TestFirstSendRun:
         self, clean_state, monkeypatch, tmp_path
     ):
         def failing(*_a, **_k):
-            raise gc_acp.AcpError(
-                "ACP initialize handshake with cursor-agent failed (boom)"
+            raise gc_sdk.SdkRunnerError(
+                "failed to create cursor agent via cursor-sdk (boom)"
             )
 
-        monkeypatch.setattr(gc_acp, "run_acp", failing)
+        monkeypatch.setattr(gc_sdk, "run_sdk", failing)
         out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
-        assert "handshake" in out
+        assert "failed to create cursor agent" in out
         # Errors are prose sentences with a next step, not codes.
         assert "send another message" in out
         # Exactly-once: the tool result IS the report; nothing enqueued.
@@ -618,18 +412,18 @@ class TestFirstSendRun:
     def test_wedged_prehandshake_run_is_cancelled_and_reported(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """cursor-agent that never establishes a session gets cancelled and
+        """A run that never establishes an agent gets cancelled and
         the tool returns an actionable failure instead of blocking forever."""
         monkeypatch.setattr(gc, "_HANDLE_WAIT_S", 0.3)
 
         def never_session(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                          cancel_check=None, session_id=None, model=None):
+                          cancel_check=None, agent_id=None, model=None):
             while not (cancel_check and cancel_check()):
                 time.sleep(0.01)
             return
             yield  # pragma: no cover — make it a generator
 
-        monkeypatch.setattr(gc_acp, "run_acp", never_session)
+        monkeypatch.setattr(gc_sdk, "run_sdk", never_session)
         out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
         assert "did not establish" in out
@@ -651,22 +445,21 @@ def _preset_event():
 # ---------------------------------------------------------------------------
 
 def _narration_chunk(text):
-    return ("acp.update", {
-        "sessionUpdate": "agent_message_chunk",
-        "content": {"type": "text", "text": text},
+    return ("sdk.message", {
+        "type": "assistant",
+        "message": {"content": [{"type": "text", "text": text}]},
     })
 
 
 def _tool_round(call_id):
     return [
-        ("acp.update", {
-            "sessionUpdate": "tool_call", "toolCallId": call_id,
-            "title": "Read file", "kind": "read", "status": "pending",
-            "rawInput": {},
+        ("sdk.message", {
+            "type": "tool_call", "call_id": call_id, "name": "read_file",
+            "status": "running", "args": {"path": "/tmp/x"},
         }),
-        ("acp.update", {
-            "sessionUpdate": "tool_call_update", "toolCallId": call_id,
-            "status": "completed",
+        ("sdk.message", {
+            "type": "tool_call", "call_id": call_id, "name": "read_file",
+            "status": "completed", "result": {},
         }),
     ]
 
@@ -678,12 +471,12 @@ class TestCompletionSummary:
 
     def _run_replay(self, monkeypatch, tmp_path, sid, events):
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, session_id=None, model=None):
-            yield ("acp.session", {"sessionId": sid, "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
                                    "model": "m"})
             yield from events
 
-        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
         _start_run("t", repo=str(tmp_path))
         job = _job_for(sid)
         assert job.done_event.wait(10)
@@ -705,7 +498,7 @@ class TestCompletionSummary:
             # those must join raw, not with injected separators.
             _narration_chunk("Implemented the retry wrapper in servi"),
             _narration_chunk("ces/http.py and added regression tests."),
-            ("acp.result", {"stopReason": "end_turn"}),
+            ("sdk.result", {"status": "finished"}),
         ]
         job = self._run_replay(monkeypatch, tmp_path, "s-sum", events)
 
@@ -739,7 +532,7 @@ class TestCompletionSummary:
             *_tool_round("t1"),
             _narration_chunk("Exploring the services."),
             *_tool_round("t2"),  # turn ends right after tool activity
-            ("acp.result", {"stopReason": "end_turn"}),
+            ("sdk.result", {"status": "finished"}),
         ]
         job = self._run_replay(monkeypatch, tmp_path, "s-fall", events)
 
@@ -753,22 +546,22 @@ class TestCompletionSummary:
 # ---------------------------------------------------------------------------
 
 class TestSendMessageResume:
-    def test_pre_v04_handle_threads_the_resume_id_to_run_acp(
+    def test_pre_v04_handle_threads_the_resume_id_to_run_sdk(
         self, clean_state, monkeypatch, tmp_path
     ):
         """A pre-v0.4 handle (keyed by the raw cursor sid, no alias field)
-        resumes by its own key via ACP session/load."""
+        resumes by its own key via Agent.resume."""
         gc_handles.record("s-prior", repo=_resolved(tmp_path), status="completed")
         release = threading.Event()
-        seq = _AcpSequence(_gated_replay_factory(release, sid="s-prior"))
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        seq = _SdkSequence(_gated_replay_factory(release, sid="s-prior"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         ack = cursor_send_message("s-prior", "continue it")
         try:
             _assert_running_ack(ack)
             assert "sent to s-prior" in ack
-            # The resume id reached the ACP layer (session/load path).
-            assert seq.calls[0]["session_id"] == "s-prior"
+            # The resume id reached the SDK layer (Agent.resume path).
+            assert seq.calls[0]["agent_id"] == "s-prior"
         finally:
             release.set()
         assert _job_for("s-prior").done_event.wait(10)
@@ -776,19 +569,19 @@ class TestSendMessageResume:
     def test_expired_handle_falls_back_to_fresh_session(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """The ACP layer falls back to session/new for an expired id; the
+        """The SDK layer falls back to a fresh agent for an expired id; the
         session's alias is updated to the fresh sid — no crash, no hard
         failure."""
 
         def fallback_replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                            cancel_check=None, session_id=None, model=None):
-            # Simulates acp_runner's session/load → session/new fallback.
-            yield ("acp.session", {"sessionId": "s-fresh", "cwd": str(workdir),
+                            cancel_check=None, agent_id=None, model=None):
+            # Simulates sdk_runner's resume → fresh-agent fallback.
+            yield ("sdk.session", {"agentId": "s-fresh", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
-            yield ("acp.result", {"stopReason": "end_turn"})
+            yield ("sdk.result", {"status": "finished"})
 
         gc_handles.record("s-expired", repo=_resolved(tmp_path), status="completed")
-        monkeypatch.setattr(gc_acp, "run_acp", fallback_replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", fallback_replay)
         cursor_send_message("s-expired", "t")
         job = _job_for("s-fresh")
         assert job.done_event.wait(10)
@@ -805,8 +598,8 @@ class TestSendMessageResume:
 
 class TestModelParam:
     def _run_and_capture(self, monkeypatch, tmp_path, sid, **start_kwargs):
-        seq = _AcpSequence(_gated_replay_factory(_preset_event(), sid=sid))
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        seq = _SdkSequence(_gated_replay_factory(_preset_event(), sid=sid))
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
         _start_run("t", repo=str(tmp_path), **start_kwargs)
         _job_for(sid).done_event.wait(10)
         return seq.calls[0]
@@ -838,12 +631,12 @@ class TestModelParam:
     ):
         release = threading.Event()
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-m5"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-m5"))
         ack = _start_run("t", repo=str(tmp_path), model="composer-x")
         try:
             _assert_running_ack(ack)
             job = _job_for("s-m5")
-            assert job.model == "composer-x"  # reported by acp.session
+            assert job.model == "composer-x"  # reported by sdk.session
             assert gc_handles.get("s-m5")["model"] == "composer-x"
         finally:
             release.set()
@@ -860,11 +653,11 @@ class TestCursorSendMessage:
     ):
         release1 = threading.Event()  # never set: run 1 ends only via cancel
         release2 = threading.Event()
-        seq = _AcpSequence(
+        seq = _SdkSequence(
             _gated_replay_factory(release1, sid="s-send"),
             _gated_replay_factory(release2, sid="s-send", early_edit=False),
         )
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
         first_job = _job_for("s-send")
@@ -886,7 +679,7 @@ class TestCursorSendMessage:
             # ...its delivery suppressed (the send ack reported it) ...
             assert _drain_completion_queue() == []
             # ...and the re-prompt continued the SAME session with the message.
-            assert seq.calls[1]["session_id"] == "s-send"
+            assert seq.calls[1]["agent_id"] == "s-send"
             assert seq.calls[1]["task"] == "also add subtract"
         finally:
             release2.set()
@@ -905,11 +698,11 @@ class TestCursorSendMessage:
         self, clean_state, monkeypatch, tmp_path
     ):
         release2 = threading.Event()
-        seq = _AcpSequence(
+        seq = _SdkSequence(
             _gated_replay_factory(_preset_event(), sid="s-f"),
             _gated_replay_factory(release2, sid="s-f", early_edit=False),
         )
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         _start_run("task A", repo=str(tmp_path))
         first_job = _job_for("s-f")
@@ -921,7 +714,7 @@ class TestCursorSendMessage:
             _assert_running_ack(ack)
             # No interruption happened — the run had already settled.
             assert "interrupted mid-run" not in ack
-            assert seq.calls[1]["session_id"] == "s-f"
+            assert seq.calls[1]["agent_id"] == "s-f"
             assert seq.calls[1]["task"] == "refine it"
         finally:
             release2.set()
@@ -930,10 +723,10 @@ class TestCursorSendMessage:
     def test_first_message_on_a_fresh_session_is_the_task(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """cursor_create_session dispatches NOTHING; the first send spawns
-        the ACP session with the message as the task."""
-        seq = _AcpSequence(_gated_replay_factory(_preset_event(), sid="s-lazy"))
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        """cursor_create_session dispatches NOTHING; the first send creates
+        the cursor agent with the message as the task."""
+        seq = _SdkSequence(_gated_replay_factory(_preset_event(), sid="s-lazy"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         ack = cursor_create_session(repo=str(tmp_path))
         name = ack.splitlines()[0].split("session: ")[1]
@@ -943,7 +736,7 @@ class TestCursorSendMessage:
 
         cursor_send_message(name, "build the thing")
         assert seq.calls[0]["task"] == "build the thing"
-        assert seq.calls[0]["session_id"] is None  # fresh, not a resume
+        assert seq.calls[0]["agent_id"] is None  # fresh, not a resume
         job = gc_jobs.registry.get_by_name(name)
         assert job is not None
         assert job.done_event.wait(10)
@@ -957,16 +750,16 @@ class TestCursorSendMessage:
         gc_handles.record("s-old", repo=_resolved(tmp_path), status="cancelled",
                           model="recorded-model")
         release = threading.Event()
-        seq = _AcpSequence(_gated_replay_factory(release, sid="s-old",
+        seq = _SdkSequence(_gated_replay_factory(release, sid="s-old",
                                                  early_edit=False))
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         ack = cursor_send_message("s-old", "pick it back up")
         try:
             _assert_running_ack(ack)
             assert "sent to s-old" in ack
-            assert seq.calls[0]["session_id"] == "s-old"
+            assert seq.calls[0]["agent_id"] == "s-old"
             # The recorded model is reused for the continuation.
             assert seq.calls[0]["model"] == "recorded-model"
         finally:
@@ -1016,7 +809,7 @@ class TestCursorStatusReadOnly:
         """THE critical property: asking "how's it going?" must not kill the
         run — no cancel, no mutation, and the run still completes normally."""
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-ro"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-ro"))
 
         _assert_running_ack(_start_run("long task", repo=str(tmp_path)))
         job = _job_for("s-ro")
@@ -1053,7 +846,7 @@ class TestCursorStatusReadOnly:
     def test_finished_job_status_shows_summary_peek_without_diffs(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(_preset_event(),
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(),
                                                                      sid="s-fin"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-fin")
@@ -1069,11 +862,11 @@ class TestCursorStatusReadOnly:
     def test_status_reports_last_activity_seconds(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """The header carries last activity — seconds since the last ACP
+        """The header carries last activity — seconds since the last stream
         event — so a caller can spot a silent run without touching it.
         Fresh while events stream; frozen at finished_at once terminal."""
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp",
+        monkeypatch.setattr(gc_sdk, "run_sdk",
                             _gated_replay_factory(release, sid="s-act"))
 
         _start_run("t", repo=str(tmp_path))
@@ -1101,7 +894,7 @@ class TestCursorStatusReadOnly:
         self, clean_state, tmp_path
     ):
         """A just-dispatched continuation is addressable by the requested
-        handle in the window before acp.session fires."""
+        handle in the window before sdk.session fires."""
         release = threading.Event()
 
         def runner(job):
@@ -1159,7 +952,7 @@ class TestCursorStop:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()  # never set: only the cancel ends the run
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-stop"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-stop"))
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-stop")
@@ -1185,7 +978,7 @@ class TestCursorStop:
     def test_stop_on_finished_run_is_graceful_and_idempotent(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(_preset_event(),
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(),
                                                                      sid="s-idem"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-idem")
@@ -1237,7 +1030,7 @@ class TestSameRepoConcurrency:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp", _gated_replay_factory(release, sid="s-a"))
+        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-a"))
         first = _start_run("task A", repo=str(tmp_path))
         try:
             _assert_running_ack(first)
@@ -1264,11 +1057,11 @@ class TestSameRepoConcurrency:
         repo_a.mkdir()
         repo_b.mkdir()
         release = threading.Event()
-        seq = _AcpSequence(
+        seq = _SdkSequence(
             _gated_replay_factory(release, sid="s-ra", early_edit=False),
             _gated_replay_factory(release, sid="s-rb", early_edit=False),
         )
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
 
         res_a = _start_run("a", repo=str(repo_a))
         res_b = _start_run("b", repo=str(repo_b))
@@ -1282,11 +1075,11 @@ class TestSameRepoConcurrency:
             assert _job_for(sid).done_event.wait(10)
 
     def test_finished_run_releases_the_repo(self, clean_state, monkeypatch, tmp_path):
-        seq = _AcpSequence(
+        seq = _SdkSequence(
             _gated_replay_factory(_preset_event(), sid="s-one"),
             _gated_replay_factory(_preset_event(), sid="s-two"),
         )
-        monkeypatch.setattr(gc_acp, "run_acp", seq)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
         _start_run("t", repo=str(tmp_path))
         assert _job_for("s-one").done_event.wait(10)
 
@@ -1386,7 +1179,7 @@ class TestHandleTable:
 
 
 # ---------------------------------------------------------------------------
-# Git fallback — files_changed for edits the ACP stream carried no diff for
+# Git fallback — files_changed for edits the SDK stream carried no diff for
 # ---------------------------------------------------------------------------
 
 def _git(repo, *args):
@@ -1417,14 +1210,14 @@ class TestGitFallback:
         (git_repo / "pre.txt").write_text("pre dirty before run\n")
 
         def shell_edit_replay(*_a, **_k):
-            yield ("acp.session", {"sessionId": "s-git", "cwd": str(git_repo), "model": "m"})
+            yield ("sdk.session", {"agentId": "s-git", "cwd": str(git_repo), "model": "m"})
             # Simulates cursor editing through a shell command: no diff
-            # content ever appears on the ACP stream.
+            # content ever appears on the SDK stream.
             (git_repo / "tool.txt").write_text("orig\nedited by shell\n")
             (git_repo / "new.txt").write_text("brand new\n")
-            yield ("acp.result", {"stopReason": "end_turn"})
+            yield ("sdk.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_acp, "run_acp", shell_edit_replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", shell_edit_replay)
         _start_run("edit via shell", repo=str(git_repo))
         job = _job_for("s-git")
         assert job.done_event.wait(10)
@@ -1437,27 +1230,27 @@ class TestGitFallback:
         assert "edited by shell" in by_path["tool.txt"]["diff"]
         assert by_path["new.txt"]["status"] == "A"
 
-    def test_acp_stream_diff_wins_over_fallback(self, clean_state, monkeypatch, git_repo):
-        """A file already captured from the ACP stream is not re-added."""
+    def test_sdk_stream_diff_wins_over_fallback(self, clean_state, monkeypatch, git_repo):
+        """A file already captured from the SDK stream is not re-added."""
 
         def stream_and_shell(*_a, **_k):
-            yield ("acp.session", {"sessionId": "s-win", "cwd": str(git_repo), "model": "m"})
+            yield ("sdk.session", {"agentId": "s-win", "cwd": str(git_repo), "model": "m"})
             (git_repo / "tool.txt").write_text("orig\nedited\n")
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call", "toolCallId": "t1",
-                "title": "Edit File", "kind": "edit", "status": "pending", "rawInput": {},
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "edit_file",
+                "status": "running", "args": {"path": str(git_repo / "tool.txt")},
             })
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "completed",
-                "content": [{
-                    "type": "diff", "path": str(git_repo / "tool.txt"),
+                "result": {
+                    "path": str(git_repo / "tool.txt"),
                     "oldText": "orig\n", "newText": "orig\nedited\n",
-                }],
+                },
             })
-            yield ("acp.result", {"stopReason": "end_turn"})
+            yield ("sdk.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_acp, "run_acp", stream_and_shell)
+        monkeypatch.setattr(gc_sdk, "run_sdk", stream_and_shell)
         _start_run("t", repo=str(git_repo))
         job = _job_for("s-win")
         assert job.done_event.wait(10)
@@ -1482,12 +1275,12 @@ class TestAllTerminalStatesDeliver:
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, session_id=None, model=None):
-            yield ("acp.session", {"sessionId": sid, "cwd": str(workdir), "model": "m"})
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": sid, "cwd": str(workdir), "model": "m"})
             release.wait(10)
             yield terminal_event
 
-        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
         res = _start_run("t", repo=str(tmp_path))
         assert "running in background" in res, f"run never armed: {res}"
         job = _job_for(sid)
@@ -1500,7 +1293,7 @@ class TestAllTerminalStatesDeliver:
     def test_completed_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-ok",
-            ("acp.result", {"stopReason": "end_turn"}),
+            ("sdk.result", {"status": "finished"}),
         )
         assert job.status == "completed"
         assert evt["status"] == "completed"
@@ -1509,7 +1302,7 @@ class TestAllTerminalStatesDeliver:
     def test_cancelled_run_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-c",
-            ("acp.result", {"stopReason": "cancelled"}),
+            ("sdk.result", {"status": "cancelled"}),
         )
         # The JOB status names the real terminal state...
         assert job.status == "cancelled"
@@ -1522,7 +1315,7 @@ class TestAllTerminalStatesDeliver:
     def test_timeout_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-t",
-            ("acp.error", {"error": "ACP run timed out after 5s", "timeout": True}),
+            ("sdk.error", {"error": "cursor run timed out: no activity for 5s", "timeout": True}),
         )
         assert job.status == "timeout"
         assert evt["status"] == "timeout"
@@ -1532,7 +1325,7 @@ class TestAllTerminalStatesDeliver:
     def test_midrun_failure_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-x",
-            ("acp.error", {"error": "ACP connection failed mid-run: boom"}),
+            ("sdk.error", {"error": "cursor-sdk stream failed mid-run: boom"}),
         )
         assert job.status == "failed"
         assert evt["status"] == "failed"
@@ -1541,31 +1334,37 @@ class TestAllTerminalStatesDeliver:
     def test_transport_drop_delivers_failed_not_completed(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """Live repro (2026-07-03): the stream died with a RetriableError
-        narrated as the final message chunks, then a "clean" end_turn. The
-        delivered completion must say failed with the error first-class in
-        the header — not completed with the error buried in the summary."""
+        """Live repro (2026-07-03, ACP era): the stream died with a
+        RetriableError narrated as the final message chunks, then a "clean"
+        finish. The delivered completion must say failed with the error
+        first-class in the header — not completed with the error buried in
+        the summary. Kept under the SDK transport: the classification is
+        content-based and transport-agnostic."""
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, session_id=None, model=None):
-            yield ("acp.session", {"sessionId": "s-drop", "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": "s-drop", "cwd": str(workdir),
                                    "model": "m"})
             release.wait(10)
-            yield ("acp.update", {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text",
-                            "text": "Now let me explore the relevant code\n"},
+            yield ("sdk.message", {
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "Now let me explore the relevant code\n",
+                }]},
             })
-            yield ("acp.update", {
-                "sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text",
-                            "text": "RetriableError: [canceled] http/2 stream "
-                                    "closed with error code CANCEL (0x8)"},
+            yield ("sdk.message", {
+                "type": "assistant",
+                "message": {"content": [{
+                    "type": "text",
+                    "text": "RetriableError: [canceled] http/2 stream "
+                            "closed with error code CANCEL (0x8)",
+                }]},
             })
-            yield ("acp.result", {"stopReason": "end_turn"})
+            yield ("sdk.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
         res = _start_run("t", repo=str(tmp_path))
         assert "running in background" in res, f"run never armed: {res}"
         job = _job_for("s-drop")
@@ -1586,391 +1385,6 @@ class TestAllTerminalStatesDeliver:
         assert "status: failed" in evt["summary"]
         assert "run failed:" in evt["summary"]
         assert "http/2 stream closed" in evt["summary"].split("cursor's summary:")[0]
-
-
-# ---------------------------------------------------------------------------
-# acp_runner.run_acp — real subprocess round-trips against a fake ACP server
-# ---------------------------------------------------------------------------
-
-_FAKE_ACP = '''#!/usr/bin/env python3
-import json, sys, time
-MODE = "__MODE__"
-
-def send(o):
-    sys.stdout.write(json.dumps(o) + "\\n")
-    sys.stdout.flush()
-
-def update(upd):
-    send({"jsonrpc": "2.0", "method": "session/update",
-          "params": {"sessionId": "s-test", "update": upd}})
-
-if MODE == "die":
-    sys.exit(1)
-
-prompt_id = None
-for line in sys.stdin:
-    line = line.strip()
-    if not line:
-        continue
-    msg = json.loads(line)
-    m = msg.get("method")
-    if m == "initialize":
-        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"protocolVersion": 1}})
-    elif m == "session/new":
-        send({"jsonrpc": "2.0", "id": msg["id"],
-              "result": {"sessionId": "s-test", "models": {"currentModelId": "fake-model"}}})
-    elif m == "session/load":
-        if MODE == "loadfail":
-            send({"jsonrpc": "2.0", "id": msg["id"],
-                  "error": {"code": -32602, "message": "Invalid params",
-                            "data": {"message": "Session not found"}}})
-        else:
-            # Replay of prior history precedes the load response (observed
-            # live 2026-07-02), then the same result shape as session/new
-            # minus sessionId.
-            update({"sessionUpdate": "user_message_chunk",
-                    "content": {"type": "text", "text": "prior task"}})
-            update({"sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "prior answer"}})
-            send({"jsonrpc": "2.0", "id": msg["id"],
-                  "result": {"models": {"currentModelId": "fake-model"}}})
-    elif m == "session/prompt":
-        prompt_id = msg["id"]
-        update({"sessionUpdate": "agent_message_chunk",
-                "content": {"type": "text", "text": "working"}})
-        if MODE == "slow":
-            # Slow but ACTIVE: keep streaming updates with gaps well under
-            # the inactivity threshold, for a total well past it.
-            for i in range(5):
-                time.sleep(0.5)
-                update({"sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "step %d" % i}})
-            send({"jsonrpc": "2.0", "id": prompt_id,
-                  "result": {"stopReason": "end_turn"}})
-        elif MODE == "chatty":
-            # Runaway: streams updates forever, never finishes, never
-            # reads stdin again (so session/cancel goes unanswered).
-            while True:
-                time.sleep(0.2)
-                update({"sessionUpdate": "agent_message_chunk",
-                        "content": {"type": "text", "text": "still going"}})
-        elif MODE == "middie":
-            # Transport drop: stream one chunk mid-work, then die without
-            # ever resolving session/prompt (no end_turn).
-            update({"sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "exploring"}})
-            sys.exit(1)
-        elif MODE == "slowtool":
-            # One long LOCAL tool call: tool_call starts, then total ACP
-            # silence while the "command" runs for well past the inactivity
-            # threshold, then the terminal update + end_turn.
-            update({"sessionUpdate": "tool_call", "toolCallId": "t-slow",
-                    "title": "`npx tsc --noEmit`", "kind": "execute",
-                    "status": "pending", "rawInput": {"command": "npx tsc --noEmit"}})
-            time.sleep(2.5)
-            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-slow",
-                    "status": "completed",
-                    "rawOutput": {"exitCode": 0, "stdout": "ok", "stderr": ""}})
-            send({"jsonrpc": "2.0", "id": prompt_id,
-                  "result": {"stopReason": "end_turn"}})
-        elif MODE == "toolhang":
-            # A tool call that FINISHES, then true silence: no pending call
-            # remains, so the inactivity watchdog must still fire.
-            update({"sessionUpdate": "tool_call", "toolCallId": "t-done",
-                    "title": "`ls`", "kind": "execute", "status": "pending",
-                    "rawInput": {"command": "ls"}})
-            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-done",
-                    "status": "completed",
-                    "rawOutput": {"exitCode": 0, "stdout": "", "stderr": ""}})
-            # then hang: keep reading, never resolve the prompt
-        elif MODE in ("happy", "load", "loadfail"):
-            update({"sessionUpdate": "tool_call", "toolCallId": "t1",
-                    "title": "Edit File", "kind": "edit", "status": "pending",
-                    "rawInput": {}})
-            update({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                    "status": "completed",
-                    "content": [{"type": "diff", "path": "/w/f.py",
-                                 "oldText": "a\\n", "newText": "a\\nb\\n"}]})
-            send({"jsonrpc": "2.0", "id": prompt_id,
-                  "result": {"stopReason": "end_turn"}})
-        # cancel / hang: keep reading
-    elif m == "session/cancel":
-        if MODE == "cancel":
-            send({"jsonrpc": "2.0", "id": prompt_id,
-                  "result": {"stopReason": "cancelled"}})
-        # hang: ignore the cancel entirely
-'''
-
-
-def _install_fake_acp(tmp_path, monkeypatch, mode):
-    stub = tmp_path / "cursor-agent"
-    stub.write_text(_FAKE_ACP.replace("__MODE__", mode))
-    stub.chmod(0o755)
-    monkeypatch.setattr(gc_acp, "subprocess_env", _prepend_path_env(tmp_path))
-
-
-class TestAcpRunner:
-    def test_happy_path_yields_session_updates_result(self, tmp_path, monkeypatch):
-        _install_fake_acp(tmp_path, monkeypatch, "happy")
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     cancel_check=lambda: False))
-        keys = [k for k, _ in events]
-        assert keys[0] == "acp.session"
-        assert events[0][1]["sessionId"] == "s-test"
-        assert "acp.update" in keys
-        assert keys[-1] == "acp.result"
-        assert events[-1][1]["stopReason"] == "end_turn"
-        updates = [o for k, o in events if k == "acp.update"]
-        assert any(u.get("sessionUpdate") == "tool_call_update" and u.get("content")
-                   for u in updates)
-
-    def test_cancel_check_sends_session_cancel(self, tmp_path, monkeypatch):
-        _install_fake_acp(tmp_path, monkeypatch, "cancel")
-        cancelled = {"flag": False}
-        events = []
-        t0 = time.monotonic()
-        for key, obj in gc_acp.run_acp("do it", str(tmp_path),
-                                       inactivity_timeout_s=30.0,
-                                       cancel_check=lambda: cancelled["flag"]):
-            events.append((key, obj))
-            if key == "acp.update":
-                cancelled["flag"] = True  # interrupt lands mid-run
-        elapsed = time.monotonic() - t0
-        assert events[-1] == ("acp.result", {"stopReason": "cancelled"})
-        assert elapsed < 15, f"native cancel did not resolve promptly ({elapsed:.1f}s)"
-
-    def test_silent_hang_is_killed_at_the_inactivity_limit(self, tmp_path, monkeypatch):
-        """A run with ZERO activity is hung: the inactivity watchdog kills
-        it and the error names the limit that fired."""
-        _install_fake_acp(tmp_path, monkeypatch, "hang")
-        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
-        t0 = time.monotonic()
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=1.0,
-                                     cancel_check=lambda: False))
-        elapsed = time.monotonic() - t0
-        assert events[-1][0] == "acp.error"
-        assert events[-1][1]["timeout"] is True
-        assert "no activity for 1s" in events[-1][1]["error"]
-        assert elapsed < 20, f"timeout kill did not tear down ({elapsed:.1f}s)"
-
-    def test_slow_but_active_run_is_not_killed(self, tmp_path, monkeypatch):
-        """Inactivity semantics: events keep arriving past the old wall
-        limit (total >> inactivity_timeout_s), so the run must complete —
-        activity resets the watchdog clock."""
-        _install_fake_acp(tmp_path, monkeypatch, "slow")
-        t0 = time.monotonic()
-        # Gaps between updates are 0.5s; total streaming is ~2.5s. Under the
-        # old wall-clock semantics a 1.5s timeout would have killed it.
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=1.5,
-                                     cancel_check=lambda: False))
-        elapsed = time.monotonic() - t0
-        assert elapsed > 1.5, "run finished before the old wall limit — inconclusive"
-        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
-        assert not any(k == "acp.error" for k, _ in events)
-
-    def test_pending_tool_call_suspends_the_inactivity_watchdog(
-        self, tmp_path, monkeypatch
-    ):
-        """Live repro (`run.failed: ACP run timed out: no activity for
-        600s` while cursor waited on a 10–25 min local typecheck): a run
-        that is silent because ONE tool call is still in flight is busy,
-        not hung — it must survive well past the inactivity threshold and
-        complete normally once the call finishes."""
-        _install_fake_acp(tmp_path, monkeypatch, "slowtool")
-        t0 = time.monotonic()
-        # Tool-call silence is ~2.5s against a 1s inactivity threshold.
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=1.0,
-                                     cancel_check=lambda: False))
-        elapsed = time.monotonic() - t0
-        assert elapsed > 2.0, "tool call finished before the threshold — inconclusive"
-        assert not any(k == "acp.error" for k, _ in events)
-        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
-        finished = [o for k, o in events if k == "acp.update"
-                    and o.get("sessionUpdate") == "tool_call_update"
-                    and o.get("status") == "completed"]
-        assert finished, "the pending tool call never completed in the replay"
-
-    def test_true_silence_after_a_finished_tool_call_still_times_out(
-        self, tmp_path, monkeypatch
-    ):
-        """The suspension is scoped to IN-FLIGHT calls only: once the tool
-        call completes and real silence follows, the existing inactivity
-        semantics still kill the run."""
-        _install_fake_acp(tmp_path, monkeypatch, "toolhang")
-        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
-        t0 = time.monotonic()
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=1.0,
-                                     cancel_check=lambda: False))
-        elapsed = time.monotonic() - t0
-        assert events[-1][0] == "acp.error"
-        assert events[-1][1]["timeout"] is True
-        assert "no activity for 1s" in events[-1][1]["error"]
-        assert elapsed < 20, f"timeout kill did not tear down ({elapsed:.1f}s)"
-
-    def test_max_wall_ceiling_kills_a_runaway_stream(self, tmp_path, monkeypatch):
-        """A run that streams forever never trips the inactivity watchdog —
-        the max_wall_s hard ceiling is the safety net, and the error says so."""
-        _install_fake_acp(tmp_path, monkeypatch, "chatty")
-        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
-        t0 = time.monotonic()
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     max_wall_s=1.5,
-                                     cancel_check=lambda: False))
-        elapsed = time.monotonic() - t0
-        assert events[-1][0] == "acp.error"
-        assert events[-1][1]["timeout"] is True
-        assert "exceeded max wall time (1s)" in events[-1][1]["error"]
-        assert elapsed < 20, f"wall-ceiling kill did not tear down ({elapsed:.1f}s)"
-
-    def test_legacy_timeout_kwarg_is_an_inactivity_alias(self, tmp_path, monkeypatch):
-        """Backward compat: the old ``timeout=`` kwarg still works, now with
-        inactivity semantics."""
-        _install_fake_acp(tmp_path, monkeypatch, "hang")
-        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
-        events = list(gc_acp.run_acp("do it", str(tmp_path), timeout=1.0,
-                                     cancel_check=lambda: False))
-        assert events[-1][0] == "acp.error"
-        assert events[-1][1]["timeout"] is True
-        assert "no activity for 1s" in events[-1][1]["error"]
-
-    def test_process_death_midprompt_is_an_error_not_a_result(
-        self, tmp_path, monkeypatch
-    ):
-        """cursor-agent dying mid-prompt (no end_turn) must surface as
-        acp.error — the shape the normalizer classifies as run.failed —
-        never as an acp.result completion."""
-        _install_fake_acp(tmp_path, monkeypatch, "middie")
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     cancel_check=lambda: False))
-        assert not any(k == "acp.result" for k, _ in events)
-        assert events[-1][0] == "acp.error"
-        assert "connection" in events[-1][1]["error"].lower()
-        # And the normalizer turns that into a failed run.
-        envs = gc_events.AcpNormalizer().normalize(*events[-1])
-        assert envs[0]["event"] == "run.failed"
-        assert envs[0]["status"] == "failed"
-
-    def test_dead_binary_raises_actionable_acp_error(self, tmp_path, monkeypatch):
-        _install_fake_acp(tmp_path, monkeypatch, "die")
-        with pytest.raises(gc_acp.AcpError) as exc_info:
-            list(gc_acp.run_acp("do it", str(tmp_path),
-                                inactivity_timeout_s=10.0,
-                                cancel_check=lambda: False))
-        assert "handshake" in str(exc_info.value)
-
-    def test_empty_task_raises(self, tmp_path):
-        with pytest.raises(gc_runner.HarnessError):
-            list(gc_acp.run_acp("  ", str(tmp_path)))
-
-    def test_bad_repo_raises(self):
-        with pytest.raises(gc_runner.HarnessError):
-            list(gc_acp.run_acp("t", "/nope/nothing/here"))
-
-    def test_session_id_resumes_via_session_load(self, tmp_path, monkeypatch):
-        """session_id → session/load path: the resume id is kept (not the
-        fake server's session/new id) and resumed=True, with the replayed
-        history flowing through as ordinary acp.update events."""
-        _install_fake_acp(tmp_path, monkeypatch, "load")
-        events = list(gc_acp.run_acp("continue it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     cancel_check=lambda: False,
-                                     session_id="s-prior"))
-        # Replayed history arrives BEFORE session/load resolves, so the
-        # acp.session event follows the replay updates in the stream.
-        sessions = [o for k, o in events if k == "acp.session"]
-        assert len(sessions) == 1
-        assert sessions[0]["sessionId"] == "s-prior"
-        assert sessions[0]["resumed"] is True
-        replayed = [o for k, o in events if k == "acp.update"
-                    and o.get("sessionUpdate") == "user_message_chunk"]
-        assert replayed, "session/load replay did not flow through acp.update"
-        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
-
-    def test_session_load_failure_falls_back_to_session_new(self, tmp_path, monkeypatch):
-        """Expired/unknown session id must not hard-fail: fall back to a
-        fresh session/new and report resumed=False."""
-        _install_fake_acp(tmp_path, monkeypatch, "loadfail")
-        events = list(gc_acp.run_acp("continue it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     cancel_check=lambda: False,
-                                     session_id="s-expired"))
-        assert events[0][0] == "acp.session"
-        assert events[0][1]["sessionId"] == "s-test"  # fresh session
-        assert events[0][1]["resumed"] is False
-        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
-
-    def test_no_session_id_creates_fresh_session(self, tmp_path, monkeypatch):
-        """Omitting session_id keeps the one-shot behavior byte-identical."""
-        _install_fake_acp(tmp_path, monkeypatch, "happy")
-        events = list(gc_acp.run_acp("do it", str(tmp_path),
-                                     inactivity_timeout_s=30.0,
-                                     cancel_check=lambda: False))
-        assert events[0][1]["sessionId"] == "s-test"
-        assert events[0][1]["resumed"] is False
-
-
-# ---------------------------------------------------------------------------
-# _AcpClient._establish_session — request-layer method selection
-# ---------------------------------------------------------------------------
-
-class TestEstablishSession:
-    def _run(self, session_id, responder):
-        """Drive _establish_session with a mocked _request; returns
-        (methods_called, params_by_method, (sess, resumed), client)."""
-        import asyncio
-        import queue
-
-        client = gc_acp._AcpClient(
-            task="t", workdir=Path("/w"), out_q=queue.Queue(),
-            cancel_requested=threading.Event(),
-            session_id=session_id,
-        )
-        calls = []
-
-        async def fake_request(method, params, timeout=None):
-            calls.append((method, params))
-            return responder(method)
-
-        client._request = fake_request
-        result = asyncio.run(client._establish_session())
-        return calls, result, client
-
-    def test_session_id_uses_session_load_not_session_new(self):
-        calls, (sess, resumed), client = self._run(
-            "s-prior",
-            lambda m: {"models": {"currentModelId": "m"}},
-        )
-        assert [m for m, _ in calls] == ["session/load"]
-        assert calls[0][1]["sessionId"] == "s-prior"
-        assert calls[0][1]["mcpServers"] == []
-        assert resumed is True
-        assert client._session_id == "s-prior"
-
-    def test_load_failure_falls_back_to_session_new(self):
-        def responder(method):
-            if method == "session/load":
-                raise RuntimeError("ACP error -32602: Invalid params")
-            return {"sessionId": "s-fresh", "models": {}}
-
-        calls, (sess, resumed), client = self._run("s-gone", responder)
-        assert [m for m, _ in calls] == ["session/load", "session/new"]
-        assert resumed is False
-        assert client._session_id == "s-fresh"
-
-    def test_no_session_id_goes_straight_to_session_new(self):
-        calls, (sess, resumed), client = self._run(
-            None, lambda m: {"sessionId": "s-fresh", "models": {}}
-        )
-        assert [m for m, _ in calls] == ["session/new"]
-        assert resumed is False
-        assert client._session_id == "s-fresh"
 
 
 # ---------------------------------------------------------------------------
@@ -2029,17 +1443,17 @@ class TestRegistration:
         assert "interrupt" in desc
         assert "re-prompt" in desc
 
-    def test_check_fn_false_without_binary(self, monkeypatch):
-        monkeypatch.setattr(gc_runner, "cursor_agent_available", lambda: False)
+    def test_check_fn_false_without_sdk_package(self, monkeypatch):
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: False)
         assert check_cursor_available() is False
 
     def test_check_fn_false_without_resolvable_repo(self, monkeypatch):
-        monkeypatch.setattr(gc_runner, "cursor_agent_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
         monkeypatch.setattr(gc, "_default_repo", lambda: None)
         assert check_cursor_available() is False
 
-    def test_check_fn_true_with_binary_and_repo(self, monkeypatch):
-        monkeypatch.setattr(gc_runner, "cursor_agent_available", lambda: True)
+    def test_check_fn_true_with_sdk_and_repo(self, monkeypatch):
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
         # _default_repo falls back to os.getcwd(), which always exists.
         assert check_cursor_available() is True
 
@@ -2047,7 +1461,7 @@ class TestRegistration:
         def boom():
             raise RuntimeError("probe failed")
 
-        monkeypatch.setattr(gc_runner, "cursor_agent_available", boom)
+        monkeypatch.setattr(gc_sdk, "sdk_available", boom)
         assert check_cursor_available() is False
 
 
@@ -2374,7 +1788,7 @@ class TestEventLog:
 class TestEventLogIntegration:
     def _run_to_completion(self, monkeypatch, tmp_path, sid="s-spill"):
         monkeypatch.setattr(
-            gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid=sid)
+            gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(), sid=sid)
         )
         _start_run("t", repo=str(tmp_path))
         job = _job_for(sid)
@@ -2447,21 +1861,20 @@ class TestEventLogIntegration:
         big = "y" * 50_000
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, session_id=None, model=None):
-            yield ("acp.session", {"sessionId": "s-bigout", "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": "s-bigout", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call", "toolCallId": "t1",
-                "title": "big", "kind": "execute", "status": "pending",
-                "rawInput": {"command": "generate"},
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "running", "args": {"command": "generate"},
             })
-            yield ("acp.update", {
-                "sessionUpdate": "tool_call_update", "toolCallId": "t1",
-                "status": "completed", "rawOutput": {"stdout": big},
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "completed", "result": {"exitCode": 0, "stdout": big},
             })
-            yield ("acp.result", {"stopReason": "end_turn"})
+            yield ("sdk.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_acp, "run_acp", replay)
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-bigout")
         assert job.done_event.wait(10)
@@ -2520,7 +1933,7 @@ class TestHandleScoping:
     ):
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:alice")
         monkeypatch.setattr(
-            gc_acp, "run_acp", _gated_replay_factory(_preset_event(), sid="s-mine")
+            gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(), sid="s-mine")
         )
         _start_run("t", repo=str(tmp_path))
         assert _job_for("s-mine").done_event.wait(10)
@@ -2677,8 +2090,8 @@ class TestCursorCreateSession:
     def test_creates_a_named_handle_and_dispatches_nothing(
         self, clean_state, monkeypatch, tmp_path
     ):
-        boom = lambda *a, **k: pytest.fail("create must not spawn ACP")
-        monkeypatch.setattr(gc_acp, "run_acp", boom)
+        boom = lambda *a, **k: pytest.fail("create must not start a run")
+        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
 
         ack = cursor_create_session(repo=str(tmp_path))
         name = _created_name(ack)
@@ -2736,7 +2149,7 @@ class TestCursorCreateSession:
         """After the first send binds the cursor UUID, name and UUID are
         interchangeable across status/stop/events/send."""
         monkeypatch.setattr(
-            gc_acp, "run_acp",
+            gc_sdk, "run_sdk",
             _gated_replay_factory(_preset_event(), sid="11111111-2222-3333"),
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
@@ -2906,7 +2319,7 @@ class TestCursorList:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_acp, "run_acp",
+        monkeypatch.setattr(gc_sdk, "run_sdk",
                             _gated_replay_factory(release, sid="s-live-list"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-live-list")

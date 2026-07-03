@@ -1,8 +1,8 @@
 """Persistent handle table for cursor sessions — explicit handles, no heuristics.
 
 EXPLICIT session handles, no auto-resume heuristics: ``cursor_create_session``
-mints a session NAME and every other tool takes it back (the cursor ACP
-UUID resolves as an alias). This module is the tiny persistence layer under
+mints a session NAME and every other tool takes it back (the cursor
+agent id resolves as an alias). This module is the tiny persistence layer under
 that model — a JSON file mapping
 ``session_name -> {repo, status, task, model, cursor_session_id, ...}`` so a
 handle minted on turn T is still resolvable on turn T+1 even across a process
@@ -138,8 +138,8 @@ def _prune_locked(now: Optional[float] = None) -> None:
 def record(session_id: Optional[str], **fields: Any) -> None:
     """Merge ``fields`` into the entry for ``session_id``. Never raises.
 
-    No-ops on a missing session_id (e.g. a run that failed before the ACP
-    session was ever established has no handle to record).
+    No-ops on a missing session_id (e.g. a run that failed before the
+    cursor agent was ever established has no handle to record).
     """
     try:
         if not session_id:
@@ -172,7 +172,7 @@ def resolve(identifier: Optional[str]) -> Optional[str]:
     """The canonical session NAME for a name-or-UUID identifier, or None.
 
     v0.4 keys the table by human slug (``playful-space-bunny``); the cursor
-    ACP UUID is recorded on the entry as ``cursor_session_id`` and stays a
+    agent id is recorded on the entry as ``cursor_session_id`` and stays a
     working alias — this is the lookup that makes UUIDs resolve everywhere
     a name is accepted. Never raises.
     """

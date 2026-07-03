@@ -468,6 +468,13 @@ class SdkNormalizer:
         # call_ids whose "running" tool_use envelope was already emitted
         # (the SDK may re-emit running-status messages as args accumulate).
         self._started: set = set()
+        # Tail of the FINAL contiguous content segment: assistant deltas
+        # accumulate here and any tool/thinking activity resets it, so at a
+        # "finished" result it holds only what the agent streamed last.
+        # Scanned for transport-error signatures (see _TRANSPORT_ERROR_RE) —
+        # observed live under ACP and kept under the SDK: a dying model
+        # stream can be narrated as ordinary content before a clean finish.
+        self._final_content_tail = ""
 
     # -- event entry point ---------------------------------------------------
 
@@ -507,6 +514,20 @@ class SdkNormalizer:
         if event_key == "sdk.result":
             status = str(data.get("status") or "")
             if status == "finished":
+                transport_error = _transport_error_line(self._final_content_tail)
+                if transport_error:
+                    # The "clean" finish is a lie: the stream died and the
+                    # error was narrated as the last message. Classify the
+                    # run failed, error first-class.
+                    return [
+                        lifecycle(
+                            "run.failed",
+                            status="failed",
+                            error=transport_error,
+                            transport_error=True,
+                            run_status=status,
+                        )
+                    ]
                 return [lifecycle("run.completed", status="completed",
                                   run_status=status)]
             if status == "cancelled":
@@ -563,6 +584,7 @@ class SdkNormalizer:
             return []
 
         if mtype == "thinking":
+            self._final_content_tail = ""
             text = msg.get("text")
             if isinstance(text, str) and text:
                 return [lifecycle("reasoning", text=text)]
@@ -570,9 +592,14 @@ class SdkNormalizer:
 
         if mtype == "assistant":
             text = _sdk_assistant_text(msg)
+            if text:
+                self._final_content_tail = (
+                    self._final_content_tail + text
+                )[-_TRANSPORT_SCAN_CHARS:]
             return [content_delta(text)] if text else []
 
         if mtype == "tool_call":
+            self._final_content_tail = ""
             return self._tool_call(msg)
 
         if mtype == "usage":
