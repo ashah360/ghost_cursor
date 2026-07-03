@@ -1,11 +1,13 @@
 """E2E EVAL (shape 2) — LLM-as-judge on a real plugin run.
 
 Shapes 1 & 3 assert on *facts* (tool called, file exists, no exception). This
-shape evaluates *quality*: it runs a real cursor task through the plugin,
-captures the full context (result JSON + streamed progress + final files/diffs),
-and asks a cheap judge model: "did this go smoothly, or are there concerns a
-user would notice?" — catching soft regressions (garbled diffs, error text
-leaking into output, empty/confused results) that a pass/fail assertion misses.
+shape evaluates *quality*: it runs a real cursor task through the v0.4 plugin
+(create session → send message), captures the full context (the plain-text
+tool acks, the final status text, the paged event history, and the final
+files), and asks a cheap judge model: "did this go smoothly, or are there
+concerns a user would notice?" — catching soft regressions (garbled diffs,
+error text leaking into output, empty/confused results) that a pass/fail
+assertion misses.
 
 Requires (skips cleanly otherwise):
   - GHOST_CURSOR_E2E=1
@@ -24,7 +26,6 @@ import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -43,6 +44,8 @@ pytestmark = pytest.mark.skipif(
     reason="e2e-eval opt-in: needs GHOST_CURSOR_E2E=1, CURSOR_API_KEY, OPENAI_API_KEY, cursor-agent",
 )
 
+TERMINAL = ("completed", "failed", "cancelled", "timeout")
+
 
 def _find_plugin_init() -> Path:
     override = os.environ.get("GHOST_CURSOR_PLUGIN_INIT")
@@ -59,7 +62,7 @@ def _find_plugin_init() -> Path:
             cands.append(Path(root) / "plugins" / "ghost_cursor" / "__init__.py")
     for c in cands:
         try:
-            if c.is_file() and "def cursor_start" in c.read_text(encoding="utf-8"):
+            if c.is_file() and "def cursor_create_session" in c.read_text(encoding="utf-8"):
                 return c
         except Exception:
             continue
@@ -72,10 +75,11 @@ def _judge(context: str) -> dict:
     prompt = (
         "You are a strict QA reviewer for a coding-agent plugin (ghost_cursor) that "
         "delegates edits to the Cursor agent. Below is the FULL context of one real "
-        "run: the tool's result JSON, streamed progress, and the final files/diffs.\n\n"
+        "run: the plugin's plain-text tool outputs (session ack, final status block, "
+        "paged event history) and the final files.\n\n"
         "Judge whether the run went SMOOTHLY from a user's perspective. Concerns include: "
         "error/traceback text leaking into output, empty or confused results, a diff that "
-        "doesn't match the request, the tool reporting success but no real change, or "
+        "doesn't match the request, the tool reporting completion but no real change, or "
         "auth/protocol errors. If the task was accomplished cleanly with a coherent result, "
         "it PASSES.\n\n"
         f"=== RUN CONTEXT ===\n{context[:6000]}\n=== END ===\n\n"
@@ -121,31 +125,44 @@ def test_plugin_run_is_clean_by_llm_judge(tmp_path):
     repo.mkdir()
     subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
 
-    r = json.loads(gc._handle_cursor_start(
-        {"task": "Create stringutils.py with a function shout(s) that returns s "
-                 "uppercased with '!' appended. Include a docstring.",
-         "repo": str(repo), "model": CURSOR_MODEL}))
-    sid = r.get("session_id")
-    assert sid, f"no handle: {r}"
+    create_ack = gc._handle_cursor_create_session(
+        {"repo": str(repo), "model": CURSOR_MODEL})
+    assert create_ack.startswith("session: "), f"no session minted: {create_ack!r}"
+    name = create_ack.splitlines()[0].split("session: ", 1)[1].strip()
 
-    # wait for completion, capturing the final status context
+    send_ack = gc._handle_cursor_send_message({
+        "session": name,
+        "message": "Create stringutils.py with a function shout(s) that returns s "
+                   "uppercased with '!' appended. Include a docstring.",
+    })
+    assert f"sent to {name}" in send_ack, f"send not acknowledged: {send_ack!r}"
+
+    # wait for a terminal status header, capturing the final status text
     final = None
     deadline = time.time() + 180
     while time.time() < deadline:
-        s = json.loads(gc._handle_cursor_status({"session_id": sid}))
-        if s.get("status") in ("completed", "failed", "cancelled", "timeout"):
-            final = s
+        status = gc._handle_cursor_status({"session": name})
+        first = status.splitlines()[0]
+        if first.startswith("status: ") and first.split("status: ", 1)[1].strip() in TERMINAL:
+            final = status
             break
         time.sleep(4)
     assert final is not None, "run never reached a terminal state"
+
+    events = gc._handle_cursor_events({"session": name, "limit": 20})
 
     files_txt = ""
     su = repo / "stringutils.py"
     if su.exists():
         files_txt = su.read_text()
 
-    context = json.dumps({"start_result": r, "final_status": final}, indent=1) + \
-        f"\n\n--- final stringutils.py ---\n{files_txt}"
+    context = (
+        f"--- create ack ---\n{create_ack}\n\n"
+        f"--- send ack ---\n{send_ack}\n\n"
+        f"--- final status ---\n{final}\n\n"
+        f"--- event history (last 20) ---\n{events}\n\n"
+        f"--- final stringutils.py ---\n{files_txt}"
+    )
 
     verdict = _judge(context)
     assert verdict.get("verdict") == "pass", \
