@@ -151,7 +151,15 @@ class CursorJob:
     last_event_at: Optional[float] = None
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    assistant_parts: List[str] = field(default_factory=list)
+    # Streamed assistant prose as CONTIGUOUS blocks: each inner list is one
+    # uninterrupted run of content deltas; tool calls / reasoning between
+    # content start a new block. Lets the summary prefer the final wrap-up
+    # message instead of raw-concatenating every interstitial narration
+    # fragment (see summary_text).
+    assistant_segments: List[List[str]] = field(default_factory=list)
+    # True while the newest segment is still receiving deltas — i.e. the
+    # last folded envelope was content, nothing interrupted it since.
+    segment_open: bool = False
     reasoning_tail: str = ""
     progress_buffer: str = ""
     progress_events: int = 0
@@ -259,6 +267,32 @@ class CursorJob:
         for env in to_spill:
             _eventlog.append(spill_sid, env)
 
+    # -- summary derivation -------------------------------------------------------
+
+    def summary_text(self) -> str:
+        """The prose summary for status peeks and the final result.
+
+        Prefers the FINAL contiguous content block of the turn — the actual
+        wrap-up message the agent streamed last, with its deltas joined raw
+        (they are fragments of one message). When the turn did not end on a
+        content block (killed mid-tool-call, cancelled), there is no final
+        message to prefer, so it falls back to every block joined with
+        blank lines — never raw-concatenated, so interstitial narration
+        sentences don't fuse ("...spike file.Now let me explore...").
+        """
+        with self._lock:
+            blocks = [
+                b
+                for b in ("".join(seg).strip() for seg in self.assistant_segments)
+                if b
+            ]
+            ended_on_content = self.segment_open
+        if not blocks:
+            return ""
+        if ended_on_content:
+            return blocks[-1]
+        return "\n\n".join(blocks)
+
     # -- read-only view ---------------------------------------------------------
 
     def snapshot(self) -> Dict[str, Any]:
@@ -292,9 +326,7 @@ class CursorJob:
                 "cursor_session_id": self.cursor_session_id,
                 "resumed": self.resumed,
                 "model": self.model or (self.requested_model or ""),
-                "summary_so_far": _clip(
-                    "".join(self.assistant_parts).strip(), _PAYLOAD_SUMMARY_CHARS
-                ),
+                "summary_so_far": _clip(self.summary_text(), _PAYLOAD_SUMMARY_CHARS),
                 "files_changed_so_far": files,
                 "files_changed_count": len(files),
                 "latest_reasoning": self.reasoning_tail[-1500:],
