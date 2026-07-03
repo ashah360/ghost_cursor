@@ -303,8 +303,8 @@ def _gated_replay_factory(release, sid="s-run", early_edit=True, late_edit=True)
     a summary chunk, and a clean end_turn.
     """
 
-    def replay(task, workdir, timeout=0.0, cancel_check=None,
-               session_id=None, model=None):
+    def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+               cancel_check=None, session_id=None, model=None):
         yield ("acp.session", {
             "sessionId": sid, "cwd": str(workdir),
             "model": model or "fake-model", "resumed": bool(session_id),
@@ -355,14 +355,17 @@ class _AcpSequence:
         self._factories = list(factories)
         self.calls = []
 
-    def __call__(self, task, workdir, timeout=0.0, cancel_check=None,
-                 session_id=None, model=None):
+    def __call__(self, task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                 cancel_check=None, session_id=None, model=None):
         self.calls.append({
             "task": task, "workdir": str(workdir),
             "session_id": session_id, "model": model,
+            "inactivity_timeout_s": inactivity_timeout_s,
+            "max_wall_s": max_wall_s,
         })
         factory = self._factories.pop(0)
-        return factory(task, workdir, timeout=timeout, cancel_check=cancel_check,
+        return factory(task, workdir, inactivity_timeout_s=inactivity_timeout_s,
+                       max_wall_s=max_wall_s, cancel_check=cancel_check,
                        session_id=session_id, model=model)
 
 
@@ -493,8 +496,8 @@ class TestCursorStartNew:
         the tool returns an actionable failure instead of blocking forever."""
         monkeypatch.setattr(gc, "_HANDLE_WAIT_S", 0.3)
 
-        def never_session(task, workdir, timeout=0.0, cancel_check=None,
-                          session_id=None, model=None):
+        def never_session(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                          cancel_check=None, session_id=None, model=None):
             while not (cancel_check and cancel_check()):
                 time.sleep(0.01)
             return
@@ -602,8 +605,8 @@ class TestCursorStartResume:
         """The ACP layer falls back to session/new for an expired id; the
         tool reports resumed=False honestly — no crash, no hard failure."""
 
-        def fallback_replay(task, workdir, timeout=0.0, cancel_check=None,
-                            session_id=None, model=None):
+        def fallback_replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                            cancel_check=None, session_id=None, model=None):
             # Simulates acp_runner's session/load → session/new fallback.
             yield ("acp.session", {"sessionId": "s-fresh", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
@@ -852,6 +855,36 @@ class TestCursorStatusReadOnly:
         assert status["result"]["session_id"] == "s-fin"
         assert status["result"]["files_changed_count"] == 2
 
+    def test_status_reports_last_activity_seconds(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Snapshots carry last_activity_s — seconds since the last ACP
+        event — so a caller can spot a silent run without touching it.
+        Fresh while events stream; frozen at finished_at once terminal."""
+        release = threading.Event()
+        monkeypatch.setattr(gc_acp, "run_acp",
+                            _gated_replay_factory(release, sid="s-act"))
+
+        json.loads(cursor_start("t", repo=str(tmp_path)))
+        job = _job_for("s-act")
+        assert _wait_until(lambda: job.last_event_at is not None)
+
+        live = json.loads(cursor_status("s-act"))
+        assert live["status"] == "running"
+        # Events just streamed — the run is fresh, not silent.
+        assert 0 <= live["last_activity_s"] < 10
+
+        release.set()
+        assert job.done_event.wait(10)
+        done = json.loads(cursor_status("s-act"))
+        assert done["status"] == "completed"
+        assert done["last_activity_s"] >= 0
+        # Terminal runs freeze the clock at finished_at: repeated polls of a
+        # finished run must not report ever-growing silence.
+        time.sleep(0.3)
+        again = json.loads(cursor_status("s-act"))
+        assert again["last_activity_s"] == done["last_activity_s"]
+
     def test_status_addresses_a_dispatched_resume_before_its_session_event(
         self, clean_state, tmp_path
     ):
@@ -864,7 +897,7 @@ class TestCursorStatusReadOnly:
             return {"success": True, "status": "completed"}
 
         job, existing = gc_jobs.registry.dispatch(
-            runner=runner, task="t", repo=str(tmp_path), timeout=60,
+            runner=runner, task="t", repo=str(tmp_path), inactivity_timeout_s=60,
             requested_session_id="s-req",
         )
         assert existing is None
@@ -1255,8 +1288,8 @@ class TestAllTerminalStatesDeliver:
         (deterministic — the run cannot finalize before arming)."""
         release = threading.Event()
 
-        def replay(task, workdir, timeout=0.0, cancel_check=None,
-                   session_id=None, model=None):
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, session_id=None, model=None):
             yield ("acp.session", {"sessionId": sid, "cwd": str(workdir), "model": "m"})
             release.wait(10)
             yield terminal_event
@@ -1813,7 +1846,8 @@ class TestLegacyRunner:
 
 class TestProgressBuffer:
     def test_buffer_accumulates_and_rolls(self, clean_state):
-        job = gc_jobs.CursorJob(job_id="cursor_test", task="t", repo="/r", timeout=60)
+        job = gc_jobs.CursorJob(job_id="cursor_test", task="t", repo="/r",
+                                inactivity_timeout_s=60)
         monkey_cap = 500
         old_cap = gc_jobs.MAX_PROGRESS_CHARS
         gc_jobs.MAX_PROGRESS_CHARS = monkey_cap
@@ -1833,7 +1867,8 @@ class TestProgressBuffer:
             gc_jobs.MAX_PROGRESS_CHARS = old_cap
 
     def test_buffer_drops_full_file_content_but_keeps_diff(self, clean_state):
-        job = gc_jobs.CursorJob(job_id="cursor_test2", task="t", repo="/r", timeout=60)
+        job = gc_jobs.CursorJob(job_id="cursor_test2", task="t", repo="/r",
+                                inactivity_timeout_s=60)
         job.append_progress({
             "kind": "file_diff", "path": "/r/f.py",
             "before": "B" * 10_000, "after": "A" * 10_000,

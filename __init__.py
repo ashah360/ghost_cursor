@@ -107,6 +107,34 @@ _HANDLE_DOC = (
     "every cursor completion message)."
 )
 
+# Shared watchdog params for cursor_start / cursor_send. Timeouts are
+# inactivity-based: streamed progress keeps a run alive indefinitely unless
+# the optional wall ceiling is set.
+_TIMEOUT_PROPERTIES = {
+    "inactivity_timeout_s": {
+        "type": "number",
+        "description": (
+            "Optional. Abort the run only after this many seconds of "
+            "SILENCE (no ACP events from cursor). Any streamed activity — "
+            "reasoning, tool calls, content — resets the clock, so a long "
+            "run that keeps making progress is never killed by this limit. "
+            "0 disables the inactivity watchdog. Default: "
+            "plugins.ghost_cursor.inactivity_timeout_s in config.yaml, "
+            "else 600."
+        ),
+    },
+    "max_wall_s": {
+        "type": "number",
+        "description": (
+            "Optional hard ceiling on TOTAL run time in seconds — a "
+            "safety net for runaway runs that keep streaming without "
+            "finishing. 0 disables it. Default: "
+            "plugins.ghost_cursor.max_wall_s in config.yaml, else 0 "
+            "(disabled)."
+        ),
+    },
+}
+
 CURSOR_START_SCHEMA = {
     "name": START_TOOL_NAME,
     "description": (
@@ -162,6 +190,7 @@ CURSOR_START_SCHEMA = {
                     "session."
                 ),
             },
+            **_TIMEOUT_PROPERTIES,
         },
         "required": ["task"],
     },
@@ -193,6 +222,7 @@ CURSOR_SEND_SCHEMA = {
                     "'also add tests for the divide function'."
                 ),
             },
+            **_TIMEOUT_PROPERTIES,
         },
         "required": ["session_id", "message"],
     },
@@ -290,6 +320,47 @@ def _resolve_model(explicit: Optional[str]) -> Optional[str]:
     return val or _configured_model()
 
 
+def _configured_timeout(key: str) -> Optional[float]:
+    """A numeric ``plugins.ghost_cursor.<key>`` config.yaml value, if set.
+
+    Same read pattern as :func:`_configured_model`. Returns None when the
+    key is absent or not a number (fall through to the built-in default).
+    """
+    try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        val = cfg_get(read_raw_config(), "plugins", "ghost_cursor", key)
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_inactivity_timeout(explicit: Optional[float]) -> float:
+    """Inactivity threshold precedence: explicit param >
+    ``plugins.ghost_cursor.inactivity_timeout_s`` in config >
+    ``DEFAULT_INACTIVITY_TIMEOUT_S`` (600s of silence). 0 disables."""
+    if explicit is not None:
+        return float(explicit)
+    configured = _configured_timeout("inactivity_timeout_s")
+    return (
+        configured
+        if configured is not None
+        else _acp.DEFAULT_INACTIVITY_TIMEOUT_S
+    )
+
+
+def _resolve_max_wall(explicit: Optional[float]) -> float:
+    """Wall-ceiling precedence: explicit param >
+    ``plugins.ghost_cursor.max_wall_s`` in config > ``DEFAULT_MAX_WALL_S``
+    (0 = disabled)."""
+    if explicit is not None:
+        return float(explicit)
+    configured = _configured_timeout("max_wall_s")
+    return configured if configured is not None else _acp.DEFAULT_MAX_WALL_S
+
+
 # ---------------------------------------------------------------------------
 # Run execution (worker-thread body)
 # ---------------------------------------------------------------------------
@@ -353,11 +424,13 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         for key, obj in _acp.run_acp(
             job.task,
             workdir,
-            timeout=float(job.timeout),
+            inactivity_timeout_s=float(job.inactivity_timeout_s),
+            max_wall_s=float(job.max_wall_s),
             cancel_check=job.cancel_event.is_set,
             session_id=job.requested_session_id,
             model=job.requested_model,
         ):
+            job.last_event_at = time.time()
             if key == "acp.session":
                 sid = str(obj.get("sessionId") or "")
                 with job._lock:
@@ -440,7 +513,8 @@ def _dispatch_run(
     workdir: str,
     session_id: Optional[str],
     model: Optional[str],
-    timeout: float,
+    inactivity_timeout_s: float,
+    max_wall_s: float,
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -453,7 +527,8 @@ def _dispatch_run(
         runner=_execute_cursor_run,
         task=str(task),
         repo=str(workdir),
-        timeout=float(timeout),
+        inactivity_timeout_s=float(inactivity_timeout_s),
+        max_wall_s=float(max_wall_s),
         session_key=_resolve_session_key(),
         requested_session_id=(str(session_id).strip() or None) if session_id else None,
         requested_model=model,
@@ -555,7 +630,9 @@ def cursor_start(
     repo: Optional[str] = None,
     model: Optional[str] = None,
     session_id: Optional[str] = None,
-    timeout: float = _runner.DEFAULT_TIMEOUT_S,
+    inactivity_timeout_s: Optional[float] = None,
+    max_wall_s: Optional[float] = None,
+    timeout: Optional[float] = None,
     **_kwargs: Any,
 ) -> str:
     """Dispatch a cursor run; return the session handle immediately.
@@ -565,6 +642,13 @@ def cursor_start(
     succeeded — an expired/unknown handle falls back to a fresh session).
     ``model`` threads through to the cursor-agent invocation (see module
     docstring for the instrumentation).
+
+    Timeouts are INACTIVITY-based: ``inactivity_timeout_s`` aborts only
+    after that much silence (no ACP events — progress resets the clock);
+    ``max_wall_s`` is an optional hard ceiling on total run time (0 =
+    disabled). Both default from config (see the resolver helpers).
+    ``timeout`` is the deprecated pre-inactivity name, kept as an alias for
+    ``inactivity_timeout_s``.
     """
     if not str(task or "").strip():
         return json.dumps({"success": False, "error": "task is required"})
@@ -604,7 +688,10 @@ def cursor_start(
             workdir=str(workdir),
             session_id=resume_id,
             model=_resolve_model(model),
-            timeout=timeout,
+            inactivity_timeout_s=_resolve_inactivity_timeout(
+                inactivity_timeout_s if inactivity_timeout_s is not None else timeout
+            ),
+            max_wall_s=_resolve_max_wall(max_wall_s),
         ),
         ensure_ascii=False,
         default=str,
@@ -614,7 +701,9 @@ def cursor_start(
 def cursor_send(
     session_id: str,
     message: str,
-    timeout: float = _runner.DEFAULT_TIMEOUT_S,
+    inactivity_timeout_s: Optional[float] = None,
+    max_wall_s: Optional[float] = None,
+    timeout: Optional[float] = None,
     **_kwargs: Any,
 ) -> str:
     """Steer / follow up on a cursor run (cancel-and-re-prompt semantics).
@@ -688,7 +777,10 @@ def cursor_send(
         workdir=repo,
         session_id=sid,
         model=_resolve_model(model),
-        timeout=timeout,
+        inactivity_timeout_s=_resolve_inactivity_timeout(
+            inactivity_timeout_s if inactivity_timeout_s is not None else timeout
+        ),
+        max_wall_s=_resolve_max_wall(max_wall_s),
     )
     if interrupted:
         result["interrupted_previous_prompt"] = True
@@ -827,6 +919,8 @@ def _handle_cursor_start(args: Dict[str, Any], **kwargs: Any) -> str:
         repo=args.get("repo"),
         model=args.get("model"),
         session_id=args.get("session_id"),
+        inactivity_timeout_s=args.get("inactivity_timeout_s"),
+        max_wall_s=args.get("max_wall_s"),
     )
 
 
@@ -834,6 +928,8 @@ def _handle_cursor_send(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_send(
         session_id=args.get("session_id", ""),
         message=args.get("message", ""),
+        inactivity_timeout_s=args.get("inactivity_timeout_s"),
+        max_wall_s=args.get("max_wall_s"),
     )
 
 
