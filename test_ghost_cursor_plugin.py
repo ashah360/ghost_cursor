@@ -1549,6 +1549,29 @@ for line in sys.stdin:
             update({"sessionUpdate": "agent_message_chunk",
                     "content": {"type": "text", "text": "exploring"}})
             sys.exit(1)
+        elif MODE == "slowtool":
+            # One long LOCAL tool call: tool_call starts, then total ACP
+            # silence while the "command" runs for well past the inactivity
+            # threshold, then the terminal update + end_turn.
+            update({"sessionUpdate": "tool_call", "toolCallId": "t-slow",
+                    "title": "`npx tsc --noEmit`", "kind": "execute",
+                    "status": "pending", "rawInput": {"command": "npx tsc --noEmit"}})
+            time.sleep(2.5)
+            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-slow",
+                    "status": "completed",
+                    "rawOutput": {"exitCode": 0, "stdout": "ok", "stderr": ""}})
+            send({"jsonrpc": "2.0", "id": prompt_id,
+                  "result": {"stopReason": "end_turn"}})
+        elif MODE == "toolhang":
+            # A tool call that FINISHES, then true silence: no pending call
+            # remains, so the inactivity watchdog must still fire.
+            update({"sessionUpdate": "tool_call", "toolCallId": "t-done",
+                    "title": "`ls`", "kind": "execute", "status": "pending",
+                    "rawInput": {"command": "ls"}})
+            update({"sessionUpdate": "tool_call_update", "toolCallId": "t-done",
+                    "status": "completed",
+                    "rawOutput": {"exitCode": 0, "stdout": "", "stderr": ""}})
+            # then hang: keep reading, never resolve the prompt
         elif MODE in ("happy", "load", "loadfail"):
             update({"sessionUpdate": "tool_call", "toolCallId": "t1",
                     "title": "Edit File", "kind": "edit", "status": "pending",
@@ -1636,6 +1659,47 @@ class TestAcpRunner:
         assert elapsed > 1.5, "run finished before the old wall limit — inconclusive"
         assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
         assert not any(k == "acp.error" for k, _ in events)
+
+    def test_pending_tool_call_suspends_the_inactivity_watchdog(
+        self, tmp_path, monkeypatch
+    ):
+        """Live repro (`run.failed: ACP run timed out: no activity for
+        600s` while cursor waited on a 10–25 min local typecheck): a run
+        that is silent because ONE tool call is still in flight is busy,
+        not hung — it must survive well past the inactivity threshold and
+        complete normally once the call finishes."""
+        _install_fake_acp(tmp_path, monkeypatch, "slowtool")
+        t0 = time.monotonic()
+        # Tool-call silence is ~2.5s against a 1s inactivity threshold.
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.0,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert elapsed > 2.0, "tool call finished before the threshold — inconclusive"
+        assert not any(k == "acp.error" for k, _ in events)
+        assert events[-1] == ("acp.result", {"stopReason": "end_turn"})
+        finished = [o for k, o in events if k == "acp.update"
+                    and o.get("sessionUpdate") == "tool_call_update"
+                    and o.get("status") == "completed"]
+        assert finished, "the pending tool call never completed in the replay"
+
+    def test_true_silence_after_a_finished_tool_call_still_times_out(
+        self, tmp_path, monkeypatch
+    ):
+        """The suspension is scoped to IN-FLIGHT calls only: once the tool
+        call completes and real silence follows, the existing inactivity
+        semantics still kill the run."""
+        _install_fake_acp(tmp_path, monkeypatch, "toolhang")
+        monkeypatch.setattr(gc_acp, "CANCEL_GRACE_S", 1.0)
+        t0 = time.monotonic()
+        events = list(gc_acp.run_acp("do it", str(tmp_path),
+                                     inactivity_timeout_s=1.0,
+                                     cancel_check=lambda: False))
+        elapsed = time.monotonic() - t0
+        assert events[-1][0] == "acp.error"
+        assert events[-1][1]["timeout"] is True
+        assert "no activity for 1s" in events[-1][1]["error"]
+        assert elapsed < 20, f"timeout kill did not tear down ({elapsed:.1f}s)"
 
     def test_max_wall_ceiling_kills_a_runaway_stream(self, tmp_path, monkeypatch):
         """A run that streams forever never trips the inactivity watchdog —
