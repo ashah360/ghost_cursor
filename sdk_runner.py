@@ -21,6 +21,11 @@ Yielded event tuples (consumed by ``events.SdkNormalizer``):
   dropped while the run stayed alive and was transparently re-attached via
   ``run.observe(after_offset=<last offset>)``. Lifecycle/log signal only:
   the user sees nothing, no synthetic messages, no re-prompt.
+* ``("sdk.bridge_died", {"workspace": ..., "detail": ...})`` — the bridge
+  sidecar died mid-run (kill -9 / crash; issue #11). Emitted the moment
+  the death is detected so the event log shows it immediately, then the
+  cached bridge client is invalidated and a typed ``sdk.error`` follows
+  within the same second — no silent multi-minute retry loop.
 * ``("sdk.model_warning", {"warning": ..., "requested": ..., "using":
   ...})`` — the requested model string was unparseable and DEFAULT_MODEL
   was substituted (see :func:`translate_model`). Yielded before any run
@@ -130,6 +135,17 @@ API_KEY_ENV = "CURSOR_API_KEY"
 
 class SdkRunnerError(HarnessError):
     """Hard SDK failure before the run started — no run happened."""
+
+
+class BridgeDiedError(Exception):
+    """The workspace's bridge sidecar died mid-run (kill -9 / crash).
+
+    Internal to the worker: raised where the death is detected (stream
+    drop / terminal "error" with an unreachable bridge) and translated
+    into a typed ``sdk.error`` + cache invalidation in one place
+    (``_SdkWorker._fail_bridge_died``) instead of spinning the re-attach
+    or auto-retry loops against a dead process (issue #11).
+    """
 
 
 def sdk_available() -> bool:
@@ -314,7 +330,15 @@ def _bridge_alive(client: Any) -> bool:
     raised by the client is.
     """
     try:
-        process = getattr(client, "process", None) or getattr(client, "_process", None)
+        process = (
+            getattr(client, "process", None)
+            or getattr(client, "_process", None)
+            # The real CursorClient keeps the bridge subprocess on its
+            # owned Bridge handle (client._owned_bridge.process) — probing
+            # only .process/._process never detected a kill -9'd sidecar
+            # by process liveness (issue #11).
+            or getattr(getattr(client, "_owned_bridge", None), "process", None)
+        )
         poll = getattr(process, "poll", None)
         if callable(poll) and poll() is not None:
             return False  # the sidecar process has exited
@@ -450,6 +474,28 @@ def recycle_bridge(workspace: str) -> bool:
             "cursor-sdk bridge relaunch after recycle failed for %s",
             key, exc_info=True,
         )
+    return True
+
+
+def invalidate_bridge(workspace: str, client: Optional[Any] = None) -> bool:
+    """Drop (and close) the cached bridge client for ``workspace`` after a
+    detected bridge death — WITHOUT the eager relaunch ``recycle_bridge``
+    does: the next send's ``get_bridge`` launches a fresh bridge, so every
+    existing session on the repo recovers exactly like a fresh one
+    (issue #11: the dead client used to stay cached and poison all
+    subsequent sends for the workspace). When ``client`` is given, only
+    that exact client is invalidated — a replacement someone else already
+    swapped in is kept. Returns True when a cached client was dropped.
+    """
+    key = str(workspace)
+    with _bridges_lock:
+        cached = _bridges.get(key)
+        if cached is None or (client is not None and cached is not client):
+            return False
+        del _bridges[key]
+        _bridge_launched_at.pop(key, None)
+        _drop_agents_for_workspace_locked(key)
+    _close_client(cached)
     return True
 
 
@@ -674,6 +720,7 @@ class _SdkWorker:
         self._pending_tool_calls: set = set()
 
         self._run: Optional[Any] = None
+        self._client: Optional[Any] = None
         self._settled = False
 
     # -- plumbing ----------------------------------------------------------
@@ -699,6 +746,36 @@ class _SdkWorker:
     def _timeout_error(self) -> Dict[str, Any]:
         detail = self.abort_detail or "watchdog abort"
         return {"error": f"cursor run timed out: {detail}", "timeout": True}
+
+    def _fail_bridge_died(self, detail: str) -> None:
+        """Settle the run as a typed bridge-death failure (issue #11).
+
+        In order: a visible lifecycle event the instant the death is known
+        (so the event log never shows a plain healthy "running" while the
+        bridge is gone), then the cached client is invalidated (the next
+        send on ANY session for this repo launches a fresh bridge), then
+        the typed error. No ``run_status`` on the error — the
+        zero-progress auto-retry must never spin against a dead bridge.
+        """
+        workspace = str(self._workdir)
+        self._put("sdk.bridge_died", {"workspace": workspace, "detail": detail})
+        invalidated = invalidate_bridge(workspace, self._client)
+        logger.warning(
+            "cursor-sdk bridge for %s died mid-run (%s) — cached client %s",
+            workspace, detail,
+            "invalidated" if invalidated else "already replaced",
+        )
+        self._put(
+            "sdk.error",
+            {
+                "error": (
+                    f"cursor-sdk bridge for {workspace} died mid-run; the "
+                    "run was lost — a fresh bridge will be started on the "
+                    "next send"
+                ),
+                "bridge_died": True,
+            },
+        )
 
     # -- agent establishment -------------------------------------------------
 
@@ -811,6 +888,14 @@ class _SdkWorker:
                     return  # cancel racing the stream teardown — settled below
                 if _run_status(run) in _TERMINAL_RUN_STATUSES:
                     return  # run is over; the stream just died reporting it
+                # A dropped stream from a DEAD bridge is unrecoverable:
+                # fail fast and typed instead of silently sleeping through
+                # the observe re-attach budget against it (issue #11).
+                if not _bridge_alive(self._client):
+                    raise BridgeDiedError(
+                        f"stream dropped ({type(exc).__name__}: {exc}) and "
+                        "the bridge no longer answers"
+                    ) from exc
                 logger.warning(
                     "cursor-sdk event stream dropped (%s: %s) — re-attaching "
                     "via observe(after_offset=%r)",
@@ -831,7 +916,15 @@ class _SdkWorker:
                     try:
                         stream = iter(run.observe(after_offset=last_offset))
                         break
-                    except Exception:
+                    except Exception as observe_exc:
+                        # A bridge that dies DURING the re-attach window
+                        # exits here instead of draining the budget.
+                        if not _bridge_alive(self._client):
+                            raise BridgeDiedError(
+                                "re-attach failed "
+                                f"({type(observe_exc).__name__}: {observe_exc}) "
+                                "and the bridge no longer answers"
+                            ) from observe_exc
                         logger.debug("observe re-attach failed", exc_info=True)
                 self._put(
                     "sdk.reattached",
@@ -869,6 +962,7 @@ class _SdkWorker:
                     },
                 )
                 return
+            self._client = client
 
             try:
                 agent, resumed, from_cache = self._establish_agent(client)
@@ -921,6 +1015,14 @@ class _SdkWorker:
                 self._settled = True
                 if self.abort_reason == "timeout":
                     self._put("sdk.error", self._timeout_error())
+                elif status == "error" and not _bridge_alive(client):
+                    # The run "errored" because its bridge died under it —
+                    # typed fast failure; never mine detail off (an RPC
+                    # against) a dead bridge, never auto-retry into it.
+                    self._fail_bridge_died(
+                        "run settled with status 'error' and the bridge "
+                        "no longer answers"
+                    )
                 elif status == "error":
                     # Terminal "error": surface the typed detail instead of
                     # a bare status so downstream renders more than
@@ -938,6 +1040,14 @@ class _SdkWorker:
                     )
                 else:
                     self._put("sdk.result", {"status": status})
+            except BridgeDiedError as exc:
+                self._settled = True
+                if self.abort_reason == "timeout":
+                    self._put("sdk.error", self._timeout_error())
+                elif self.abort_reason == "cancel":
+                    self._put("sdk.result", {"status": "cancelled"})
+                else:
+                    self._fail_bridge_died(str(exc))
             except Exception as exc:
                 self._settled = True
                 if self.abort_reason == "timeout":

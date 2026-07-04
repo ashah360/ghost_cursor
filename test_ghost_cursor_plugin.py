@@ -4374,6 +4374,172 @@ class TestBridgeHealthGuard:
         assert gc_sdk._bridge_max_age_s() == gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S
 
 
+class _MortalClient(_FakeClient):
+    """A fake bridge client with a kill switch: healthy until ``dead`` is
+    flipped (the scripted kill -9), then every probe fails."""
+
+    def __init__(self, agent, **kw):
+        super().__init__(agent, **kw)
+        self.dead = False
+        self.closed = False
+
+    def ping(self):
+        if self.dead:
+            raise ConnectionError("connection refused")
+
+    def close(self):
+        self.closed = True
+
+
+class TestBridgeDeathRecovery:
+    """Issue #11 (live adversarial testing 2026-07-04): kill -9 on the
+    bridge sidecar left the in-flight run silently retrying a dead bridge
+    for ~2 minutes while reporting 'running', and the dead client stayed
+    cached — poisoning every subsequent send on that repo. Bridge death
+    must fail the run FAST with a typed error, land a visible event in
+    the log, and invalidate the cached client so the next send on any
+    session for the repo gets a fresh bridge."""
+
+    def _dying_setup(self, tmp_path):
+        """A client + run where a kill -9 lands mid-stream: two events
+        flow, then the bridge dies and the stream drops."""
+        run = _FakeRun([])
+        agent = _FakeAgent(runs=[run])
+        client = _MortalClient(agent)
+
+        def kill():
+            client.dead = True  # the scripted kill -9
+
+        run._stream._script[:] = [
+            _sdk_msg(type="thinking", text="before the kill"),
+            kill,
+            ConnectionError("peer closed connection"),
+            _sdk_msg(type="thinking", text="never delivered"),
+        ]
+        return client, run
+
+    def test_bridge_death_mid_run_fails_fast_with_typed_error(
+        self, tmp_path, monkeypatch
+    ):
+        """The dead bridge is detected at the FIRST stream drop: no silent
+        observe re-attach budget, no minutes of backoff — a typed
+        bridge-death error within seconds, preceded by a visible
+        sdk.bridge_died event."""
+        monkeypatch.setattr(gc_sdk, "_REATTACH_BACKOFF_S", 0.0)
+        client, run = self._dying_setup(tmp_path)
+        _install_fake_sdk(monkeypatch, client)
+
+        started = time.monotonic()
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert time.monotonic() - started < 5.0, (
+            "bridge death must fail fast, not retry for minutes"
+        )
+        # Never tried to re-attach to (or auto-retry against) a dead bridge.
+        assert run.observe_calls == []
+
+        keys = [k for k, _ in events]
+        assert "sdk.bridge_died" in keys, "no visible bridge-death event"
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["bridge_died"] is True
+        assert "died mid-run" in obj["error"]
+        assert "fresh bridge will be started on the next send" in obj["error"]
+        # The typed failure must not look like a retryable server error to
+        # the zero-progress auto-retry (no run_status="error").
+        assert obj.get("run_status") is None
+        # The death event precedes the error and names the workspace.
+        died = [o for k, o in events if k == "sdk.bridge_died"][0]
+        assert died["workspace"] == str(gc_runner.resolve_repo(str(tmp_path)))
+        assert keys.index("sdk.bridge_died") < keys.index("sdk.error")
+
+    def test_bridge_death_invalidates_cache_and_next_send_gets_fresh_bridge(
+        self, tmp_path, monkeypatch
+    ):
+        """After the mid-run death the cached client (and its agent
+        handles) are gone, and the next send on the SAME session resumes
+        through a freshly launched bridge and succeeds — existing sessions
+        recover exactly like a fresh one. NO get_bridge monkeypatch: the
+        real cache/invalidation plumbing is exercised."""
+        monkeypatch.setattr(gc_sdk, "_REATTACH_BACKOFF_S", 0.0)
+        workspace = str(gc_runner.resolve_repo(str(tmp_path)))
+        killed, _run = self._dying_setup(tmp_path)
+
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "_bridges", {workspace: killed})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {workspace: time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+
+        fresh = _FakeClient(_FakeAgent(runs=[_FakeRun(_happy_script())]))
+        fresh.ping = lambda: None
+        launches = []
+        import sys as _sys
+
+        def fake_launch_bridge(workspace=None, **kw):
+            launches.append(fresh)
+            return fresh
+
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        ))
+
+        first = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert first[-1][0] == "sdk.error"
+        assert first[-1][1]["bridge_died"] is True
+        # The dead client was invalidated and closed — NOT left cached to
+        # poison the workspace's next sends...
+        assert workspace not in gc_sdk._bridges
+        assert killed.closed is True
+        # ...and its cached agent handle went with it.
+        assert gc_sdk.get_cached_agent(workspace, "agent-fake-1") is None
+        # No eager relaunch on death: the NEXT send launches the bridge.
+        assert launches == []
+
+        second = list(gc_sdk.run_sdk(
+            "follow up", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-fake-1",
+        ))
+        assert launches == [fresh]
+        # The existing session reattached via resume on the fresh bridge
+        # and the send completed.
+        assert [c["agent_id"] for c in fresh.agents.resume_calls] == [
+            "agent-fake-1"
+        ]
+        assert second[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_bridge_death_event_normalizes_to_visible_lifecycle(self):
+        """The sdk.bridge_died event lands in the JSONL log as a lifecycle
+        envelope (status 'recent' lines show it), and the typed sdk.error
+        carries the bridge_died marker into run.failed."""
+        normalizer = gc_events.SdkNormalizer()
+        died = normalizer.normalize(
+            "sdk.bridge_died", {"workspace": "/w", "detail": "stream dropped"}
+        )
+        assert died == [{
+            "source": "ghost", "kind": "lifecycle", "event": "bridge.died",
+            "workspace": "/w", "detail": "stream dropped",
+        }]
+
+        failed = normalizer.normalize("sdk.error", {
+            "error": "cursor-sdk bridge for /w died mid-run; the run was "
+                     "lost — a fresh bridge will be started on the next send",
+            "bridge_died": True,
+        })
+        assert len(failed) == 1
+        assert failed[0]["event"] == "run.failed"
+        assert failed[0]["bridge_died"] is True
+        assert "died mid-run" in failed[0]["error"]
+
+
 def _typed_sdk_error(name, message, is_retryable=None, retry_after=None):
     """An exception duck-typing the CursorAgentError surface, with a
     controllable type name (the payload renders '<TypeName>: <message>')."""
