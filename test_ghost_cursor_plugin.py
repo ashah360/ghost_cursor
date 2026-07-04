@@ -1955,6 +1955,149 @@ class TestProgressSubscriptions:
 
 
 # ---------------------------------------------------------------------------
+# Digest flood guards — interval floor + single ticker chain (issue #10)
+# ---------------------------------------------------------------------------
+
+class TestDigestFloodGuards:
+    """Issue #10 (live incident 2026-07-04): ~2,600 digests delivered in a
+    6s run at update_interval_s=1, aggravated by interrupt-and-reprompt
+    stacking digest loops. Two guarantees close it: interval_s is a HARD
+    FLOOR between enqueued digests no matter what fires the tick, and a
+    session can never have more than one live ticker chain — a stale
+    chain tears itself down on its next fire."""
+
+    def _held_run(self, monkeypatch, tmp_path, sid="agent-flood", **send_kw):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(cursor_send_message(name, "task", **send_kw))
+        return name, _job_for(sid), release
+
+    def test_interval_is_hard_floor_regardless_of_tick_source(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Fire the delivery path 50 times back-to-back (what the stacked
+        chains of the incident did): exactly ONE digest may pass per
+        interval window, and the dropped ticks consume neither the digest
+        numbering nor the events-since-last-tick cursor."""
+        # 30s interval: the real timer never fires in-test, so every tick
+        # here is driven manually.
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=30
+        )
+        try:
+            ticker = gc_progress._tickers[name]
+            ticker._deliver()  # digest 1 — no floor yet
+            seq_after_first = ticker.last_seq
+            for _ in range(50):  # the flood
+                ticker._deliver()
+            digests = _digest_events(_drain_completion_queue())
+            assert len(digests) == 1, (
+                f"interval floor not enforced: {len(digests)} digests"
+            )
+            assert digests[0]["cursor_progress_update"] == 1
+            assert ticker.last_seq == seq_after_first
+
+            # Once the window elapses (rewind the floor clock instead of
+            # sleeping 30s) delivery resumes with NO numbering gap — the
+            # dropped ticks never consumed counters.
+            with gc_progress._lock:
+                gc_progress._last_emit[name] -= 30
+            ticker._deliver()
+            resumed = _digest_events(_drain_completion_queue())
+            assert [d["cursor_progress_update"] for d in resumed] == [2]
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_floor_persists_across_interrupt_and_reprompt(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The incident's aggravator: each re-prompt reset the digest loop.
+        The floor is keyed by session (like the numbering), so the NEW
+        run's first tick inside the previous digest's window is dropped."""
+        release1, release2 = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="agent-fl-ir"),
+            _gated_replay_factory(release2, sid="agent-fl-ir"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(
+            cursor_send_message(name, "task", update_interval_s=30)
+        )
+        gc_progress._tickers[name]._deliver()  # digest 1 on run 1
+
+        ack = cursor_send_message(name, "follow-up")
+        _assert_running_ack(ack)
+        assert "interrupted" in ack
+        job2 = _job_for("agent-fl-ir")
+        try:
+            _drain_completion_queue()  # digest 1 (run 1's cancel is in-turn)
+            ticker2 = gc_progress._tickers[name]
+            assert ticker2.job is job2
+            ticker2._deliver()  # inside digest 1's 30s window → dropped
+            assert _digest_events(_drain_completion_queue()) == [], (
+                "re-prompt reset the interval floor"
+            )
+        finally:
+            release1.set()
+            release2.set()
+            assert job2.done_event.wait(10)
+
+    def test_reprompt_swaps_ticker_and_stale_chain_tears_down(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Re-prompting must not stack digest loops: the old run's ticker
+        is cancelled at settle, only ONE ticker stays registered, and a
+        stray un-registered chain (the pre-fix stacking) cancels itself on
+        its next fire without delivering anything."""
+        release1, release2 = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="agent-fl-stack"),
+            _gated_replay_factory(release2, sid="agent-fl-stack"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(
+            cursor_send_message(name, "task", update_interval_s=30)
+        )
+        old = gc_progress._tickers[name]
+
+        ack = cursor_send_message(name, "follow-up")
+        _assert_running_ack(ack)
+        assert "interrupted" in ack
+        job2 = _job_for("agent-fl-stack")
+        try:
+            new = gc_progress._tickers[name]
+            assert new is not old
+            assert new.job is job2
+            # The interrupted run's chain is dead, not merely replaced.
+            assert old._cancelled
+            assert old._timer is None
+
+            # A stale duplicate chain (what stacked pre-fix) fires once,
+            # notices it is not the registered ticker, and tears itself
+            # down without delivering.
+            rogue = gc_progress._Ticker(job2, 0.01)
+            rogue.start()
+            assert _wait_until(lambda: rogue._cancelled, timeout=5), (
+                "stale digest chain kept running"
+            )
+            assert rogue._timer is None
+            assert gc_progress._tickers[name] is new
+            # Nothing reached the queue: the rogue self-terminated and the
+            # legit 30s ticker never came due.
+            assert _digest_events(_drain_completion_queue()) == []
+        finally:
+            release1.set()
+            release2.set()
+            assert job2.done_event.wait(10)
+
+
+# ---------------------------------------------------------------------------
 # Zero-progress auto-retry — stale-bridge recovery (live incident 2026-07-04)
 # ---------------------------------------------------------------------------
 
