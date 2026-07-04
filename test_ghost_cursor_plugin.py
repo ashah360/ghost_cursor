@@ -3869,6 +3869,192 @@ class TestSdkRunner:
         assert obj["run_status"] == "error"
 
 
+class TestBridgeHealthGuard:
+    """get_bridge's send-time staleness guard: a cached client that fails
+    the cheap health probe, or is older than the configured max age, is
+    recycled (closed + relaunched) BEFORE dispatch instead of letting the
+    run fail through a dead/stale sidecar."""
+
+    def _fake_launcher(self, monkeypatch, factory):
+        """Install a fake cursor_sdk module whose launch_bridge calls
+        ``factory`` and record every launch."""
+        import sys as _sys
+
+        launches = []
+
+        def fake_launch_bridge(workspace=None, **kw):
+            client = factory(workspace)
+            launches.append(client)
+            return client
+
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        ))
+        return launches
+
+    def test_failed_probe_recycles_then_dispatch_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end through run_sdk with NO get_bridge monkeypatch: the
+        cached client's probe raises, so it is recycled and the run
+        dispatches through the fresh client instead of failing."""
+
+        class _DeadClient:
+            closed = False
+
+            def ping(self):
+                raise ConnectionError("bridge gone")
+
+            def close(self):
+                self.closed = True
+
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        fresh = _FakeClient(agent)
+        fresh.ping = lambda: None
+        dead = _DeadClient()
+        workspace = str(gc_runner.resolve_repo(str(tmp_path)))
+
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "_bridges", {workspace: dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {workspace: time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(monkeypatch, lambda ws: fresh)
+
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert dead.closed is True
+        assert launches == [fresh]
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_fresh_healthy_bridge_is_not_recycled(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        pings = []
+        client.ping = lambda: pings.append(1)
+        workspace = str(gc_runner.resolve_repo(str(tmp_path)))
+
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "_bridges", {workspace: client})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {workspace: time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(monkeypatch, lambda ws: pytest.fail(
+            "healthy fresh bridge must not be relaunched"
+        ))
+
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert pings, "the cached client was never probed"
+        assert launches == []
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_list_probe_failure_marks_the_bridge_dead(self, monkeypatch):
+        """No ping() on the client: the short-timeout agents.list probe is
+        the health signal, and its hard failure recycles the bridge."""
+
+        class _ListDeadClient:
+            closed = False
+
+            def __init__(self):
+                self.agents = SimpleNamespace(
+                    list=lambda **kw: (_ for _ in ()).throw(
+                        ConnectionError("connection refused")
+                    )
+                )
+
+            def close(self):
+                self.closed = True
+
+        dead = _ListDeadClient()
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {"/repo/a": time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(
+            monkeypatch, lambda ws: SimpleNamespace(ws=ws)
+        )
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert dead.closed is True
+        assert launches == [got]
+
+    def test_dead_sidecar_process_marks_the_bridge_dead(self, monkeypatch):
+        """A client whose bridge subprocess has exited fails the probe even
+        if nothing raises on the HTTP surface."""
+        dead = SimpleNamespace(
+            process=SimpleNamespace(poll=lambda: 1),  # exited, code 1
+            ping=lambda: None,
+        )
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {"/repo/a": time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(
+            monkeypatch, lambda ws: SimpleNamespace(ws=ws)
+        )
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert launches == [got]
+
+    def test_bridge_older_than_max_age_is_recycled_at_send(self, monkeypatch):
+        closed = []
+
+        class _Client:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def ping(self):
+                pass  # perfectly healthy — age alone recycles it
+
+            def close(self):
+                closed.append(self.tag)
+
+        old = _Client("old")
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": old})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at",
+            {"/repo/a": time.monotonic() - 10.0},
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_max_age_s", lambda: 5.0)
+        launches = self._fake_launcher(monkeypatch, lambda ws: _Client("fresh"))
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert closed == ["old"]
+        assert launches == [got]
+        assert got.tag == "fresh"
+
+    def test_bridge_younger_than_max_age_is_kept(self, monkeypatch):
+        client = SimpleNamespace(ping=lambda: None)
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": client})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at",
+            {"/repo/a": time.monotonic() - 1.0},
+        )
+        monkeypatch.setattr(gc_sdk, "_bridge_max_age_s", lambda: 5.0)
+        launches = self._fake_launcher(monkeypatch, lambda ws: pytest.fail(
+            "young healthy bridge must not be relaunched"
+        ))
+        assert gc_sdk.get_bridge("/repo/a") is client
+        assert launches == []
+
+    def test_max_age_default_is_four_hours_and_configurable(self, monkeypatch):
+        assert gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S == 4 * 3600.0
+        # No config readable in tests → the default.
+        assert gc_sdk._bridge_max_age_s() == gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S
+
+
 def _typed_sdk_error(name, message, is_retryable=None, retry_after=None):
     """An exception duck-typing the CursorAgentError surface, with a
     controllable type name (the payload renders '<TypeName>: <message>')."""

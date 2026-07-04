@@ -57,7 +57,12 @@ bounded backoff driven by the SDK's typed errors (``is_retryable`` +
 Bridge lifecycle: ONE bridge sidecar per workspace
 (``CursorClient.launch_bridge(workspace=repo)``), cached and reused across
 sessions on the same repo; :func:`shutdown_bridges` closes them all on
-plugin unload. Bridge state root stays at the SDK default.
+plugin unload. Bridge state root stays at the SDK default. At send time
+:func:`get_bridge` recycles a cached bridge that fails a cheap health
+probe or is older than ``plugins.ghost_cursor.bridge_max_age_s`` (default
+4h); :func:`recycle_bridge` is the explicit lever the zero-progress
+auto-retry pulls (stale long-lived bridges silently fail every run — live
+incident 2026-07-04).
 
 Threading model: Hermes tool handlers run in ordinary worker threads, so the
 blocking SDK stream loop runs in a dedicated background thread and hands
@@ -273,12 +278,67 @@ _bridges_lock = threading.Lock()
 _BRIDGE_SURVIVE_ENV = "CURSOR_SDK_BRIDGE_SURVIVE_UNCAUGHT"
 
 
-def _bridge_alive(client: Any) -> bool:
-    """Best-effort liveness probe for a cached bridge client."""
+# Health/staleness guard for cached bridges, applied at send time by
+# get_bridge. The probe is cheap and short-fused; the max age bounds how
+# long any one bridge process lives (live incident 2026-07-04: hours-old
+# bridges silently failed every run while fresh ones worked — see
+# recycle_bridge). Configurable via plugins.ghost_cursor.bridge_max_age_s
+# in config.yaml; 0 disables age-based recycling.
+_BRIDGE_PROBE_TIMEOUT_S = 5.0
+DEFAULT_BRIDGE_MAX_AGE_S = 4 * 3600.0
+
+
+def _bridge_max_age_s() -> float:
+    """The configured bridge max age (seconds), 0 = never age out."""
     try:
+        from hermes_cli.config import cfg_get, read_raw_config
+
+        val = cfg_get(
+            read_raw_config(), "plugins", "ghost_cursor", "bridge_max_age_s"
+        )
+        if val is not None:
+            return float(val)
+    except Exception:
+        pass
+    return DEFAULT_BRIDGE_MAX_AGE_S
+
+
+def _bridge_alive(client: Any) -> bool:
+    """Best-effort liveness probe for a cached bridge client.
+
+    Cheapest signals first: a dead sidecar process is dead regardless of
+    what the HTTP layer says; then a ``ping()`` when the client has one;
+    then a short-timeout ``agents.list`` round-trip (the documented cheap
+    read). Signature mismatches on the probe call (TypeError) are NOT
+    evidence of a dead bridge and never fail the probe; anything else
+    raised by the client is.
+    """
+    try:
+        process = getattr(client, "process", None) or getattr(client, "_process", None)
+        poll = getattr(process, "poll", None)
+        if callable(poll) and poll() is not None:
+            return False  # the sidecar process has exited
+
         ping = getattr(client, "ping", None)
         if callable(ping):
             ping()
+            return True
+
+        probe = client
+        with_options = getattr(client, "with_options", None)
+        if callable(with_options):
+            try:
+                probe = with_options(
+                    timeout=_BRIDGE_PROBE_TIMEOUT_S, max_retries=0
+                )
+            except Exception:
+                probe = client
+        lister = getattr(getattr(probe, "agents", None), "list", None)
+        if callable(lister):
+            try:
+                lister(runtime="local")
+            except TypeError:
+                pass  # unknown probe signature — not evidence of death
         return True
     except Exception:
         return False
@@ -289,20 +349,31 @@ def get_bridge(workspace: str) -> Any:
 
     Launches ``CursorClient.launch_bridge(workspace=...)`` on first use and
     reuses the client for every later session on the same repo. A cached
-    bridge that stopped answering (crashed sidecar) is closed and
-    relaunched — its cached agent handles are dropped with it, so the next
-    run resumes from the bridge's on-disk state instead of sending into a
-    dead process forever. Tests monkeypatch this function with a fake
-    client factory.
+    bridge is recycled at send time when it fails the cheap health probe
+    (crashed/hung sidecar) OR when it is older than the configured max age
+    (stale long-lived bridges silently fail runs — live incident
+    2026-07-04): the client is closed, its cached agent handles dropped
+    with it, and a fresh bridge launched, so the next run resumes from the
+    bridge's on-disk state instead of sending into a dead process forever.
+    Tests monkeypatch this function with a fake client factory.
     """
     key = str(workspace)
     with _bridges_lock:
         client = _bridges.get(key)
+        launched_at = _bridge_launched_at.get(key)
     if client is not None:
-        if _bridge_alive(client):
+        max_age = _bridge_max_age_s()
+        expired = (
+            max_age > 0
+            and launched_at is not None
+            and time.monotonic() - launched_at >= max_age
+        )
+        if not expired and _bridge_alive(client):
             return client
         logger.warning(
-            "cursor-sdk bridge for %s stopped answering — relaunching", key
+            "cursor-sdk bridge for %s %s — relaunching",
+            key,
+            "exceeded max age" if expired else "stopped answering",
         )
         with _bridges_lock:
             if _bridges.get(key) is client:
