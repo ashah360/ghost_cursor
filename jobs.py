@@ -66,6 +66,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from . import eventlog as _eventlog
 from . import handles as _handles
+from . import progress as _progress
 from . import render as _render
 
 logger = logging.getLogger(__name__)
@@ -161,9 +162,18 @@ class CursorJob:
     # last folded envelope was content, nothing interrupted it since.
     segment_open: bool = False
     reasoning_tail: str = ""
+    # The currently in-flight tool call ("shell `pytest -q`"), set on
+    # tool_use and cleared by its tool_result — feeds the progress-digest
+    # header so a long quiet tool call reads differently from a stall.
+    pending_tool: str = ""
+    pending_tool_since: Optional[float] = None
     progress_buffer: str = ""
     progress_events: int = 0
     run_error: Optional[str] = None
+    # Typed detail riding a terminal-error run.failed (see sdk_runner's
+    # sdk.error payload): None = unknown, not "no".
+    error_retryable: Optional[bool] = None
+    error_retry_after: Optional[str] = None
     timed_out: bool = False
     completed: bool = False
     cancelled: bool = False
@@ -330,6 +340,12 @@ class CursorJob:
                 "files_changed_so_far": files,
                 "files_changed_count": len(files),
                 "latest_reasoning": self.reasoning_tail[-1500:],
+                "pending_tool": self.pending_tool,
+                "pending_tool_s": (
+                    round((self.finished_at or now) - self.pending_tool_since, 1)
+                    if self.pending_tool and self.pending_tool_since is not None
+                    else None
+                ),
                 "progress_tail": self.progress_buffer[-4000:],
                 "progress_events": self.progress_events,
             }
@@ -448,6 +464,12 @@ class CursorJobRegistry:
             job.status = status
             job.finished_at = time.time()
             deliver = job.deliver
+        # Cancel the pending progress-digest timer BEFORE enqueuing the
+        # completion. A tick already in flight re-checks the status under
+        # the job lock (progress._Ticker._deliver), so its digest either
+        # landed on the queue before the flip above or is dropped — a
+        # digest can never follow the completion event.
+        _progress.cancel_for_job(job)
         logger.info("Cursor job %s finished: %s (deliver=%s)", job.job_id, status, deliver)
         # Settle the persistent handle table so the handle stays resolvable
         # (and correctly non-running) across process restarts. Keyed by the
@@ -546,6 +568,8 @@ class CursorJobRegistry:
             error=str(result.get("error") or ""),
             total_events=stats.get("total_events", 0),
             last_prompt_seq=_handles.last_prompt_seq(_handles.get(name)),
+            retryable=result.get("error_retryable"),
+            retry_after=result.get("error_retry_after"),
         )
         return (
             f"{text}\n\nfollow up in this session: "

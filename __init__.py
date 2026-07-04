@@ -1,6 +1,6 @@
 """Ghost ⇄ Cursor delegation plugin — bundled, auto-loaded.
 
-v0.4: explicit named sessions + plain-text tool output. Six tools in the
+v0.4: explicit named sessions + plain-text tool output. Seven tools in the
 ``ghost_cursor`` toolset:
 
 * ``cursor_create_session(repo?, model?)`` — mint a named session handle
@@ -20,6 +20,9 @@ v0.4: explicit named sessions + plain-text tool output. Six tools in the
   tool_use / content / lifecycle); limit clamps at 500.
 * ``cursor_list(scope='session'|'all')`` — TSV listing of session handles,
   scoped to the current Hermes session by default.
+* ``cursor_subscribe(session, interval_s)`` — periodic progress digests
+  while a run is active (see ``progress.py``); ``cursor_send_message``
+  seeds the interval via ``update_interval_s`` (default 180s, 0 off).
 
 (v0.3's ``cursor_start``/``cursor_send`` are gone — create + send replaced
 them outright; pre-launch, no deprecation shim.)
@@ -81,6 +84,7 @@ from . import events as _events
 from . import handles as _handles
 from . import jobs as _jobs
 from . import names as _names
+from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
 from . import sdk_runner as _sdk
@@ -93,6 +97,7 @@ STATUS_TOOL_NAME = "cursor_status"
 STOP_TOOL_NAME = "cursor_stop"
 EVENTS_TOOL_NAME = "cursor_events"
 LIST_TOOL_NAME = "cursor_list"
+SUBSCRIBE_TOOL_NAME = "cursor_subscribe"
 TOOLSET = "ghost_cursor"
 
 # Env var naming is Threshold's (the Ghost frontend), not HERMES_* — it points
@@ -207,6 +212,16 @@ CURSOR_SEND_SCHEMA = {
                     "The coding task or follow-up instruction, e.g. 'add a "
                     "multiply function to calc.py with tests'. Be specific; "
                     "include file names and acceptance criteria when known."
+                ),
+            },
+            "update_interval_s": {
+                "type": "number",
+                "description": (
+                    "Optional. While the run is active, deliver a compact "
+                    "progress digest (status header + new events) as a new "
+                    "message every this-many seconds. Default 180; 0 "
+                    "disables digests. The setting persists on the session "
+                    "(cursor_subscribe changes it mid-run)."
                 ),
             },
             **_TIMEOUT_PROPERTIES,
@@ -325,6 +340,37 @@ CURSOR_LIST_SCHEMA = {
         "required": [],
     },
 }
+
+CURSOR_SUBSCRIBE_SCHEMA = {
+    "name": SUBSCRIBE_TOOL_NAME,
+    "description": (
+        "Change how often a cursor session pushes progress digests while "
+        "a run is active. Each digest arrives as a new message: a "
+        "cursor_status-style header (status, elapsed, last activity, "
+        "files so far, pending tool call) plus the events since the "
+        "previous update. Takes effect on the next tick (sooner if the "
+        "new interval is shorter); interval_s=0 unsubscribes. Works "
+        "whether or not a run is active — the setting persists on the "
+        "session and applies to the next run. Use this to watch a long "
+        "run more closely, or to silence a chatty one; the final result "
+        "is always delivered separately regardless of this setting."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session": {"type": "string", "description": _SESSION_DOC},
+            "interval_s": {
+                "type": "number",
+                "description": (
+                    "Seconds between progress digests. 0 unsubscribes "
+                    "(no digests; completion delivery is unaffected)."
+                ),
+            },
+        },
+        "required": ["session", "interval_s"],
+    },
+}
+
 
 def _default_repo() -> Optional[str]:
     """Resolve the default workspace repo: env var, then terminal cwd."""
@@ -511,8 +557,18 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 else:
                     job.assistant_segments.append([delta])
                     job.segment_open = True
-        elif kind in ("tool_use", "tool_result"):
+        elif kind == "tool_use":
             job.segment_open = False
+            tool = str(envelope.get("tool") or "tool")
+            detail = str(
+                envelope.get("command") or envelope.get("title") or ""
+            ).strip()
+            job.pending_tool = f"{tool} `{detail}`" if detail else tool
+            job.pending_tool_since = time.time()
+        elif kind == "tool_result":
+            job.segment_open = False
+            job.pending_tool = ""
+            job.pending_tool_since = None
         elif kind == "lifecycle":
             event = envelope.get("event")
             if event == "run.completed":
@@ -521,6 +577,10 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 job.run_error = str(envelope.get("error") or "run failed")
                 job.timed_out = job.timed_out or bool(envelope.get("timeout"))
                 job.cancelled = job.cancelled or bool(envelope.get("cancelled"))
+                if "retryable" in envelope:
+                    job.error_retryable = envelope.get("retryable")
+                if "retry_after" in envelope:
+                    job.error_retry_after = envelope.get("retry_after")
             elif event == "reasoning":
                 text = str(envelope.get("text") or "")
                 if text:
@@ -528,23 +588,69 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 job.segment_open = False
 
 
-def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
-    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
+# Transparent zero-progress auto-retry. Live incident (2026-07-04): runs
+# dispatched through a stale, hours-old cursor-sdk-bridge sidecar reached
+# terminal "error" within seconds having produced ZERO meaningful events,
+# while fresh bridges worked — killing the stale bridges fixed everything.
+# A run matching that signature (terminal error + nothing meaningful
+# streamed + retryable-or-unknown) is re-sent on the SAME agent up to
+# _MAX_AUTO_RETRIES times with backoff, recycling the workspace bridge
+# before the first retry. Nothing user-facing: the job stays "running"
+# (digest numbering/subscription continue) and only jsonl lifecycle events
+# ("sdk.autoretry") record it. A run with ANY meaningful progress, a
+# non-retryable error, or an exhausted budget surfaces the detailed
+# failure instead.
+_MAX_AUTO_RETRIES = 2
+# Backoff ladder before retry N (1-based); a parseable server retry_after
+# on the error overrides the step. Module-level so tests can zero it.
+_AUTO_RETRY_BACKOFF_S = (15.0, 60.0)
 
-    Runs on the job worker thread. Cancellation is the job's cancel event
-    (set by cursor_stop / cursor_send_message), which triggers the native
-    ``run.cancel()``. The cursor agent id is persisted onto the session's
-    handle entry (as the alias) the instant the agent exists, so
-    ``Agent.resume`` keeps working across process restarts.
+# Envelope kinds that mean the run actually did something. Reasoning rides
+# a lifecycle envelope, so it is matched by event name; all other
+# session/lifecycle plumbing (run.started, model warnings, usage, task
+# status, stream reattaches) does NOT count as progress.
+_MEANINGFUL_KINDS = ("tool_use", "tool_result", "file_diff", "content")
+
+
+def _is_meaningful(envelope: Dict[str, Any]) -> bool:
+    kind = envelope.get("kind")
+    if kind in _MEANINGFUL_KINDS:
+        return True
+    return kind == "lifecycle" and envelope.get("event") == "reasoning"
+
+
+def _auto_retry_delay_s(state: Dict[str, Any], attempt: int) -> float:
+    """Backoff before auto-retry ``attempt`` (1-based): the server-supplied
+    retry_after when it parses as seconds, else the fixed ladder."""
+    retry_after = state.get("retry_after")
+    if retry_after:
+        try:
+            return max(float(str(retry_after)), 0.0)
+        except (TypeError, ValueError):
+            pass  # HTTP-date form — fall through to the ladder
+    return _AUTO_RETRY_BACKOFF_S[min(attempt - 1, len(_AUTO_RETRY_BACKOFF_S) - 1)]
+
+
+def _run_attempt(job: "_jobs.CursorJob", workdir: str) -> Dict[str, Any]:
+    """One run_sdk pass for ``job``: stream, fold, persist the handle.
+
+    Returns the attempt state the auto-retry decision needs:
+
+    * ``preflight`` — a final result dict when the run never happened
+      (bridge/auth/repo preflight failure); the caller returns it as-is.
+    * ``meaningful`` — True when any tool call / diff / content / reasoning
+      envelope was folded (session/lifecycle events don't count).
+    * ``terminal_error`` (+ ``retryable`` / ``retry_after``) — True when
+      the run settled with SDK status "error" (the enriched ``sdk.error``
+      payload, see sdk_runner).
     """
-    started = time.monotonic()
-    workdir = job.repo
-
-    # Pre-run git snapshot: fuels the fallback that populates files_changed
-    # when cursor edits through paths that emit no parseable diff content
-    # in the stream (e.g. shell commands; tool payloads are unstable).
-    git_before = _sdk.git_status_snapshot(workdir)
-
+    state: Dict[str, Any] = {
+        "preflight": None,
+        "meaningful": False,
+        "terminal_error": False,
+        "retryable": None,
+        "retry_after": None,
+    }
     normalizer = _events.SdkNormalizer()
     try:
         for key, obj in _sdk.run_sdk(
@@ -553,7 +659,9 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
             inactivity_timeout_s=float(job.inactivity_timeout_s),
             max_wall_s=float(job.max_wall_s),
             cancel_check=job.cancel_event.is_set,
-            agent_id=job.requested_session_id,
+            # A retry re-sends on the SAME agent established by the first
+            # attempt (its state survives the bridge recycle on disk).
+            agent_id=job.cursor_session_id or job.requested_session_id,
             model=job.requested_model,
         ):
             job.last_event_at = time.time()
@@ -575,18 +683,87 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
                     cursor_session_id=sid,
                 )
                 job.session_event.set()
+            elif key == "sdk.error" and obj.get("run_status") == "error":
+                state["terminal_error"] = True
+                state["retryable"] = obj.get("retryable")
+                state["retry_after"] = obj.get("retry_after")
             for envelope in normalizer.normalize(key, obj):
+                if not state["meaningful"] and _is_meaningful(envelope):
+                    state["meaningful"] = True
                 _fold_envelope(job, envelope)
     except _sdk.SdkRunnerError as exc:
         # Hard SDK failure (bridge/create/auth) — actionable error, no
         # silent regress.
-        return {"success": False, "error": str(exc)}
+        state["preflight"] = {"success": False, "error": str(exc)}
     except _runner.HarnessError as exc:
-        return {"success": False, "error": str(exc)}
+        state["preflight"] = {"success": False, "error": str(exc)}
     except Exception as exc:
         logger.exception("cursor run failed")
         with job._lock:
             job.run_error = f"{type(exc).__name__}: {exc}"
+    return state
+
+
+def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
+    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
+
+    Runs on the job worker thread. Cancellation is the job's cancel event
+    (set by cursor_stop / cursor_send_message), which triggers the native
+    ``run.cancel()``. The cursor agent id is persisted onto the session's
+    handle entry (as the alias) the instant the agent exists, so
+    ``Agent.resume`` keeps working across process restarts. Zero-progress
+    terminal errors are transparently retried on the same agent (see
+    _MAX_AUTO_RETRIES above) with a bridge recycle before the first retry.
+    """
+    started = time.monotonic()
+    workdir = job.repo
+
+    # Pre-run git snapshot: fuels the fallback that populates files_changed
+    # when cursor edits through paths that emit no parseable diff content
+    # in the stream (e.g. shell commands; tool payloads are unstable).
+    git_before = _sdk.git_status_snapshot(workdir)
+
+    attempt = 0  # auto-retries used so far
+    while True:
+        state = _run_attempt(job, workdir)
+        if state["preflight"] is not None:
+            return state["preflight"]
+        if not (
+            state["terminal_error"]
+            and not state["meaningful"]
+            and state["retryable"] is not False  # retryable or unknown
+            and attempt < _MAX_AUTO_RETRIES
+            and not job.cancel_event.is_set()
+        ):
+            break
+        attempt += 1
+        # The stale-bridge lever (see the incident note above): recycle the
+        # workspace bridge once, before the FIRST retry.
+        bridge_recycled = attempt == 1 and _sdk.recycle_bridge(workdir)
+        with job._lock:
+            reason = (
+                "zero-progress terminal error: "
+                f"{job.run_error or 'unknown error'}"
+            )
+        # Log-only signal (jsonl + rolling buffer) — nothing user-facing.
+        _fold_envelope(job, _events.lifecycle(
+            "sdk.autoretry",
+            attempt=attempt,
+            reason=reason,
+            bridge_recycled=bool(bridge_recycled),
+        ))
+        logger.warning(
+            "ghost_cursor auto-retry %d/%d for job %s (%s; bridge_recycled=%s)",
+            attempt, _MAX_AUTO_RETRIES, job.job_id, reason, bridge_recycled,
+        )
+        if job.cancel_event.wait(_auto_retry_delay_s(state, attempt)):
+            break  # cancelled during backoff — settle with what we have
+        # The retry owns the failure reporting now: clear the previous
+        # attempt's error state so a successful retry builds a clean result.
+        with job._lock:
+            job.run_error = None
+            job.error_retryable = None
+            job.error_retry_after = None
 
     # Git fallback: edits the stream carried no diff for (shell-driven
     # writes, kill-before-diff) still land in files_changed + progress.
@@ -609,6 +786,8 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         prose = job.summary_text()
         completed = job.completed
         run_error = job.run_error
+        error_retryable = job.error_retryable
+        error_retry_after = job.error_retry_after
         timed_out = job.timed_out
         result_session_id = job.cursor_session_id
         resumed = job.resumed
@@ -630,6 +809,10 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
     }
     if run_error:
         result["error"] = run_error
+        if error_retryable is not None:
+            result["error_retryable"] = error_retryable
+        if error_retry_after is not None:
+            result["error_retry_after"] = error_retry_after
         if files_changed:
             result["partial"] = True
     return result
@@ -647,6 +830,7 @@ def _dispatch_run(
     model: Optional[str],
     inactivity_timeout_s: float,
     max_wall_s: float,
+    update_interval_s: float = 0.0,
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -679,10 +863,12 @@ def _dispatch_run(
             "session_id": existing.cursor_session_id,
             "repo": str(workdir),
         }
-    return _await_handle(job)
+    return _await_handle(job, update_interval_s=update_interval_s)
 
 
-def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
+def _await_handle(
+    job: "_jobs.CursorJob", update_interval_s: float = 0.0
+) -> Dict[str, Any]:
     """Block until the run has a session handle (or died trying).
 
     Exactly-once outcome reporting: the job is dispatched with delivery
@@ -720,6 +906,10 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
         # final result in-turn (nothing was enqueued).
         return {**_jobs.trim_result(job.result or {}), "status": job.status}
 
+    # The run is live and its outcome will arrive as a delivered message —
+    # start the progress-digest timer alongside (no-op at interval 0).
+    _progress.start_for_job(job, update_interval_s)
+
     return {
         "success": True,
         "status": "running",
@@ -755,6 +945,7 @@ def _send_to_session(
     message: str,
     inactivity_timeout_s: Optional[float],
     max_wall_s: Optional[float],
+    update_interval_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The shared send path: interrupt a live run if needed, then dispatch.
 
@@ -808,6 +999,11 @@ def _send_to_session(
     prompt_seq = (
         _eventlog.stats(_log_key(name, entry)) or {}
     ).get("total_events", 0)
+    # Subscription at dispatch: explicit param > the session's persisted
+    # setting > the 180s default. Persisted so it survives restarts and
+    # carries over interrupt-and-reprompt (digest numbering continues).
+    interval = _progress.resolve_interval(entry, update_interval_s)
+    _handles.record(name, update_interval_s=interval)
     result = _dispatch_run(
         task=str(message),
         workdir=repo,
@@ -816,6 +1012,7 @@ def _send_to_session(
         model=_resolve_model(entry.get("model")),
         inactivity_timeout_s=_resolve_inactivity_timeout(inactivity_timeout_s),
         max_wall_s=_resolve_max_wall(max_wall_s),
+        update_interval_s=interval,
     )
     result.setdefault("session", name)
     if str(result.get("status") or "") != "rejected":
@@ -917,6 +1114,7 @@ def cursor_send_message(
     message: str,
     inactivity_timeout_s: Optional[float] = None,
     max_wall_s: Optional[float] = None,
+    update_interval_s: Optional[float] = None,
     **_kwargs: Any,
 ) -> str:
     """Send work to a session (first message = the task; later = follow-up,
@@ -933,7 +1131,8 @@ def cursor_send_message(
     entry = _handles.get(name) or {}
 
     result = _send_to_session(
-        name, entry, str(message), inactivity_timeout_s, max_wall_s
+        name, entry, str(message), inactivity_timeout_s, max_wall_s,
+        update_interval_s,
     )
     return _render_send_result(name, result)
 
@@ -964,6 +1163,8 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
             error=str(result.get("error") or ""),
             total_events=(stats or {}).get("total_events", 0),
             last_prompt_seq=_handles.last_prompt_seq(entry),
+            retryable=result.get("error_retryable"),
+            retry_after=result.get("error_retry_after"),
         )
     # Undelivered/unsettled shapes degrade to their error sentence.
     return str(
@@ -1127,6 +1328,26 @@ def cursor_events(
     return _render.events_text(name, page, _handles.last_prompt_seq(entry))
 
 
+def cursor_subscribe(session: str, interval_s: Any = None, **_kwargs: Any) -> str:
+    """Set/change/cancel a session's progress-digest interval (see
+    CURSOR_SUBSCRIBE_SCHEMA). Persists; retunes a live run's timer."""
+    ident = str(session or "").strip()
+    if not ident:
+        return "session is required — pass the name from cursor_create_session."
+    name = _resolve_session(ident)
+    if name is None:
+        return _unknown_session_text(ident)
+    try:
+        interval = float(interval_s)
+    except (TypeError, ValueError):
+        return "interval_s is required — seconds between digests (0 unsubscribes)."
+    if interval < 0:
+        return "interval_s must be >= 0 (0 unsubscribes)."
+
+    _progress.subscribe(name, interval)
+    return _render.subscribe_ack(name, interval)
+
+
 def cursor_list(scope: str = "session", **_kwargs: Any) -> str:
     """TSV listing of session handles (default: this Hermes session's)."""
     scope = scope if scope in _handles.VALID_SCOPES else "session"
@@ -1153,6 +1374,7 @@ def _handle_cursor_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
         message=args.get("message", ""),
         inactivity_timeout_s=args.get("inactivity_timeout_s"),
         max_wall_s=args.get("max_wall_s"),
+        update_interval_s=args.get("update_interval_s"),
     )
 
 
@@ -1180,8 +1402,15 @@ def _handle_cursor_list(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_list(scope=args.get("scope", "session"))
 
 
+def _handle_cursor_subscribe(args: Dict[str, Any], **kwargs: Any) -> str:
+    return cursor_subscribe(
+        session=args.get("session") or args.get("session_id", ""),
+        interval_s=args.get("interval_s"),
+    )
+
+
 def register(ctx) -> None:
-    """Register the 6 cursor tools. Called once by the plugin loader.
+    """Register the 7 cursor tools. Called once by the plugin loader.
 
     Also arranges clean bridge shutdown: the plugin loader has no unload
     hook, so the per-workspace cursor-sdk bridge sidecars are closed at
@@ -1195,6 +1424,7 @@ def register(ctx) -> None:
         (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, _handle_cursor_stop, "🛑"),
         (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, _handle_cursor_events, "📜"),
         (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, _handle_cursor_list, "📋"),
+        (SUBSCRIBE_TOOL_NAME, CURSOR_SUBSCRIBE_SCHEMA, _handle_cursor_subscribe, "🔔"),
     ):
         ctx.register_tool(
             name=name,

@@ -2,7 +2,7 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that lets your agent **delegate coding tasks to the [Cursor](https://cursor.com) agent** — and watch it work in real time.
 
-Registers six session tools that run Cursor agents inside a target repo over the **official [`cursor-sdk`](https://pypi.org/project/cursor-sdk/) python package**, stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
+Registers seven session tools that run Cursor agents inside a target repo over the **official [`cursor-sdk`](https://pypi.org/project/cursor-sdk/) python package**, stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
 
 Because it's an ordinary Hermes tool call inside a real session, the result **persists in the transcript and reloads for free** — and interrupts map to a native `run.cancel()`.
 
@@ -30,6 +30,7 @@ Four explicit tools mirroring Hermes's `terminal`/`process` split. The single ha
 - **`cursor_send(session_id, message, inactivity_timeout_s?, max_wall_s?)`** — steer / follow up. Honest semantics: there is **no true mid-run queue** — this interrupts the current run (`run.cancel()`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
 - **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed, `last_activity_s` (seconds since the last stream event — spot a silent run without touching it). Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
 - **`cursor_stop(session_id)`** — graceful `session/cancel`, SIGKILL only on hang. Returns final status + partial `files_changed`.
+- **`cursor_subscribe(session, interval_s)`** — subscribe to **periodic progress digests** while a run is active: every `interval_s` seconds a compact update (status header + the events since the previous tick) is delivered as a new message on the same rail as run completions. `cursor_send_message` sets the initial interval via `update_interval_s` (default **180**, `0` disables); `cursor_subscribe` changes it mid-run (shorter intervals reschedule the pending tick immediately) or unsubscribes with `interval_s=0`. The setting persists on the session across restarts; the final result is always delivered separately regardless.
 
 Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state (success/fail/error/timeout/cancel), **same-repo concurrency guard** (a second `cursor_start` on a repo with an active handle is rejected — two agents on one tree = corruption; different repos run in parallel), **handle persistence** across turns (a JSON table under `<HERMES_HOME>/state/`), **git-diff fallback** for shell-driven edits, and a **`check_fn`** so the tools only appear when `cursor-agent` is installed.
 
@@ -64,8 +65,8 @@ Verify it registered:
 
 ```bash
 # cursor_create_session / cursor_send_message / cursor_status / cursor_stop /
-# cursor_events / cursor_list should show up as tools once cursor-sdk is
-# importable
+# cursor_events / cursor_list / cursor_subscribe should show up as tools once
+# cursor-sdk is importable
 ```
 
 ## Usage
@@ -153,7 +154,8 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 
 | File | Role |
 |---|---|
-| `__init__.py` | Plugin entry — registers the six tools, resolves the progress callback, builds results |
+| `__init__.py` | Plugin entry — registers the seven tools, resolves the progress callback, builds results |
+| `progress.py` | Progress subscriptions — per-run digest timers, `cursor_subscribe` plumbing, completion-queue delivery guards |
 | `sdk_runner.py` | cursor-sdk transport — bridge lifecycle, Agent create/resume, event streaming, observe() re-attach, bounded retries, watchdogs, native cancel |
 | `events.py` | Canonical envelope builders + `SDKMessage` → envelope mapping |
 | `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |

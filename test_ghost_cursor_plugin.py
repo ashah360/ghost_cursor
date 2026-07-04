@@ -53,11 +53,13 @@ from plugins.ghost_cursor import (
     CURSOR_SEND_SCHEMA,
     CURSOR_STATUS_SCHEMA,
     CURSOR_STOP_SCHEMA,
+    CURSOR_SUBSCRIBE_SCHEMA,
     EVENTS_TOOL_NAME,
     LIST_TOOL_NAME,
     SEND_TOOL_NAME,
     STATUS_TOOL_NAME,
     STOP_TOOL_NAME,
+    SUBSCRIBE_TOOL_NAME,
     TOOLSET,
     _handle_cursor_create_session,
     _handle_cursor_events,
@@ -65,6 +67,7 @@ from plugins.ghost_cursor import (
     _handle_cursor_send_message,
     _handle_cursor_status,
     _handle_cursor_stop,
+    _handle_cursor_subscribe,
     check_cursor_available,
     cursor_create_session,
     cursor_events,
@@ -72,6 +75,7 @@ from plugins.ghost_cursor import (
     cursor_send_message,
     cursor_status,
     cursor_stop,
+    cursor_subscribe,
     register,
 )
 from plugins.ghost_cursor import events as gc_events
@@ -79,6 +83,7 @@ from plugins.ghost_cursor import sdk_runner as gc_sdk
 from plugins.ghost_cursor import handles as gc_handles
 from plugins.ghost_cursor import jobs as gc_jobs
 from plugins.ghost_cursor import names as gc_names
+from plugins.ghost_cursor import progress as gc_progress
 from plugins.ghost_cursor import render as gc_render
 from plugins.ghost_cursor import runner as gc_runner
 
@@ -160,13 +165,15 @@ def _drain_completion_queue():
 @pytest.fixture
 def clean_state(monkeypatch):
     """Fresh job registry + handle table + event-log writer state + drained
-    completion queue."""
+    completion queue + no live progress tickers."""
+    gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
     monkeypatch.setattr(gc_handles, "_table", {})
     monkeypatch.setattr(gc_handles, "_loaded", False)
     gc_eventlog._reset_for_tests()
     yield gc_jobs.registry
+    gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
     gc_eventlog._reset_for_tests()
@@ -1301,16 +1308,19 @@ class TestGitFallback:
 # ---------------------------------------------------------------------------
 
 class TestAllTerminalStatesDeliver:
-    def _run_armed(self, monkeypatch, tmp_path, sid, terminal_event):
+    def _run_armed(self, monkeypatch, tmp_path, sid, terminal_event,
+                   pre_events=()):
         """Dispatch through create + first send so delivery gets armed; the replay
-        emits ``terminal_event`` only after the running handle was returned
-        (deterministic — the run cannot finalize before arming)."""
+        emits ``pre_events`` + ``terminal_event`` only after the running
+        handle was returned (deterministic — the run cannot finalize before
+        arming)."""
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                    cancel_check=None, agent_id=None, model=None):
             yield ("sdk.session", {"agentId": sid, "cwd": str(workdir), "model": "m"})
             release.wait(10)
+            yield from pre_events
             yield terminal_event
 
         monkeypatch.setattr(gc_sdk, "run_sdk", replay)
@@ -1363,6 +1373,53 @@ class TestAllTerminalStatesDeliver:
         assert job.status == "failed"
         assert evt["status"] == "failed"
         assert "boom" in evt["error"]
+
+    def test_terminal_error_detail_reaches_the_completion_summary(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A terminal-error sdk.error with typed detail (retryable /
+        retry_after) renders it on the failure line — not the bare
+        'cursor run ended with status: error'. (The run streamed content
+        first, so the zero-progress auto-retry stays out of the way.)"""
+        job, evt = self._run_armed(
+            monkeypatch, tmp_path, "s-err-detail",
+            ("sdk.error", {
+                "error": "ServerError: upstream 502 from the agent backend",
+                "retryable": True,
+                "retry_after": "30",
+                "run_status": "error",
+            }),
+            pre_events=[_narration_chunk("started digging in")],
+        )
+        assert job.status == "failed"
+        assert evt["error"] == "ServerError: upstream 502 from the agent backend"
+        assert evt["result"]["error_retryable"] is True
+        assert evt["result"]["error_retry_after"] == "30"
+        assert (
+            "run failed: ServerError: upstream 502 from the agent backend "
+            "(retryable, retry after 30s)" in evt["summary"]
+        )
+
+    def test_terminal_error_without_detail_stays_generic(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """No typed detail available: the generic terminal-error text is
+        delivered with NO retry parenthetical (None = unknown, never
+        rendered as 'not retryable')."""
+        job, evt = self._run_armed(
+            monkeypatch, tmp_path, "s-err-bare",
+            ("sdk.error", {
+                "error": "cursor run ended with status: error",
+                "retryable": None,
+                "retry_after": None,
+                "run_status": "error",
+            }),
+            pre_events=[_narration_chunk("started digging in")],
+        )
+        assert job.status == "failed"
+        assert "run failed: cursor run ended with status: error." in evt["summary"]
+        assert "retryable" not in evt["summary"]
+        assert "error_retryable" not in evt["result"]
 
     def test_transport_drop_delivers_failed_not_completed(
         self, clean_state, monkeypatch, tmp_path
@@ -1421,11 +1478,695 @@ class TestAllTerminalStatesDeliver:
 
 
 # ---------------------------------------------------------------------------
+# Progress subscriptions — periodic digests on the completion queue
+# ---------------------------------------------------------------------------
+
+def _digest_events(events):
+    """The progress digests among drained completion-queue events."""
+    return [e for e in events if e.get("cursor_progress_update")]
+
+
+def _completion_events(events):
+    """The terminal completions among drained completion-queue events."""
+    return [e for e in events if not e.get("cursor_progress_update")]
+
+
+def _collect_queue(collected, min_digests=1, timeout=5.0):
+    """Keep draining the completion queue into ``collected`` until it holds
+    at least ``min_digests`` digest events."""
+    def _pump():
+        collected.extend(_drain_completion_queue())
+        return len(_digest_events(collected)) >= min_digests
+
+    return _wait_until(_pump, timeout=timeout)
+
+
+class TestProgressSubscriptions:
+    """cursor_send_message(update_interval_s) + cursor_subscribe: periodic
+    digests ride the same completion_queue rail as terminal completions,
+    numbered per session, and never outlive the run."""
+
+    def _held_run(self, monkeypatch, tmp_path, sid="agent-digest", **send_kw):
+        """A run held open on the returned release event, dispatched via
+        create + send so subscription plumbing runs end-to-end."""
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_send_message(name, "task", **send_kw)
+        _assert_running_ack(ack)
+        return name, _job_for(sid), release
+
+    # -- subscription set at dispatch --------------------------------------
+
+    def test_default_send_sets_180s_subscription(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(monkeypatch, tmp_path)
+        try:
+            entry = gc_handles.get(name)
+            assert entry["update_interval_s"] == 180.0
+            ticker = gc_progress._tickers.get(name)
+            assert ticker is not None
+            assert ticker.interval_s == 180.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_explicit_interval_used_and_persisted(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=45
+        )
+        try:
+            assert gc_handles.get(name)["update_interval_s"] == 45.0
+            assert gc_progress._tickers[name].interval_s == 45.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_zero_interval_means_no_digests(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0
+        )
+        try:
+            assert gc_handles.get(name)["update_interval_s"] == 0.0
+            assert name not in gc_progress._tickers
+            time.sleep(0.15)
+            assert _digest_events(_drain_completion_queue()) == []
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        events = _drain_completion_queue()
+        assert _digest_events(events) == []
+        assert len(_completion_events(events)) == 1
+
+    # -- digest delivery + content -----------------------------------------
+
+    def test_digest_rides_async_delegation_rail_with_status_and_events(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digest = _digest_events(collected)[0]
+        # The exact event shape every hermes-core consumer differentiates
+        # on: type field, unique delegation_id (TUI dedup), session_key
+        # routing — and NOT deregistering anything is the producer's job.
+        assert digest["type"] == "async_delegation"
+        assert digest["delegation_id"] == f"{name}#progress-1"
+        assert digest["status"] == "running"
+        assert digest["cursor_progress_update"] == 1
+        assert "NOT the final result" in digest["goal"]
+
+        text = digest["summary"]
+        assert f"cursor session '{name}' — progress update 1" in text
+        assert "status: running" in text
+        assert "elapsed:" in text and "last activity:" in text
+        # The early edit of the gated replay is visible either as the
+        # files-so-far header count or in the events-since-last-tick body.
+        assert "f1.py" in text
+
+    def test_quiet_tick_says_no_new_events(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            # By the second digest the held run has gone quiet — no events
+            # stream while the replay blocks on the release gate.
+            assert _collect_queue(collected, min_digests=2)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        quiet = _digest_events(collected)[-1]
+        assert "no new events since last update" in quiet["summary"]
+        # Header still carries the signal for a quiet run.
+        assert "last activity:" in quiet["summary"]
+
+    def test_digest_numbering_increments_and_tags_session(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=3)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digests = _digest_events(collected)[:3]
+        assert [d["cursor_progress_update"] for d in digests] == [1, 2, 3]
+        for i, d in enumerate(digests, start=1):
+            assert f"progress update {i}" in d["summary"]
+            assert f"'{name}'" in d["summary"]
+
+    # -- cursor_subscribe ---------------------------------------------------
+
+    def test_subscribe_changes_interval_mid_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        # Start slow (no tick due for 60s), then shorten mid-run: the
+        # pending timer must be rescheduled immediately.
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=60
+        )
+        collected = []
+        try:
+            ack = cursor_subscribe(name, 0.05)
+            assert ack == gc_render.subscribe_ack(name, 0.05)
+            assert "\n" not in ack  # 1-line plain-text ack
+            assert name in ack
+            assert gc_handles.get(name)["update_interval_s"] == 0.05
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_digest_next_update_line_reflects_midrun_interval_change(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The ticker hands its CURRENT interval to the digest at tick
+        time: a run dispatched at 60s and retuned mid-run via
+        cursor_subscribe renders the NEW interval in the next digest,
+        not the dispatch-time one."""
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=60
+        )
+        collected = []
+        try:
+            cursor_subscribe(name, 0.05)
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digest = _digest_events(collected)[0]
+        # 0.05s rounds up to the 1s floor; the old 60s would say "1m".
+        assert "next update in 1s" in digest["summary"]
+        assert "next update in 1m" not in digest["summary"]
+
+    def test_subscribe_zero_unsubscribes_mid_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+            ack = cursor_subscribe(name, 0)
+            assert "off" in ack and name in ack
+            assert gc_handles.get(name)["update_interval_s"] == 0.0
+            assert name not in gc_progress._tickers
+            _drain_completion_queue()
+            time.sleep(0.2)
+            assert _digest_events(_drain_completion_queue()) == []
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        # The terminal completion is unaffected by unsubscribing.
+        events = _drain_completion_queue()
+        assert len(_completion_events(events)) == 1
+
+    def test_subscribe_without_run_persists_for_next_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 0.05)
+        assert name in ack
+        assert gc_handles.get(name)["update_interval_s"] == 0.05
+
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-persist")
+        )
+        collected = []
+        _assert_running_ack(cursor_send_message(name, "task"))
+        job = _job_for("agent-persist")
+        try:
+            # No update_interval_s on send — the persisted 0.05 drives it.
+            assert gc_progress._tickers[name].interval_s == 0.05
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_subscribe_unknown_session_is_actionable(self, clean_state):
+        out = cursor_subscribe("no-such-session", 30)
+        assert "no session named 'no-such-session'" in out
+
+    def test_subscribe_rejects_negative_interval(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        assert ">= 0" in cursor_subscribe(name, -5)
+
+    # -- terminal-state guarantees -------------------------------------------
+
+    def test_digest_never_fires_after_terminal_state(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        assert _collect_queue(collected, min_digests=1)
+        release.set()
+        assert job.done_event.wait(10)
+        # Everything already enqueued at settle time is legal; nothing may
+        # be added after it — the pending timer was cancelled at finalize.
+        collected.extend(_drain_completion_queue())
+        time.sleep(0.25)
+        late = _drain_completion_queue()
+        assert late == [], f"digest arrived after terminal state: {late}"
+        # And on the collected sequence the completion is the LAST event.
+        assert not _digest_events([collected[-1]])
+        assert job.status == "completed"
+
+    def test_completion_delivered_exactly_once_with_digests_active(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        assert _collect_queue(collected, min_digests=2)
+        release.set()
+        assert job.done_event.wait(10)
+        collected.extend(_drain_completion_queue())
+
+        completions = _completion_events(collected)
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+        assert completions[0]["delegation_id"] == name
+        assert len(_digest_events(collected)) >= 2
+
+    def test_interrupt_and_reprompt_carries_subscription_and_numbering(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release1, release2 = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="agent-ir"),
+            _gated_replay_factory(release2, sid="agent-ir"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(cursor_send_message(name, "task", update_interval_s=0.05))
+        collected = []
+        assert _collect_queue(collected, min_digests=1)
+        first_n = max(d["cursor_progress_update"] for d in _digest_events(collected))
+
+        # Interrupt + re-prompt: the new run inherits the subscription (no
+        # explicit interval on this send) and numbering continues.
+        ack = cursor_send_message(name, "follow-up")
+        _assert_running_ack(ack)
+        assert "interrupted" in ack
+        job2 = _job_for("agent-ir")
+        try:
+            assert gc_progress._tickers[name].interval_s == 0.05
+            collected2 = []
+            assert _collect_queue(collected2, min_digests=1)
+            nums = [d["cursor_progress_update"] for d in _digest_events(collected2)]
+            assert min(nums) == first_n + 1, (
+                f"numbering restarted: {nums} after {first_n}"
+            )
+        finally:
+            release1.set()
+            release2.set()
+            assert job2.done_event.wait(10)
+
+    # -- multiple sessions ---------------------------------------------------
+
+    def test_multiple_sessions_with_different_intervals(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        release_a, release_b = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release_a, sid="agent-a"),
+            _gated_replay_factory(release_b, sid="agent-b"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        name_a = _created_name(cursor_create_session(repo=str(repo_a)))
+        name_b = _created_name(cursor_create_session(repo=str(repo_b)))
+        _assert_running_ack(
+            cursor_send_message(name_a, "task a", update_interval_s=0.05)
+        )
+        _assert_running_ack(
+            cursor_send_message(name_b, "task b", update_interval_s=60)
+        )
+        job_a, job_b = _job_for("agent-a"), _job_for("agent-b")
+        collected = []
+        try:
+            assert gc_progress._tickers[name_a].interval_s == 0.05
+            assert gc_progress._tickers[name_b].interval_s == 60.0
+            assert _collect_queue(collected, min_digests=2)
+        finally:
+            release_a.set()
+            release_b.set()
+            assert job_a.done_event.wait(10)
+            assert job_b.done_event.wait(10)
+
+        digests = _digest_events(collected)
+        # Only the fast session ticked; every digest is tagged with ITS name.
+        assert all(f"'{name_a}'" in d["summary"] for d in digests)
+        assert all(d["delegation_id"].startswith(f"{name_a}#progress-") for d in digests)
+        assert not any(f"'{name_b}'" in d["summary"] for d in digests)
+
+    # -- digest rendering (pure) ----------------------------------------------
+
+    def test_digest_text_header_body_and_caps(self):
+        events = [
+            {"seq": 40 + i, "kind": "tool_use", "tool": "shell",
+             "command": f"pytest test_{i}.py"}
+            for i in range(8)
+        ]
+        text = gc_render.digest_text(
+            name="busy-bee",
+            n=4,
+            status="running",
+            elapsed_s=843,
+            last_activity_s=12,
+            files=[{"path": "calc.py", "added": 4, "removed": 0}],
+            pending_tool="shell `pytest -q`",
+            pending_tool_s=41,
+            events=events,
+            new_count=8,
+            next_update_s=180,
+        )
+        assert "cursor session 'busy-bee' — progress update 4" in text
+        assert (
+            "status: running · elapsed: 843s · last activity: 12s ago · "
+            "next update in 3m" in text
+        )
+        assert "files so far (1): calc.py +4 −0" in text
+        assert "pending tool call: shell `pytest -q` (41s)" in text
+        assert "new events since last update (8):" in text
+        # Body capped at DIGEST_MAX_EVENTS lines + an omission pointer.
+        assert text.count("pytest test_") == gc_render.DIGEST_MAX_EVENTS
+        assert "3 more — cursor_events('busy-bee')" in text
+        assert len(text) < 2048
+
+    def test_digest_text_quiet_tick(self):
+        text = gc_render.digest_text(
+            name="quiet-owl",
+            n=2,
+            status="running",
+            elapsed_s=360,
+            last_activity_s=181,
+            files=[],
+            events=[],
+            new_count=0,
+        )
+        assert "progress update 2" in text
+        assert "no new events since last update" in text
+        # No interval provided → the fragment is omitted entirely.
+        assert "next update in" not in text
+
+    def test_digest_text_next_update_reflects_changed_interval(self):
+        """The 'next update in' fragment renders whatever interval the
+        ticker holds AT TICK TIME — a mid-run retune shows immediately."""
+        kwargs = dict(
+            name="retuned-fox", n=3, status="running", elapsed_s=100,
+            last_activity_s=5, files=[], events=[], new_count=0,
+        )
+        before = gc_render.digest_text(**kwargs, next_update_s=180)
+        after = gc_render.digest_text(**kwargs, next_update_s=45)
+        assert "next update in 3m" in before
+        assert "next update in 45s" in after
+        assert "next update in 3m" not in after
+
+    def test_pending_tool_call_visible_in_digest(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A run stuck inside one long tool call shows it in the header —
+        the 'long quiet tool call vs stall' signal from the spec."""
+        release = threading.Event()
+
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": "agent-pending",
+                                   "cwd": str(workdir), "model": "m"})
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t9", "name": "shell",
+                "status": "running",
+                "args": {"command": "sleep 999"},
+            })
+            while not release.is_set():
+                if cancel_check and cancel_check():
+                    yield ("sdk.result", {"status": "cancelled"})
+                    return
+                time.sleep(0.01)
+            yield ("sdk.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(
+            cursor_send_message(name, "task", update_interval_s=0.05)
+        )
+        job = _job_for("agent-pending")
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        assert "pending tool call:" in _digest_events(collected)[0]["summary"]
+
+
+# ---------------------------------------------------------------------------
+# Zero-progress auto-retry — stale-bridge recovery (live incident 2026-07-04)
+# ---------------------------------------------------------------------------
+
+def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
+                           meaningful=False, release=None):
+    """A replay that settles with terminal status "error" (the enriched
+    sdk.error payload from sdk_runner), optionally after one meaningful
+    tool round, optionally held open on ``release`` first."""
+
+    def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+               cancel_check=None, agent_id=None, model=None):
+        yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
+                               "model": "m", "resumed": bool(agent_id)})
+        if release is not None:
+            while not release.is_set():
+                if cancel_check and cancel_check():
+                    yield ("sdk.result", {"status": "cancelled"})
+                    return
+                time.sleep(0.01)
+        if meaningful:
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "running", "args": {"command": "ls"},
+            })
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "completed",
+                "result": {"exitCode": 0, "stdout": "ok"},
+            })
+        yield ("sdk.error", {
+            "error": "ServerError: bridge went stale",
+            "retryable": retryable,
+            "retry_after": retry_after,
+            "run_status": "error",
+        })
+
+    return replay
+
+
+def _lifecycle_trail(name):
+    """(event, record) for every lifecycle event in a session's jsonl log,
+    in seq order."""
+    page = gc_eventlog.read_events(name, offset=0, limit=500)
+    return [
+        (e.get("event"), e)
+        for e in (page or {}).get("events") or []
+        if e.get("kind") == "lifecycle"
+    ]
+
+
+class TestZeroProgressAutoRetry:
+    """A terminal-error run with ZERO meaningful events (the stale-bridge
+    signature, live incident 2026-07-04) is transparently re-sent on the
+    same agent — bridge recycled before the first retry, jsonl-only
+    lifecycle signal, no user-facing failure. Meaningful progress, a
+    non-retryable error, or an exhausted budget surfaces the detailed
+    failure from the error-observability path instead."""
+
+    def _fast_retries(self, monkeypatch):
+        """Zero the backoff ladder and stub the bridge recycle, returning
+        the recorded recycle calls."""
+        monkeypatch.setattr(gc, "_AUTO_RETRY_BACKOFF_S", (0.0, 0.0))
+        recycles = []
+        monkeypatch.setattr(
+            gc_sdk, "recycle_bridge",
+            lambda workspace: recycles.append(workspace) or True,
+        )
+        return recycles
+
+    def test_zero_progress_error_recycles_bridge_and_retry_succeeds(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-zp"),
+            _gated_replay_factory(release, sid="agent-zp"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-zp")
+        # Same job across the retry — the digest subscription (default
+        # 180s) keeps its ticker.
+        assert gc_progress._tickers[job.session_name].job is job
+        release.set()
+        assert job.done_event.wait(10)
+
+        # One job, retried in place, clean success — no user-facing failure.
+        assert job.status == "completed"
+        assert job.result["success"] is True
+        assert "error" not in job.result
+        assert len(seq.calls) == 2
+        assert seq.calls[1]["agent_id"] == "agent-zp"  # SAME agent resumed
+        assert recycles == [job.repo]
+
+        events = _drain_completion_queue()
+        completions = _completion_events(events)
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+        assert completions[0]["error"] is None
+
+        # The jsonl log shows the transparent recovery, in order: failed
+        # first run → autoretry marker (bridge recycled) → clean second run.
+        trail = _lifecycle_trail(job.session_name)
+        marks = [n for n, _ in trail
+                 if n in ("run.started", "run.failed", "sdk.autoretry",
+                          "run.completed")]
+        assert marks == ["run.started", "run.failed", "sdk.autoretry",
+                         "run.started", "run.completed"]
+        autoretry = next(e for n, e in trail if n == "sdk.autoretry")
+        assert autoretry["attempt"] == 1
+        assert autoretry["bridge_recycled"] is True
+        assert "zero-progress" in autoretry["reason"]
+        assert "ServerError: bridge went stale" in autoretry["reason"]
+
+    def test_error_after_meaningful_progress_does_not_auto_retry(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-mp", meaningful=True,
+                                   release=release),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-mp")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1  # no re-send
+        assert recycles == []
+        assert job.status == "failed"
+        assert not [n for n, _ in _lifecycle_trail(job.session_name)
+                    if n == "sdk.autoretry"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["status"] == "failed"
+        assert evt["error"] == "ServerError: bridge went stale"
+        # The detailed failure from the error-observability path.
+        assert ("run failed: ServerError: bridge went stale (retryable)"
+                in evt["summary"])
+
+    def test_retries_exhausted_surface_the_detailed_failure(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-ex", release=release,
+                                   retry_after="0"),
+            _terminal_error_replay(sid="agent-ex"),
+            _terminal_error_replay(sid="agent-ex"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-ex")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 3  # the send + both retries
+        assert recycles == [job.repo]  # recycled ONCE, on the first retry
+        assert job.status == "failed"
+        trail = [e for n, e in _lifecycle_trail(job.session_name)
+                 if n == "sdk.autoretry"]
+        assert [e["attempt"] for e in trail] == [1, 2]
+        assert [e["bridge_recycled"] for e in trail] == [True, False]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["error"] == "ServerError: bridge went stale"
+        assert evt["result"]["error_retryable"] is True
+        assert ("run failed: ServerError: bridge went stale (retryable)"
+                in evt["summary"])
+
+    def test_non_retryable_zero_progress_error_does_not_retry(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-nr", retryable=False,
+                                   release=release),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-nr")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1
+        assert recycles == []
+        assert job.status == "failed"
+        assert not [n for n, _ in _lifecycle_trail(job.session_name)
+                    if n == "sdk.autoretry"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert ("run failed: ServerError: bridge went stale (not retryable)"
+                in completions[0]["summary"])
+
+
+# ---------------------------------------------------------------------------
 # Registration + availability gate
 # ---------------------------------------------------------------------------
 
 class TestRegistration:
-    def test_register_wires_six_tools_into_ghost_cursor_toolset(self):
+    def test_register_wires_seven_tools_into_ghost_cursor_toolset(self):
         calls = []
         ctx = SimpleNamespace(register_tool=lambda **kw: calls.append(kw))
         register(ctx)
@@ -1434,6 +2175,7 @@ class TestRegistration:
         assert set(by_name) == {
             CREATE_TOOL_NAME, SEND_TOOL_NAME, STATUS_TOOL_NAME,
             STOP_TOOL_NAME, EVENTS_TOOL_NAME, LIST_TOOL_NAME,
+            SUBSCRIBE_TOOL_NAME,
         }
         for name, schema, required in (
             (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, []),
@@ -1442,6 +2184,7 @@ class TestRegistration:
             (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, ["session"]),
             (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, ["session"]),
             (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, []),
+            (SUBSCRIBE_TOOL_NAME, CURSOR_SUBSCRIBE_SCHEMA, ["session", "interval_s"]),
         ):
             entry = by_name[name]
             assert entry["toolset"] == TOOLSET
@@ -3180,6 +3923,325 @@ class TestSdkRunner:
         gc_sdk.shutdown_bridges()
         assert all(c.closed for c in launches)
         assert gc_sdk.get_bridge("/repo/a") is not a1  # relaunches after shutdown
+
+    # -- bridge recycling (stale-bridge recovery lever) ------------------------
+
+    def test_recycle_bridge_closes_cached_client_and_relaunches(
+        self, monkeypatch
+    ):
+        closed = []
+
+        class _Client:
+            def __init__(self, ws):
+                self.ws = ws
+
+            def close(self):
+                closed.append(self)
+
+        launches = []
+
+        def fake_launch_bridge(workspace=None, **kw):
+            client = _Client(workspace)
+            launches.append(client)
+            return client
+
+        import sys as _sys
+        monkeypatch.setattr(gc_sdk, "_bridges", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_launched_at", {})
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        ))
+
+        old = gc_sdk.get_bridge("/repo/a")
+        gc_sdk.cache_agent("/repo/a", "agent-1", object())
+
+        assert gc_sdk.recycle_bridge("/repo/a") is True
+        # The stale client was closed and its agent handles dropped with it
+        # (the agent itself survives on disk, resumable by agent_id)...
+        assert closed == [old]
+        assert gc_sdk.get_cached_agent("/repo/a", "agent-1") is None
+        # ...and a FRESH bridge was launched eagerly.
+        assert len(launches) == 2
+        assert gc_sdk.get_bridge("/repo/a") is launches[-1]
+
+    def test_recycle_bridge_without_cached_client_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(gc_sdk, "_bridges", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_launched_at", {})
+        assert gc_sdk.recycle_bridge("/repo/none") is False
+
+    # -- terminal-error detail mining ----------------------------------------
+
+    def test_terminal_error_with_typed_detail_emits_enriched_sdk_error(
+        self, tmp_path, monkeypatch
+    ):
+        """A run settling with status "error" mines the typed
+        CursorAgentError fields off the handle and emits them on sdk.error
+        instead of the bare status."""
+        run = _FakeRun([_sdk_msg(type="thinking", text="hm")],
+                       final_status="error")
+        run.error = _typed_sdk_error(
+            "ServerError", "upstream 502", is_retryable=True, retry_after="30"
+        )
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "ServerError: upstream 502"
+        assert obj["retryable"] is True
+        assert obj["retry_after"] == "30"
+        assert obj["run_status"] == "error"
+
+    def test_terminal_error_detail_mined_from_wait_raise(
+        self, tmp_path, monkeypatch
+    ):
+        """No error attribute on the handle, but run.wait() raises the
+        typed error (the SDK's documented no-streaming path) — still mined."""
+
+        class _WaitRaisesRun(_FakeRun):
+            def wait(self):
+                raise _typed_sdk_error(
+                    "RateLimitError", "usage limits exceeded",
+                    is_retryable=True, retry_after="120",
+                )
+
+        run = _WaitRaisesRun([_sdk_msg(type="thinking", text="hm")],
+                             final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "RateLimitError: usage limits exceeded"
+        assert obj["retryable"] is True
+        assert obj["retry_after"] == "120"
+
+    def test_terminal_error_without_detail_falls_back_to_generic(
+        self, tmp_path, monkeypatch
+    ):
+        """Nothing error-shaped recoverable off the handle: the payload
+        keeps the generic text with unknown (None) retry fields — the run
+        still settles as an error, never raises."""
+        run = _FakeRun([_sdk_msg(type="thinking", text="hm")],
+                       final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "cursor run ended with status: error"
+        assert obj["retryable"] is None
+        assert obj["retry_after"] is None
+        assert obj["run_status"] == "error"
+
+
+class TestBridgeHealthGuard:
+    """get_bridge's send-time staleness guard: a cached client that fails
+    the cheap health probe, or is older than the configured max age, is
+    recycled (closed + relaunched) BEFORE dispatch instead of letting the
+    run fail through a dead/stale sidecar."""
+
+    def _fake_launcher(self, monkeypatch, factory):
+        """Install a fake cursor_sdk module whose launch_bridge calls
+        ``factory`` and record every launch."""
+        import sys as _sys
+
+        launches = []
+
+        def fake_launch_bridge(workspace=None, **kw):
+            client = factory(workspace)
+            launches.append(client)
+            return client
+
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        ))
+        return launches
+
+    def test_failed_probe_recycles_then_dispatch_succeeds(
+        self, tmp_path, monkeypatch
+    ):
+        """End-to-end through run_sdk with NO get_bridge monkeypatch: the
+        cached client's probe raises, so it is recycled and the run
+        dispatches through the fresh client instead of failing."""
+
+        class _DeadClient:
+            closed = False
+
+            def ping(self):
+                raise ConnectionError("bridge gone")
+
+            def close(self):
+                self.closed = True
+
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        fresh = _FakeClient(agent)
+        fresh.ping = lambda: None
+        dead = _DeadClient()
+        workspace = str(gc_runner.resolve_repo(str(tmp_path)))
+
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "_bridges", {workspace: dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {workspace: time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(monkeypatch, lambda ws: fresh)
+
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert dead.closed is True
+        assert launches == [fresh]
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_fresh_healthy_bridge_is_not_recycled(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        pings = []
+        client.ping = lambda: pings.append(1)
+        workspace = str(gc_runner.resolve_repo(str(tmp_path)))
+
+        monkeypatch.setenv("CURSOR_API_KEY", "crsr_test_key")
+        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_sdk, "_bridges", {workspace: client})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {workspace: time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(monkeypatch, lambda ws: pytest.fail(
+            "healthy fresh bridge must not be relaunched"
+        ))
+
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        assert pings, "the cached client was never probed"
+        assert launches == []
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_list_probe_failure_marks_the_bridge_dead(self, monkeypatch):
+        """No ping() on the client: the short-timeout agents.list probe is
+        the health signal, and its hard failure recycles the bridge."""
+
+        class _ListDeadClient:
+            closed = False
+
+            def __init__(self):
+                self.agents = SimpleNamespace(
+                    list=lambda **kw: (_ for _ in ()).throw(
+                        ConnectionError("connection refused")
+                    )
+                )
+
+            def close(self):
+                self.closed = True
+
+        dead = _ListDeadClient()
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {"/repo/a": time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(
+            monkeypatch, lambda ws: SimpleNamespace(ws=ws)
+        )
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert dead.closed is True
+        assert launches == [got]
+
+    def test_dead_sidecar_process_marks_the_bridge_dead(self, monkeypatch):
+        """A client whose bridge subprocess has exited fails the probe even
+        if nothing raises on the HTTP surface."""
+        dead = SimpleNamespace(
+            process=SimpleNamespace(poll=lambda: 1),  # exited, code 1
+            ping=lambda: None,
+        )
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": dead})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at", {"/repo/a": time.monotonic()}
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        launches = self._fake_launcher(
+            monkeypatch, lambda ws: SimpleNamespace(ws=ws)
+        )
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert launches == [got]
+
+    def test_bridge_older_than_max_age_is_recycled_at_send(self, monkeypatch):
+        closed = []
+
+        class _Client:
+            def __init__(self, tag):
+                self.tag = tag
+
+            def ping(self):
+                pass  # perfectly healthy — age alone recycles it
+
+            def close(self):
+                closed.append(self.tag)
+
+        old = _Client("old")
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": old})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at",
+            {"/repo/a": time.monotonic() - 10.0},
+        )
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_max_age_s", lambda: 5.0)
+        launches = self._fake_launcher(monkeypatch, lambda ws: _Client("fresh"))
+
+        got = gc_sdk.get_bridge("/repo/a")
+        assert closed == ["old"]
+        assert launches == [got]
+        assert got.tag == "fresh"
+
+    def test_bridge_younger_than_max_age_is_kept(self, monkeypatch):
+        client = SimpleNamespace(ping=lambda: None)
+        monkeypatch.setattr(gc_sdk, "_bridges", {"/repo/a": client})
+        monkeypatch.setattr(
+            gc_sdk, "_bridge_launched_at",
+            {"/repo/a": time.monotonic() - 1.0},
+        )
+        monkeypatch.setattr(gc_sdk, "_bridge_max_age_s", lambda: 5.0)
+        launches = self._fake_launcher(monkeypatch, lambda ws: pytest.fail(
+            "young healthy bridge must not be relaunched"
+        ))
+        assert gc_sdk.get_bridge("/repo/a") is client
+        assert launches == []
+
+    def test_max_age_default_is_four_hours_and_configurable(self, monkeypatch):
+        assert gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S == 4 * 3600.0
+        # No config readable in tests → the default.
+        assert gc_sdk._bridge_max_age_s() == gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S
+
+
+def _typed_sdk_error(name, message, is_retryable=None, retry_after=None):
+    """An exception duck-typing the CursorAgentError surface, with a
+    controllable type name (the payload renders '<TypeName>: <message>')."""
+    cls = type(name, (Exception,), {})
+    err = cls(message)
+    err.message = message
+    if is_retryable is not None:
+        err.is_retryable = is_retryable
+    if retry_after is not None:
+        err.retry_after = retry_after
+    return err
 
 
 class _RetryableError(Exception):

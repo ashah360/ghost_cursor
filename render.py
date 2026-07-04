@@ -45,6 +45,9 @@ LARGEST_DIFF_COUNT = 3
 EVENT_INLINE_CLIP = 2048
 EVENTS_RESPONSE_CAP = 20 * 1024
 EVENTS_TRUNCATION_NOTE = "page truncated at 20KB — narrow with limit/kind"
+# progress digest: events-since-last-tick body caps (~5 lines / ~1KB).
+DIGEST_MAX_EVENTS = 5
+DIGEST_BODY_CAP = 1024
 
 _STATUS_WORDS = {"A": "added", "M": "modified", "D": "deleted"}
 
@@ -59,6 +62,29 @@ def secs(seconds: Any) -> str:
         return f"{int(float(seconds))}s"
     except (TypeError, ValueError):
         return "—"
+
+
+def dur_compact(seconds: Any) -> str:
+    """'45s' / '3m' / '2m30s' / '4h' — compact duration for header lines.
+
+    "" when the value is absent, unparseable, or <= 0 (callers omit the
+    fragment entirely). Sub-second values round up to '1s' so a live
+    subscription never renders as zero.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    total = max(int(round(value)), 1)
+    if total < 60:
+        return f"{total}s"
+    minutes, rem_s = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{rem_s}s" if rem_s else f"{minutes}m"
+    hours, rem_m = divmod(minutes, 60)
+    return f"{hours}h{rem_m}m" if rem_m else f"{hours}h"
 
 
 def clip(text: Any, limit: int, where: str = "cursor_events") -> str:
@@ -243,6 +269,81 @@ def status_text(
     return "\n".join(lines)
 
 
+def subscribe_ack(name: str, interval_s: float) -> str:
+    """The 1-line cursor_subscribe ack."""
+    if interval_s <= 0:
+        return (
+            f"session '{name}': progress updates off (completion delivery "
+            "unaffected)."
+        )
+    return (
+        f"session '{name}': progress updates every {secs(interval_s)} "
+        "(applies to the running/next run; takes effect on the next tick)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# progress digest (periodic subscription updates)
+# ---------------------------------------------------------------------------
+
+def digest_text(
+    *,
+    name: str,
+    n: int,
+    status: str,
+    elapsed_s: Any,
+    last_activity_s: Any,
+    files: List[Dict[str, Any]],
+    pending_tool: str = "",
+    pending_tool_s: Any = None,
+    events: Optional[List[Dict[str, Any]]] = None,
+    new_count: int = 0,
+    next_update_s: Any = None,
+) -> str:
+    """One periodic progress digest: the cursor_status-style header plus
+    the events since the previous tick (cursor_events-style lines, capped
+    at DIGEST_MAX_EVENTS lines / DIGEST_BODY_CAP chars). Tagged with the
+    session name and the digest number so concurrent sessions stay
+    distinguishable. ``next_update_s`` is the ticker's CURRENT interval at
+    tick time — a mid-run cursor_subscribe change shows in the very next
+    digest — rendered as 'next update in 3m' on the status line (omitted
+    when unknown/<= 0)."""
+    last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
+    next_update = dur_compact(next_update_s)
+    lines = [
+        f"cursor session '{name}' — progress update {n}",
+        f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}"
+        + (f" · next update in {next_update}" if next_update else ""),
+    ]
+    if files:
+        lines.append(f"files so far ({len(files)}): {files_inline(files)}")
+    if pending_tool:
+        since = f" ({secs(pending_tool_s)})" if pending_tool_s is not None else ""
+        lines.append(f"pending tool call: {pending_tool}{since}")
+    lines.append("")
+    if not events:
+        lines.append("no new events since last update")
+        return "\n".join(lines)
+
+    lines.append(f"new events since last update ({new_count}):")
+    used = 0
+    rows = 0
+    for record in events[-DIGEST_MAX_EVENTS:]:
+        row = clip(
+            f"{record.get('seq')}  {_eventlog.display_kind(record):<11}  "
+            f"{_event_summary(record)}",
+            200,
+        )
+        if used + len(row) + 1 > DIGEST_BODY_CAP:
+            break
+        lines.append(row)
+        used += len(row) + 1
+        rows += 1
+    if new_count > rows:
+        lines.append(f"… {new_count - rows} more — cursor_events('{name}')")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # completion message (all terminal states) + cursor_stop
 # ---------------------------------------------------------------------------
@@ -272,6 +373,24 @@ def _bounded_diff_blocks(name: str, files: List[Dict[str, Any]]) -> List[str]:
     return blocks
 
 
+def _retry_qualifier(retryable: Any, retry_after: Any) -> str:
+    """' (retryable, retry after 30s)' from typed error detail; '' when
+    nothing is known (None = unknown, never rendered as 'not retryable')."""
+    parts = []
+    if retryable is True:
+        parts.append("retryable")
+    elif retryable is False:
+        parts.append("not retryable")
+    if retry_after:
+        after = str(retry_after)
+        try:
+            after = secs(float(after))
+        except (TypeError, ValueError):
+            pass  # HTTP-date form — render verbatim
+        parts.append(f"retry after {after}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def completion_text(
     *,
     name: str,
@@ -283,8 +402,16 @@ def completion_text(
     error: str = "",
     total_events: Any = 0,
     last_prompt_seq: Any = 0,
+    retryable: Any = None,
+    retry_after: Any = None,
 ) -> str:
-    """The terminal-state report (delivered message / in-turn fast finish)."""
+    """The terminal-state report (delivered message / in-turn fast finish).
+
+    ``retryable`` / ``retry_after`` are the typed error fields mined from a
+    terminal-error run (see sdk_runner) — rendered as a parenthetical on
+    the failure line: "run failed: ServerError: … (retryable, retry after
+    30s)".
+    """
     lines = [
         f"status: {status}",
         f"session: {name} · elapsed: {secs(elapsed_s)} · repo: {repo}",
@@ -293,9 +420,10 @@ def completion_text(
     if error:
         lines += [
             "",
-            f"run {status}: {_one_line(error)}. working-tree changes are "
-            "intact. send another message to the same session to continue "
-            "— transient failures usually succeed on retry.",
+            f"run {status}: {_one_line(error)}"
+            f"{_retry_qualifier(retryable, retry_after)}. working-tree "
+            "changes are intact. send another message to the same session "
+            "to continue — transient failures usually succeed on retry.",
         ]
     if summary:
         clipped = summary[:SUMMARY_CHARS]
