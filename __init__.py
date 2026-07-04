@@ -801,6 +801,13 @@ def _send_to_session(
         if job is not None and job.cursor_session_id
         else _resume_sid(name, entry)
     )
+    # "Events since prompt" marker: snapshot the log position BEFORE the
+    # dispatch (events the new run appends must count as since-prompt), but
+    # record it only for a send that actually prompted — a rejected send
+    # (another session holds the repo) leaves the previous marker in place.
+    prompt_seq = (
+        _eventlog.stats(_log_key(name, entry)) or {}
+    ).get("total_events", 0)
     result = _dispatch_run(
         task=str(message),
         workdir=repo,
@@ -811,6 +818,8 @@ def _send_to_session(
         max_wall_s=_resolve_max_wall(max_wall_s),
     )
     result.setdefault("session", name)
+    if str(result.get("status") or "") != "rejected":
+        _handles.record(name, last_prompt_seq=prompt_seq)
     if interrupted:
         result["interrupted_previous_prompt"] = True
     return result
@@ -943,6 +952,8 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
     if status in _jobs.TERMINAL_STATUSES:
         # Ultra-fast in-turn finish (or handshake failure): this ack IS the
         # completion report.
+        entry = _handles.get(name)
+        stats = _eventlog.stats(_log_key(name, entry))
         return _render.completion_text(
             name=name,
             status=status,
@@ -951,6 +962,8 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
             summary=str(result.get("summary") or ""),
             files=result.get("files_changed") or [],
             error=str(result.get("error") or ""),
+            total_events=(stats or {}).get("total_events", 0),
+            last_prompt_seq=_handles.last_prompt_seq(entry),
         )
     # Undelivered/unsettled shapes degrade to their error sentence.
     return str(
@@ -999,6 +1012,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             # carries partial prose (and NEVER reasoning text).
             summary=str(snap.get("summary_so_far") or "") if terminal else "",
             error=str(result.get("error") or ""),
+            last_prompt_seq=_handles.last_prompt_seq(entry),
         )
 
     if entry is not None:
@@ -1022,6 +1036,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
                 "not tracked live in this process — showing the persisted "
                 "record. cursor_send_message continues the session."
             ),
+            last_prompt_seq=_handles.last_prompt_seq(entry),
         )
 
     return _render.unknown_session(ident, _list_rows(scope))
@@ -1109,7 +1124,7 @@ def cursor_events(
     )
     if page is None:
         return _render.no_event_log(name)
-    return _render.events_text(name, page)
+    return _render.events_text(name, page, _handles.last_prompt_seq(entry))
 
 
 def cursor_list(scope: str = "session", **_kwargs: Any) -> str:

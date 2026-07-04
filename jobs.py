@@ -533,6 +533,9 @@ class CursorJobRegistry:
         """The delivered completion message — the v0.4 plain-text format
         (labeled headers, prose, raw fenced diffs; never a JSON blob)."""
         name = job.session_name or job.cursor_session_id or job.job_id
+        # "events since prompt" — the spill log is keyed by the same
+        # name-first precedence (see CursorJob.append_progress).
+        stats = _eventlog.stats(name) or {}
         text = _render.completion_text(
             name=name,
             status=job.status,
@@ -541,6 +544,8 @@ class CursorJobRegistry:
             summary=str(result.get("summary") or ""),
             files=result.get("files_changed") or [],
             error=str(result.get("error") or ""),
+            total_events=stats.get("total_events", 0),
+            last_prompt_seq=_handles.last_prompt_seq(_handles.get(name)),
         )
         return (
             f"{text}\n\nfollow up in this session: "
