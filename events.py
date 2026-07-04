@@ -672,12 +672,22 @@ class SdkNormalizer:
             ]
 
         if event_key == "sdk.error":
+            # Terminal-error payloads carry typed detail (retryable /
+            # retry_after / run_status — see sdk_runner); mid-run failures
+            # don't. Pass through whichever keys are present so the fold
+            # and the completion summary can render them.
+            extras = {
+                key: data.get(key)
+                for key in ("retryable", "retry_after", "run_status")
+                if key in data
+            }
             return [
                 lifecycle(
                     "run.failed",
                     status="failed",
                     error=data.get("error") or "cursor-sdk error",
                     timeout=bool(data.get("timeout")),
+                    **extras,
                 )
             ]
 
