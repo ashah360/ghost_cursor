@@ -199,7 +199,8 @@ def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=T
     """
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-               cancel_check=None, agent_id=None, model=None):
+               cancel_check=None, agent_id=None, model=None,
+               first_event_timeout_s=None):
         yield ("sdk.session", {
             "agentId": sid, "cwd": str(workdir),
             "model": model or "fake-model", "resumed": bool(agent_id),
@@ -249,17 +250,20 @@ class _SdkSequence:
         self.calls = []
 
     def __call__(self, task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                 cancel_check=None, agent_id=None, model=None):
+                 cancel_check=None, agent_id=None, model=None,
+                 first_event_timeout_s=None):
         self.calls.append({
             "task": task, "workdir": str(workdir),
             "agent_id": agent_id, "model": model,
             "inactivity_timeout_s": inactivity_timeout_s,
             "max_wall_s": max_wall_s,
+            "first_event_timeout_s": first_event_timeout_s,
         })
         factory = self._factories.pop(0)
         return factory(task, workdir, inactivity_timeout_s=inactivity_timeout_s,
                        max_wall_s=max_wall_s, cancel_check=cancel_check,
-                       agent_id=agent_id, model=model)
+                       agent_id=agent_id, model=model,
+                       first_event_timeout_s=first_event_timeout_s)
 
 
 def _resolved(tmp_path):
@@ -1379,8 +1383,9 @@ class TestAllTerminalStatesDeliver:
     ):
         """A terminal-error sdk.error with typed detail (retryable /
         retry_after) renders it on the failure line — not the bare
-        'cursor run ended with status: error'. (The run streamed content
-        first, so the zero-progress auto-retry stays out of the way.)"""
+        'cursor run ended with status: error'. (The run completed a tool
+        call first — durable progress — so the zero-progress auto-retry
+        stays out of the way.)"""
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-err-detail",
             ("sdk.error", {
@@ -1389,7 +1394,8 @@ class TestAllTerminalStatesDeliver:
                 "retry_after": "30",
                 "run_status": "error",
             }),
-            pre_events=[_narration_chunk("started digging in")],
+            pre_events=[*_tool_round("t1"),
+                        _narration_chunk("started digging in")],
         )
         assert job.status == "failed"
         assert evt["error"] == "ServerError: upstream 502 from the agent backend"
@@ -1414,7 +1420,8 @@ class TestAllTerminalStatesDeliver:
                 "retry_after": None,
                 "run_status": "error",
             }),
-            pre_events=[_narration_chunk("started digging in")],
+            pre_events=[*_tool_round("t1"),
+                        _narration_chunk("started digging in")],
         )
         assert job.status == "failed"
         assert "run failed: cursor run ended with status: error." in evt["summary"]
@@ -2102,13 +2109,17 @@ class TestDigestFloodGuards:
 # ---------------------------------------------------------------------------
 
 def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
-                           meaningful=False, release=None):
+                           meaningful=False, edit=False, content_chunks=0,
+                           release=None):
     """A replay that settles with terminal status "error" (the enriched
-    sdk.error payload from sdk_runner), optionally after one meaningful
-    tool round, optionally held open on ``release`` first."""
+    sdk.error payload from sdk_runner), optionally after progress —
+    ``meaningful`` = one completed shell round, ``edit`` = one completed
+    file edit (folds a file_diff), ``content_chunks`` = that many trivial
+    narration deltas — optionally held open on ``release`` first."""
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-               cancel_check=None, agent_id=None, model=None):
+               cancel_check=None, agent_id=None, model=None,
+               first_event_timeout_s=None):
         yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
                                "model": "m", "resumed": bool(agent_id)})
         if release is not None:
@@ -2117,6 +2128,19 @@ def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
                     yield ("sdk.result", {"status": "cancelled"})
                     return
                 time.sleep(0.01)
+        for i in range(content_chunks):
+            yield _narration_chunk(f"narration {i} ")
+        if edit:
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "e1", "name": "edit_file",
+                "status": "running", "args": {"path": f"{workdir}/f1.py"},
+            })
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "e1", "name": "edit_file",
+                "status": "completed",
+                "result": {"path": f"{workdir}/f1.py",
+                           "oldText": "a\n", "newText": "a\nb\n"},
+            })
         if meaningful:
             yield ("sdk.message", {
                 "type": "tool_call", "call_id": "t1", "name": "shell",
@@ -2276,6 +2300,146 @@ class TestZeroProgressAutoRetry:
         assert evt["result"]["error_retryable"] is True
         assert ("run failed: ServerError: bridge went stale (retryable)"
                 in evt["summary"])
+
+    def test_error_after_file_diff_progress_does_not_auto_retry(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Issue #17: a run that edited files (a folded file_diff — the
+        signature of committed/pushed work) and then died with terminal
+        status "error" must NOT be re-prompted; the failure is delivered
+        immediately through the normal path."""
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-fd", edit=True,
+                                   release=release),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-fd")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1  # no re-send
+        assert recycles == []
+        assert job.status == "failed"
+        assert not [n for n, _ in _lifecycle_trail(job.session_name)
+                    if n == "sdk.autoretry"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["status"] == "failed"
+        assert evt["error"] == "ServerError: bridge went stale"
+        # The partial work travels with the delivered failure.
+        assert evt["result"]["partial"] is True
+        assert evt["result"]["files_changed_count"] == 1
+
+    def test_trivial_content_only_error_still_auto_retries(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Issue #17 gate calibration: a half-started narration (a couple
+        of content deltas, no diffs, no completed tools) is still the
+        zero-progress signature — the transparent retry must fire and its
+        sdk.autoretry marker must land in the session jsonl."""
+        recycles = self._fast_retries(monkeypatch)
+        release, release2 = threading.Event(), threading.Event()
+        release2.set()  # the retry run flows straight through
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-tc", content_chunks=2,
+                                   release=release),
+            _gated_replay_factory(release2, sid="agent-tc"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-tc")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 2  # retried once, in place
+        assert recycles == [job.repo]
+        assert job.status == "completed"
+        trail = [e for n, e in _lifecycle_trail(job.session_name)
+                 if n == "sdk.autoretry"]
+        assert [e["attempt"] for e in trail] == [1]
+        assert "zero-progress" in trail[0]["reason"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+
+    def test_zero_event_retry_gets_tight_first_event_watchdog(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Issue #17: the retry attempt is dispatched with the TIGHT
+        first-event window (independent of the user's inactivity timeout);
+        a retry that streams nothing settles the job FAILED — not a
+        multi-minute silent "running" zombie — and the failure is
+        delivered."""
+        recycles = self._fast_retries(monkeypatch)
+        monkeypatch.setattr(gc, "_AUTO_RETRY_FIRST_EVENT_S", 0.2)
+        release = threading.Event()
+
+        def silent_retry(task, workdir, inactivity_timeout_s=0.0,
+                         max_wall_s=0.0, cancel_check=None, agent_id=None,
+                         model=None, first_event_timeout_s=None):
+            yield ("sdk.session", {"agentId": "agent-wd", "cwd": str(workdir),
+                                   "model": "m", "resumed": bool(agent_id)})
+            if not first_event_timeout_s:
+                # Unfixed plumbing (no watchdog handed to the retry):
+                # finish clean so the assertions below fail fast instead
+                # of hanging on a watchdog that never fires.
+                yield ("sdk.result", {"status": "finished"})
+                return
+            # Emulate the real run_sdk contract (unit-tested separately in
+            # TestSdkRunner): total silence until the first-event window
+            # lapses, then the plain non-timeout, no-run_status error.
+            deadline = time.monotonic() + float(first_event_timeout_s)
+            while time.monotonic() < deadline:
+                if cancel_check and cancel_check():
+                    yield ("sdk.result", {"status": "cancelled"})
+                    return
+                time.sleep(0.01)
+            yield ("sdk.error", {"error": (
+                "cursor run aborted: produced no stream events within "
+                f"{first_event_timeout_s}s of dispatch"
+            )})
+
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-wd", release=release),
+            silent_retry,
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(
+            cursor_send_message(
+                _created_name(cursor_create_session(repo=str(tmp_path))),
+                "t", inactivity_timeout_s=1800,
+            )
+        )
+        job = _job_for("agent-wd")
+        release.set()
+        assert job.done_event.wait(10)
+
+        # The first attempt ran without the watchdog; the retry got the
+        # tight window, NOT the user's 1800s inactivity timeout.
+        assert len(seq.calls) == 2
+        assert seq.calls[0]["first_event_timeout_s"] is None
+        assert seq.calls[1]["first_event_timeout_s"] == 0.2
+        assert seq.calls[1]["inactivity_timeout_s"] == 1800.0
+        assert recycles == [job.repo]
+
+        # Settled FAILED (not timeout/cancelled), no further retries, and
+        # the failure delivered with the autoretry marker in the log.
+        assert job.status == "failed"
+        assert "no stream events" in (job.run_error or "")
+        trail = [e for n, e in _lifecycle_trail(job.session_name)
+                 if n == "sdk.autoretry"]
+        assert [e["attempt"] for e in trail] == [1]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "failed"
+        assert "no stream events" in completions[0]["error"]
 
     def test_non_retryable_zero_progress_error_does_not_retry(
         self, clean_state, monkeypatch, tmp_path
@@ -3786,6 +3950,52 @@ class TestSdkRunner:
         assert key == "sdk.error"
         assert obj["timeout"] is True
         assert "max wall time" in obj["error"]
+
+    def test_first_event_watchdog_aborts_a_run_that_streams_nothing(
+        self, tmp_path, monkeypatch
+    ):
+        """Issue #17: with first_event_timeout_s armed, a run that streams
+        NO events is aborted within the window and settles as a PLAIN
+        failure — no timeout flag, no run_status — so the caller neither
+        reports a timeout nor re-enters the auto-retry gate."""
+        run = _FakeRun([])
+        blocker = lambda: run.cancel_event.wait(10)  # noqa: E731
+        run._stream._script[:] = [blocker]
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        started = time.monotonic()
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            first_event_timeout_s=0.4,
+        ))
+        assert time.monotonic() - started < 10
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert "no stream events" in obj["error"]
+        assert not obj.get("timeout")
+        assert obj.get("run_status") is None
+        assert run.cancel_event.is_set(), "watchdog must cancel the live run"
+
+    def test_first_event_watchdog_is_inert_once_events_flow(
+        self, tmp_path, monkeypatch
+    ):
+        """The first stream event disarms the watchdog: a run that starts
+        streaming immediately and then works quietly past the window
+        finishes clean."""
+        def slow_finish():
+            time.sleep(0.6)  # well past the 0.2s first-event window
+            return _sdk_msg(type="thinking", text="still here")
+
+        run = _FakeRun([_sdk_msg(type="thinking", text="hm"), slow_finish])
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            first_event_timeout_s=0.2,
+        ))
+        assert events[-1] == ("sdk.result", {"status": "finished"})
 
     def test_resume_uses_persisted_agent_id(self, tmp_path, monkeypatch):
         agent = _FakeAgent(agent_id="agent-prior",
