@@ -1,6 +1,6 @@
 """Ghost ⇄ Cursor delegation plugin — bundled, auto-loaded.
 
-v0.4: explicit named sessions + plain-text tool output. Six tools in the
+v0.4: explicit named sessions + plain-text tool output. Seven tools in the
 ``ghost_cursor`` toolset:
 
 * ``cursor_create_session(repo?, model?)`` — mint a named session handle
@@ -20,6 +20,9 @@ v0.4: explicit named sessions + plain-text tool output. Six tools in the
   tool_use / content / lifecycle); limit clamps at 500.
 * ``cursor_list(scope='session'|'all')`` — TSV listing of session handles,
   scoped to the current Hermes session by default.
+* ``cursor_subscribe(session, interval_s)`` — periodic progress digests
+  while a run is active (see ``progress.py``); ``cursor_send_message``
+  seeds the interval via ``update_interval_s`` (default 180s, 0 off).
 
 (v0.3's ``cursor_start``/``cursor_send`` are gone — create + send replaced
 them outright; pre-launch, no deprecation shim.)
