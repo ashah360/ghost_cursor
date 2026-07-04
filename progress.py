@@ -43,6 +43,22 @@ digest event is shaped the way it is:
   successive digests aren't deduped against each other or against the
   real completion (whose delegation_id is the plain session name).
 
+Interval enforcement + single-chain guarantee (issue #10)
+---------------------------------------------------------
+``interval_s`` is a HARD FLOOR between digest deliveries, enforced at
+emit time and not merely by timer scheduling: ``_deliver`` drops any
+digest attempted less than the current interval after the previously
+enqueued one (per session, ``_last_emit``, monotonic clock). The floor
+outlives individual tickers — interrupt-and-reprompt keeps it, exactly
+like the digest numbering. Independently, only ONE timer chain per
+session can stay alive: registration in ``_tickers`` is swapped
+atomically (``start_for_job``), a tick fired by a ticker that is no
+longer the registered one cancels itself instead of delivering or
+re-arming (``_is_registered``), and arming always supersedes a pending
+timer so a chain cannot fork. Re-prompting therefore cannot stack
+digest loops, and even a stale chain that fires once before noticing
+is muted by the floor.
+
 Delivery-order guarantee
 ------------------------
 ``jobs.CursorJobRegistry._finalize`` flips the job to a terminal status
@@ -81,6 +97,20 @@ _tickers: Dict[str, "_Ticker"] = {}
 # ticker: interrupt-and-reprompt carries the subscription to the new run
 # and the numbering continues.
 _counters: Dict[str, int] = {}
+# session name -> time.monotonic() of the last digest actually enqueued.
+# The hard interval floor (issue #10): delivery is suppressed while less
+# than the current interval has elapsed since the previous digest, no
+# matter which timer chain fired the tick. Like _counters it outlives any
+# one ticker, so interrupt-and-reprompt cannot reset the floor either.
+_last_emit: Dict[str, float] = {}
+
+
+def _floor_slack(interval_s: float) -> float:
+    """Slack subtracted from the floor comparison so scheduler jitter on
+    an exactly-on-time tick never drops a legitimate digest. Small in
+    absolute terms and capped relative to the interval so short (test)
+    intervals keep a meaningful floor."""
+    return min(0.02, interval_s * 0.1)
 
 
 def resolve_interval(entry: Optional[Dict[str, Any]], explicit: Optional[float]) -> float:
@@ -136,6 +166,11 @@ class _Ticker:
     def _arm_locked(self) -> None:
         if self._cancelled or self.interval_s <= 0:
             return
+        # A pending timer is superseded, never left running alongside the
+        # new one — arming is a reschedule, so a chain can never fork into
+        # two parallel timer chains (issue #10).
+        if self._timer is not None:
+            self._timer.cancel()
         timer = threading.Timer(self.interval_s, self._tick)
         # The tick identifies which timer fired it (see _tick: only the
         # CURRENT chain may re-arm, so a concurrent set_interval reschedule
@@ -173,8 +208,21 @@ class _Ticker:
 
     # -- the tick ----------------------------------------------------------
 
+    def _is_registered(self) -> bool:
+        """Whether this ticker is still the session's live one.
+
+        A re-prompt swaps the registration to the new run's ticker; a
+        chain that fires afterwards is stale and must tear itself down
+        instead of delivering or re-arming (issue #10: interrupts must
+        not stack digest loops)."""
+        with _lock:
+            return _tickers.get(self.name) is self
+
     def _tick(self, fired: threading.Timer) -> None:
         try:
+            if not self._is_registered():
+                self.cancel()
+                return
             if self.job.status == _RUNNING:
                 self._deliver()
         except Exception:
@@ -196,6 +244,18 @@ class _Ticker:
 
     def _deliver(self) -> None:
         job = self.job
+        # Hard interval floor (issue #10): regardless of what fired this
+        # tick — the healthy chain, a stale duplicate, a mid-run retune —
+        # a digest inside interval_s of the previously ENQUEUED one is
+        # dropped. last_seq is deliberately untouched so the skipped
+        # events roll into the next digest instead of being lost.
+        now = time.monotonic()
+        with _lock:
+            last = _last_emit.get(self.name)
+        if last is not None and now - last < self.interval_s - _floor_slack(
+            self.interval_s
+        ):
+            return
         total = self._log_total()
         new_count = max(total - self.last_seq, 0)
         events: List[Dict[str, Any]] = []
@@ -288,6 +348,7 @@ class _Ticker:
             return
         with _lock:
             _counters[self.name] = n
+            _last_emit[self.name] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
@@ -302,16 +363,19 @@ def start_for_job(job: Any, interval_s: float) -> None:
     session is cancelled either way.
     """
     key = job.session_name or job.job_id
+    ticker = _Ticker(job, interval_s) if interval_s > 0 else None
+    # Swap the registration in ONE lock hold: there is never a window in
+    # which two tickers are (or believe they are) live for the session —
+    # the moment the new one is visible the old one is stale, and a stale
+    # chain tears itself down on its next fire (_is_registered).
     with _lock:
         old = _tickers.pop(key, None)
+        if ticker is not None:
+            _tickers[key] = ticker
     if old is not None:
         old.cancel()
-    if interval_s <= 0:
-        return
-    ticker = _Ticker(job, interval_s)
-    with _lock:
-        _tickers[key] = ticker
-    ticker.start()
+    if ticker is not None:
+        ticker.start()
 
 
 def cancel_for_job(job: Any) -> None:
@@ -353,5 +417,6 @@ def _reset_for_tests() -> None:
         tickers = list(_tickers.values())
         _tickers.clear()
         _counters.clear()
+        _last_emit.clear()
     for ticker in tickers:
         ticker.cancel()
