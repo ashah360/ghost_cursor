@@ -109,6 +109,27 @@ def _one_line(text: Any) -> str:
     return " ".join(str(text or "").split())
 
 
+def since_prompt_line(name: str, total_events: Any, last_prompt_seq: Any) -> str:
+    """'events since prompt: N — cursor_events(...)' — the labeled line
+    shared by status / events / completion output.
+
+    N is how many event-log items accumulated since the session was last
+    prompted, and the pointer names the exact offset/limit that pages
+    them. Sessions with no recorded marker (fresh, or legacy handles from
+    before the field existed) count the whole log.
+    """
+    total = max(int(total_events or 0), 0)
+    marker = max(int(last_prompt_seq or 0), 0)
+    since = max(total - marker, 0)
+    if since == 0:
+        return "events since prompt: 0"
+    limit = min(since, _eventlog.MAX_PAGE_LIMIT)
+    return (
+        f"events since prompt: {since} — "
+        f"cursor_events('{name}', offset={marker}, limit={limit})"
+    )
+
+
 def files_inline(files: List[Dict[str, Any]], max_files: int = 8) -> str:
     """'calc.py +4 −0, test.py +12 −0' (counts only, never diffs)."""
     parts = [
@@ -214,6 +235,7 @@ def status_text(
     summary: str = "",
     error: str = "",
     note: str = "",
+    last_prompt_seq: Any = 0,
 ) -> str:
     """The read-only status view. NO inline diffs, NO reasoning content."""
     log = log_path or "(none yet)"
@@ -223,6 +245,7 @@ def status_text(
         f"session: {name} · elapsed: {secs(elapsed_s)} · "
         f"last activity: {last}",
         f"events: {total_events} total · log: {log}",
+        since_prompt_line(name, total_events, last_prompt_seq),
         "",
         # TODO(peek design, T-050 §aux-model): replace this template-only
         # line with the aux-model one-line peek once that lands. Until then
@@ -377,6 +400,8 @@ def completion_text(
     summary: str,
     files: List[Dict[str, Any]],
     error: str = "",
+    total_events: Any = 0,
+    last_prompt_seq: Any = 0,
     retryable: Any = None,
     retry_after: Any = None,
 ) -> str:
@@ -390,6 +415,7 @@ def completion_text(
     lines = [
         f"status: {status}",
         f"session: {name} · elapsed: {secs(elapsed_s)} · repo: {repo}",
+        since_prompt_line(name, total_events, last_prompt_seq),
     ]
     if error:
         lines += [
@@ -509,7 +535,7 @@ def _event_body(record: Dict[str, Any]) -> str:
     return _clip_kb(text)
 
 
-def events_text(name: str, page: Dict[str, Any]) -> str:
+def events_text(name: str, page: Dict[str, Any], last_prompt_seq: Any = 0) -> str:
     events = page.get("events") or []
     total = int(page.get("total_events") or 0)
     log = str(page.get("log_path") or "")
@@ -527,7 +553,10 @@ def events_text(name: str, page: Dict[str, Any]) -> str:
     of = (
         f"{matching} matching (kind={kind}) of {total}" if kind else f"{total}"
     )
-    chunks = [f"events {first}–{last} of {of} (log: {log})"]
+    chunks = [
+        f"events {first}–{last} of {of} (log: {log})",
+        since_prompt_line(name, total, last_prompt_seq),
+    ]
 
     for gap in page.get("gaps") or []:
         gfirst, glast = gap.get("first_dropped_seq"), gap.get("last_dropped_seq")

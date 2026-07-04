@@ -3053,6 +3053,182 @@ class TestCursorEventsPaging:
 
 
 # ---------------------------------------------------------------------------
+# events since prompt — the last_prompt_seq marker + the labeled line
+# ---------------------------------------------------------------------------
+
+class TestEventsSincePrompt:
+    """cursor_send_message stamps the log position onto the handle at
+    dispatch; status / events / completion output render
+    "events since prompt: N" with the exact cursor_events page for them."""
+
+    def test_send_records_the_marker_and_persists_it(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release2 = threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(_preset_event(), sid="s-mark"),
+            _gated_replay_factory(release2, sid="s-mark", early_edit=False),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _start_run("task A", repo=str(tmp_path))
+        job = _job_for("s-mark")
+        name = job.session_name
+        assert job.done_event.wait(10)
+        # First send on a fresh session: the log was empty at dispatch.
+        assert gc_handles.get(name)["last_prompt_seq"] == 0
+        total_after_first = gc_eventlog.stats(name)["total_events"]
+        assert total_after_first > 0
+        _drain_completion_queue()
+
+        ack = cursor_send_message(name, "follow up")
+        try:
+            _assert_running_ack(ack)
+            # The follow-up moved the marker to the log position at dispatch
+            # (events the new run appends count as since-prompt)...
+            assert gc_handles.get(name)["last_prompt_seq"] == total_after_first
+            # ...and the marker is persisted, not process-local.
+            on_disk = json.loads(gc_handles._state_file().read_text("utf-8"))
+            assert on_disk[name]["last_prompt_seq"] == total_after_first
+        finally:
+            release2.set()
+        assert gc_jobs.registry.get_by_name(name).done_event.wait(10)
+
+    def test_interrupt_reprompt_updates_the_marker(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release1 = threading.Event()  # never set: run 1 ends only via cancel
+        release2 = threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="s-remark"),
+            _gated_replay_factory(release2, sid="s-remark", early_edit=False),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
+        first_job = _job_for("s-remark")
+        name = first_job.session_name
+        assert gc_handles.get(name)["last_prompt_seq"] == 0
+        assert _wait_until(lambda: first_job.files)  # run-1 events landed
+
+        ack = cursor_send_message(name, "steer it")
+        try:
+            _assert_running_ack(ack)
+            marker = gc_handles.get(name)["last_prompt_seq"]
+            # The interrupted run's events sit BEHIND the fresh marker...
+            assert marker > 0
+            # ...which is a real log position, never past the log's end.
+            assert marker <= gc_eventlog.stats(name)["total_events"]
+        finally:
+            release2.set()
+        assert gc_jobs.registry.get_by_name(name).done_event.wait(10)
+
+    def test_rejected_send_leaves_the_marker_alone(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-busy2")
+        )
+        _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
+        job = _job_for("s-busy2")
+        try:
+            other = _created_name(cursor_create_session(repo=str(tmp_path)))
+            out = cursor_send_message(other, "second task")
+            assert "cannot start" in out
+            # No prompt went out for the rejected send — no marker written.
+            assert "last_prompt_seq" not in gc_handles.get(other)
+        finally:
+            release.set()
+        assert job.done_event.wait(10)
+
+    def test_status_shows_count_and_pager_pointer(self, clean_state):
+        _seed_session_log("since-st", [
+            {"kind": "content", "delta": f"e{i}"} for i in range(12)
+        ])
+        gc_handles.record("since-st", last_prompt_seq=4)
+        out = cursor_status("since-st")
+        assert (
+            "events since prompt: 8 — "
+            "cursor_events('since-st', offset=4, limit=8)"
+        ) in out
+
+    def test_events_page_carries_the_since_prompt_line(self, clean_state):
+        _seed_session_log("since-ev", [
+            {"kind": "content", "delta": f"e{i}"} for i in range(10)
+        ])
+        gc_handles.record("since-ev", last_prompt_seq=7)
+        out = cursor_events("since-ev")
+        assert (
+            "events since prompt: 3 — "
+            "cursor_events('since-ev', offset=7, limit=3)"
+        ) in out
+
+    def test_delivered_completion_reports_events_since_prompt(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-cmark")
+        )
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-cmark")
+        release.set()
+        assert job.done_event.wait(10)
+
+        events = _drain_completion_queue()
+        assert len(events) == 1
+        # First prompt's marker is 0, so every event of the run counts.
+        total = gc_eventlog.stats(job.session_name)["total_events"]
+        assert total > 0
+        assert (
+            f"events since prompt: {total} — "
+            f"cursor_events('{job.session_name}', offset=0, limit={total})"
+        ) in events[0]["summary"]
+
+    def test_zero_since_prompt_renders_the_bare_count(self, clean_state):
+        _seed_session_log("since-zero", [
+            {"kind": "content", "delta": f"e{i}"} for i in range(5)
+        ])
+        gc_handles.record("since-zero", last_prompt_seq=5)
+        out = cursor_status("since-zero")
+        assert "events since prompt: 0" in out
+        assert "events since prompt: 0 —" not in out  # nothing to page
+
+    def test_legacy_handle_without_the_field_counts_the_whole_log(
+        self, clean_state
+    ):
+        # _seed_session_log records a handle with NO last_prompt_seq — the
+        # exact shape of entries persisted before the field existed.
+        _seed_session_log("since-legacy", [
+            {"kind": "content", "delta": f"e{i}"} for i in range(6)
+        ])
+        assert "last_prompt_seq" not in gc_handles.get("since-legacy")
+        status = cursor_status("since-legacy")
+        assert (
+            "events since prompt: 6 — "
+            "cursor_events('since-legacy', offset=0, limit=6)"
+        ) in status
+        assert "events since prompt: 6" in cursor_events("since-legacy")
+
+    def test_corrupt_marker_sanitizes_to_zero_instead_of_crashing(
+        self, clean_state
+    ):
+        _seed_session_log("since-corrupt", [{"kind": "content", "delta": "hi"}])
+        gc_handles.record("since-corrupt", last_prompt_seq="not-a-number")
+        out = cursor_status("since-corrupt")
+        assert out.startswith("status: completed")
+        assert "events since prompt: 1" in out
+
+    def test_pager_limit_clamps_at_max_page_limit(self, clean_state):
+        line = gc_render.since_prompt_line("big", 1200, 100)
+        assert line == (
+            "events since prompt: 1100 — "
+            "cursor_events('big', offset=100, limit=500)"
+        )
+
+
+# ---------------------------------------------------------------------------
 # cursor_list — TSV shape + hermes-session scoping
 # ---------------------------------------------------------------------------
 

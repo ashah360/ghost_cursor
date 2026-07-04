@@ -207,6 +207,22 @@ def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 
+def last_prompt_seq(entry: Optional[Dict[str, Any]]) -> int:
+    """The event-log position recorded when the session was last prompted.
+
+    ``cursor_send_message`` stamps ``last_prompt_seq`` (the log's total
+    event count at dispatch) onto the handle entry, so
+    ``total_events - last_prompt_seq`` is "events since the last prompt".
+    Legacy entries predate the field and a corrupt value must not crash a
+    status call — both sanitize to 0, which counts the whole log. Never
+    raises.
+    """
+    try:
+        return max(int((entry or {}).get("last_prompt_seq") or 0), 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _in_scope(entry: Dict[str, Any], scope: str, session_key: str) -> bool:
     if scope == "all":
         return True
