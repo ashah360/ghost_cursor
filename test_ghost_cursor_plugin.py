@@ -53,11 +53,13 @@ from plugins.ghost_cursor import (
     CURSOR_SEND_SCHEMA,
     CURSOR_STATUS_SCHEMA,
     CURSOR_STOP_SCHEMA,
+    CURSOR_SUBSCRIBE_SCHEMA,
     EVENTS_TOOL_NAME,
     LIST_TOOL_NAME,
     SEND_TOOL_NAME,
     STATUS_TOOL_NAME,
     STOP_TOOL_NAME,
+    SUBSCRIBE_TOOL_NAME,
     TOOLSET,
     _handle_cursor_create_session,
     _handle_cursor_events,
@@ -65,6 +67,7 @@ from plugins.ghost_cursor import (
     _handle_cursor_send_message,
     _handle_cursor_status,
     _handle_cursor_stop,
+    _handle_cursor_subscribe,
     check_cursor_available,
     cursor_create_session,
     cursor_events,
@@ -72,6 +75,7 @@ from plugins.ghost_cursor import (
     cursor_send_message,
     cursor_status,
     cursor_stop,
+    cursor_subscribe,
     register,
 )
 from plugins.ghost_cursor import events as gc_events
@@ -79,6 +83,7 @@ from plugins.ghost_cursor import sdk_runner as gc_sdk
 from plugins.ghost_cursor import handles as gc_handles
 from plugins.ghost_cursor import jobs as gc_jobs
 from plugins.ghost_cursor import names as gc_names
+from plugins.ghost_cursor import progress as gc_progress
 from plugins.ghost_cursor import render as gc_render
 from plugins.ghost_cursor import runner as gc_runner
 
@@ -160,13 +165,15 @@ def _drain_completion_queue():
 @pytest.fixture
 def clean_state(monkeypatch):
     """Fresh job registry + handle table + event-log writer state + drained
-    completion queue."""
+    completion queue + no live progress tickers."""
+    gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
     monkeypatch.setattr(gc_handles, "_table", {})
     monkeypatch.setattr(gc_handles, "_loaded", False)
     gc_eventlog._reset_for_tests()
     yield gc_jobs.registry
+    gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
     gc_eventlog._reset_for_tests()
@@ -1421,11 +1428,446 @@ class TestAllTerminalStatesDeliver:
 
 
 # ---------------------------------------------------------------------------
+# Progress subscriptions — periodic digests on the completion queue
+# ---------------------------------------------------------------------------
+
+def _digest_events(events):
+    """The progress digests among drained completion-queue events."""
+    return [e for e in events if e.get("cursor_progress_update")]
+
+
+def _completion_events(events):
+    """The terminal completions among drained completion-queue events."""
+    return [e for e in events if not e.get("cursor_progress_update")]
+
+
+def _collect_queue(collected, min_digests=1, timeout=5.0):
+    """Keep draining the completion queue into ``collected`` until it holds
+    at least ``min_digests`` digest events."""
+    def _pump():
+        collected.extend(_drain_completion_queue())
+        return len(_digest_events(collected)) >= min_digests
+
+    return _wait_until(_pump, timeout=timeout)
+
+
+class TestProgressSubscriptions:
+    """cursor_send_message(update_interval_s) + cursor_subscribe: periodic
+    digests ride the same completion_queue rail as terminal completions,
+    numbered per session, and never outlive the run."""
+
+    def _held_run(self, monkeypatch, tmp_path, sid="agent-digest", **send_kw):
+        """A run held open on the returned release event, dispatched via
+        create + send so subscription plumbing runs end-to-end."""
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_send_message(name, "task", **send_kw)
+        _assert_running_ack(ack)
+        return name, _job_for(sid), release
+
+    # -- subscription set at dispatch --------------------------------------
+
+    def test_default_send_sets_180s_subscription(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(monkeypatch, tmp_path)
+        try:
+            entry = gc_handles.get(name)
+            assert entry["update_interval_s"] == 180.0
+            ticker = gc_progress._tickers.get(name)
+            assert ticker is not None
+            assert ticker.interval_s == 180.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_explicit_interval_used_and_persisted(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=45
+        )
+        try:
+            assert gc_handles.get(name)["update_interval_s"] == 45.0
+            assert gc_progress._tickers[name].interval_s == 45.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_zero_interval_means_no_digests(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0
+        )
+        try:
+            assert gc_handles.get(name)["update_interval_s"] == 0.0
+            assert name not in gc_progress._tickers
+            time.sleep(0.15)
+            assert _digest_events(_drain_completion_queue()) == []
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        events = _drain_completion_queue()
+        assert _digest_events(events) == []
+        assert len(_completion_events(events)) == 1
+
+    # -- digest delivery + content -----------------------------------------
+
+    def test_digest_rides_async_delegation_rail_with_status_and_events(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digest = _digest_events(collected)[0]
+        # The exact event shape every hermes-core consumer differentiates
+        # on: type field, unique delegation_id (TUI dedup), session_key
+        # routing — and NOT deregistering anything is the producer's job.
+        assert digest["type"] == "async_delegation"
+        assert digest["delegation_id"] == f"{name}#progress-1"
+        assert digest["status"] == "running"
+        assert digest["cursor_progress_update"] == 1
+        assert "NOT the final result" in digest["goal"]
+
+        text = digest["summary"]
+        assert f"cursor session '{name}' — progress update 1" in text
+        assert "status: running" in text
+        assert "elapsed:" in text and "last activity:" in text
+        # The early edit of the gated replay is visible either as the
+        # files-so-far header count or in the events-since-last-tick body.
+        assert "f1.py" in text
+
+    def test_quiet_tick_says_no_new_events(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            # By the second digest the held run has gone quiet — no events
+            # stream while the replay blocks on the release gate.
+            assert _collect_queue(collected, min_digests=2)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        quiet = _digest_events(collected)[-1]
+        assert "no new events since last update" in quiet["summary"]
+        # Header still carries the signal for a quiet run.
+        assert "last activity:" in quiet["summary"]
+
+    def test_digest_numbering_increments_and_tags_session(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=3)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digests = _digest_events(collected)[:3]
+        assert [d["cursor_progress_update"] for d in digests] == [1, 2, 3]
+        for i, d in enumerate(digests, start=1):
+            assert f"progress update {i}" in d["summary"]
+            assert f"'{name}'" in d["summary"]
+
+    # -- cursor_subscribe ---------------------------------------------------
+
+    def test_subscribe_changes_interval_mid_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        # Start slow (no tick due for 60s), then shorten mid-run: the
+        # pending timer must be rescheduled immediately.
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=60
+        )
+        collected = []
+        try:
+            ack = cursor_subscribe(name, 0.05)
+            assert ack == gc_render.subscribe_ack(name, 0.05)
+            assert "\n" not in ack  # 1-line plain-text ack
+            assert name in ack
+            assert gc_handles.get(name)["update_interval_s"] == 0.05
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_subscribe_zero_unsubscribes_mid_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+            ack = cursor_subscribe(name, 0)
+            assert "off" in ack and name in ack
+            assert gc_handles.get(name)["update_interval_s"] == 0.0
+            assert name not in gc_progress._tickers
+            _drain_completion_queue()
+            time.sleep(0.2)
+            assert _digest_events(_drain_completion_queue()) == []
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        # The terminal completion is unaffected by unsubscribing.
+        events = _drain_completion_queue()
+        assert len(_completion_events(events)) == 1
+
+    def test_subscribe_without_run_persists_for_next_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 0.05)
+        assert name in ack
+        assert gc_handles.get(name)["update_interval_s"] == 0.05
+
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-persist")
+        )
+        collected = []
+        _assert_running_ack(cursor_send_message(name, "task"))
+        job = _job_for("agent-persist")
+        try:
+            # No update_interval_s on send — the persisted 0.05 drives it.
+            assert gc_progress._tickers[name].interval_s == 0.05
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_subscribe_unknown_session_is_actionable(self, clean_state):
+        out = cursor_subscribe("no-such-session", 30)
+        assert "no session named 'no-such-session'" in out
+
+    def test_subscribe_rejects_negative_interval(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        assert ">= 0" in cursor_subscribe(name, -5)
+
+    # -- terminal-state guarantees -------------------------------------------
+
+    def test_digest_never_fires_after_terminal_state(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        assert _collect_queue(collected, min_digests=1)
+        release.set()
+        assert job.done_event.wait(10)
+        # Everything already enqueued at settle time is legal; nothing may
+        # be added after it — the pending timer was cancelled at finalize.
+        collected.extend(_drain_completion_queue())
+        time.sleep(0.25)
+        late = _drain_completion_queue()
+        assert late == [], f"digest arrived after terminal state: {late}"
+        # And on the collected sequence the completion is the LAST event.
+        assert not _digest_events([collected[-1]])
+        assert job.status == "completed"
+
+    def test_completion_delivered_exactly_once_with_digests_active(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=0.05
+        )
+        collected = []
+        assert _collect_queue(collected, min_digests=2)
+        release.set()
+        assert job.done_event.wait(10)
+        collected.extend(_drain_completion_queue())
+
+        completions = _completion_events(collected)
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+        assert completions[0]["delegation_id"] == name
+        assert len(_digest_events(collected)) >= 2
+
+    def test_interrupt_and_reprompt_carries_subscription_and_numbering(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release1, release2 = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="agent-ir"),
+            _gated_replay_factory(release2, sid="agent-ir"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(cursor_send_message(name, "task", update_interval_s=0.05))
+        collected = []
+        assert _collect_queue(collected, min_digests=1)
+        first_n = max(d["cursor_progress_update"] for d in _digest_events(collected))
+
+        # Interrupt + re-prompt: the new run inherits the subscription (no
+        # explicit interval on this send) and numbering continues.
+        ack = cursor_send_message(name, "follow-up")
+        _assert_running_ack(ack)
+        assert "interrupted" in ack
+        job2 = _job_for("agent-ir")
+        try:
+            assert gc_progress._tickers[name].interval_s == 0.05
+            collected2 = []
+            assert _collect_queue(collected2, min_digests=1)
+            nums = [d["cursor_progress_update"] for d in _digest_events(collected2)]
+            assert min(nums) == first_n + 1, (
+                f"numbering restarted: {nums} after {first_n}"
+            )
+        finally:
+            release1.set()
+            release2.set()
+            assert job2.done_event.wait(10)
+
+    # -- multiple sessions ---------------------------------------------------
+
+    def test_multiple_sessions_with_different_intervals(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        repo_a, repo_b = tmp_path / "a", tmp_path / "b"
+        repo_a.mkdir()
+        repo_b.mkdir()
+        release_a, release_b = threading.Event(), threading.Event()
+        seq = _SdkSequence(
+            _gated_replay_factory(release_a, sid="agent-a"),
+            _gated_replay_factory(release_b, sid="agent-b"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        name_a = _created_name(cursor_create_session(repo=str(repo_a)))
+        name_b = _created_name(cursor_create_session(repo=str(repo_b)))
+        _assert_running_ack(
+            cursor_send_message(name_a, "task a", update_interval_s=0.05)
+        )
+        _assert_running_ack(
+            cursor_send_message(name_b, "task b", update_interval_s=60)
+        )
+        job_a, job_b = _job_for("agent-a"), _job_for("agent-b")
+        collected = []
+        try:
+            assert gc_progress._tickers[name_a].interval_s == 0.05
+            assert gc_progress._tickers[name_b].interval_s == 60.0
+            assert _collect_queue(collected, min_digests=2)
+        finally:
+            release_a.set()
+            release_b.set()
+            assert job_a.done_event.wait(10)
+            assert job_b.done_event.wait(10)
+
+        digests = _digest_events(collected)
+        # Only the fast session ticked; every digest is tagged with ITS name.
+        assert all(f"'{name_a}'" in d["summary"] for d in digests)
+        assert all(d["delegation_id"].startswith(f"{name_a}#progress-") for d in digests)
+        assert not any(f"'{name_b}'" in d["summary"] for d in digests)
+
+    # -- digest rendering (pure) ----------------------------------------------
+
+    def test_digest_text_header_body_and_caps(self):
+        events = [
+            {"seq": 40 + i, "kind": "tool_use", "tool": "shell",
+             "command": f"pytest test_{i}.py"}
+            for i in range(8)
+        ]
+        text = gc_render.digest_text(
+            name="busy-bee",
+            n=4,
+            status="running",
+            elapsed_s=843,
+            last_activity_s=12,
+            files=[{"path": "calc.py", "added": 4, "removed": 0}],
+            pending_tool="shell `pytest -q`",
+            pending_tool_s=41,
+            events=events,
+            new_count=8,
+        )
+        assert "cursor session 'busy-bee' — progress update 4" in text
+        assert "status: running · elapsed: 843s · last activity: 12s ago" in text
+        assert "files so far (1): calc.py +4 −0" in text
+        assert "pending tool call: shell `pytest -q` (41s)" in text
+        assert "new events since last update (8):" in text
+        # Body capped at DIGEST_MAX_EVENTS lines + an omission pointer.
+        assert text.count("pytest test_") == gc_render.DIGEST_MAX_EVENTS
+        assert "3 more — cursor_events('busy-bee')" in text
+        assert len(text) < 2048
+
+    def test_digest_text_quiet_tick(self):
+        text = gc_render.digest_text(
+            name="quiet-owl",
+            n=2,
+            status="running",
+            elapsed_s=360,
+            last_activity_s=181,
+            files=[],
+            events=[],
+            new_count=0,
+        )
+        assert "progress update 2" in text
+        assert "no new events since last update" in text
+
+    def test_pending_tool_call_visible_in_digest(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A run stuck inside one long tool call shows it in the header —
+        the 'long quiet tool call vs stall' signal from the spec."""
+        release = threading.Event()
+
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, agent_id=None, model=None):
+            yield ("sdk.session", {"agentId": "agent-pending",
+                                   "cwd": str(workdir), "model": "m"})
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t9", "name": "shell",
+                "status": "running",
+                "args": {"command": "sleep 999"},
+            })
+            while not release.is_set():
+                if cancel_check and cancel_check():
+                    yield ("sdk.result", {"status": "cancelled"})
+                    return
+                time.sleep(0.01)
+            yield ("sdk.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(
+            cursor_send_message(name, "task", update_interval_s=0.05)
+        )
+        job = _job_for("agent-pending")
+        collected = []
+        try:
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+        assert "pending tool call:" in _digest_events(collected)[0]["summary"]
+
+
+# ---------------------------------------------------------------------------
 # Registration + availability gate
 # ---------------------------------------------------------------------------
 
 class TestRegistration:
-    def test_register_wires_six_tools_into_ghost_cursor_toolset(self):
+    def test_register_wires_seven_tools_into_ghost_cursor_toolset(self):
         calls = []
         ctx = SimpleNamespace(register_tool=lambda **kw: calls.append(kw))
         register(ctx)
@@ -1434,6 +1876,7 @@ class TestRegistration:
         assert set(by_name) == {
             CREATE_TOOL_NAME, SEND_TOOL_NAME, STATUS_TOOL_NAME,
             STOP_TOOL_NAME, EVENTS_TOOL_NAME, LIST_TOOL_NAME,
+            SUBSCRIBE_TOOL_NAME,
         }
         for name, schema, required in (
             (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, []),
@@ -1442,6 +1885,7 @@ class TestRegistration:
             (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, ["session"]),
             (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, ["session"]),
             (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, []),
+            (SUBSCRIBE_TOOL_NAME, CURSOR_SUBSCRIBE_SCHEMA, ["session", "interval_s"]),
         ):
             entry = by_name[name]
             assert entry["toolset"] == TOOLSET
