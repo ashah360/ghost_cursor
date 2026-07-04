@@ -703,8 +703,9 @@ class _SdkWorker:
         self._model = model or None
         self._model_id = model_id_of(model)
 
-        # "cancel" | "timeout" — written by the consumer thread before it
-        # sets cancel_requested (single write, read after the event fires).
+        # "cancel" | "timeout" | "first_event" — written by the consumer
+        # thread before it sets cancel_requested (single write, read after
+        # the event fires).
         self.abort_reason: Optional[str] = None
         # Human-readable detail naming WHICH watchdog fired.
         self.abort_detail: Optional[str] = None
@@ -712,6 +713,10 @@ class _SdkWorker:
         # the worker thread, read by the consumer's inactivity watchdog — a
         # plain float is fine, attribute writes are atomic under the GIL.
         self.last_activity_monotonic: float = time.monotonic()
+        # Whether ANY run stream event has been received yet — feeds the
+        # consumer's optional first-event watchdog (issue #17: a retried
+        # run that streams nothing must settle fast). GIL-safe bool.
+        self.stream_event_seen: bool = False
         # call_ids with a tool_call seen (status "running") but no terminal
         # update yet. A pending tool call means cursor is legitimately BUSY
         # even though no events stream while it runs, so the inactivity
@@ -746,6 +751,17 @@ class _SdkWorker:
     def _timeout_error(self) -> Dict[str, Any]:
         detail = self.abort_detail or "watchdog abort"
         return {"error": f"cursor run timed out: {detail}", "timeout": True}
+
+    def _first_event_error(self) -> Dict[str, Any]:
+        """The first-event watchdog's failure payload (issue #17).
+
+        Deliberately NOT flagged as a timeout and carrying no
+        ``run_status``: the caller settles it as a plain failure (not a
+        "timeout" result) and the zero-progress auto-retry gate never
+        re-enters on it.
+        """
+        detail = self.abort_detail or "no stream events"
+        return {"error": f"cursor run aborted: {detail}"}
 
     def _fail_bridge_died(self, detail: str) -> None:
         """Settle the run as a typed bridge-death failure (issue #11).
@@ -934,6 +950,7 @@ class _SdkWorker:
 
             reattaches = 0
             self.last_activity_monotonic = time.monotonic()
+            self.stream_event_seen = True
             offset = getattr(event, "offset", None)
             if offset is not None:
                 last_offset = str(offset)
@@ -1015,6 +1032,8 @@ class _SdkWorker:
                 self._settled = True
                 if self.abort_reason == "timeout":
                     self._put("sdk.error", self._timeout_error())
+                elif self.abort_reason == "first_event":
+                    self._put("sdk.error", self._first_event_error())
                 elif status == "error" and not _bridge_alive(client):
                     # The run "errored" because its bridge died under it —
                     # typed fast failure; never mine detail off (an RPC
@@ -1044,6 +1063,8 @@ class _SdkWorker:
                 self._settled = True
                 if self.abort_reason == "timeout":
                     self._put("sdk.error", self._timeout_error())
+                elif self.abort_reason == "first_event":
+                    self._put("sdk.error", self._first_event_error())
                 elif self.abort_reason == "cancel":
                     self._put("sdk.result", {"status": "cancelled"})
                 else:
@@ -1052,6 +1073,8 @@ class _SdkWorker:
                 self._settled = True
                 if self.abort_reason == "timeout":
                     self._put("sdk.error", self._timeout_error())
+                elif self.abort_reason == "first_event":
+                    self._put("sdk.error", self._first_event_error())
                 elif self.abort_reason == "cancel":
                     self._put("sdk.result", {"status": "cancelled"})
                 else:
@@ -1084,6 +1107,7 @@ def run_sdk(
     cancel_check: Optional[Callable[[], bool]] = None,
     agent_id: Optional[str] = None,
     model: Optional[str] = None,
+    first_event_timeout_s: Optional[float] = None,
 ) -> Iterator[Tuple[str, Dict[str, Any]]]:
     """Run cursor on ``task`` inside ``repo`` via the cursor-sdk, yielding events.
 
@@ -1102,6 +1126,12 @@ def run_sdk(
       ``DEFAULT_INACTIVITY_TIMEOUT_S``; 0 disables.
     * ``max_wall_s`` — optional hard ceiling on TOTAL run time. Default
       ``DEFAULT_MAX_WALL_S`` (0 = disabled).
+    * ``first_event_timeout_s`` — optional tight first-event watchdog
+      (issue #17, armed by the caller's auto-retry loop): abort when NO
+      run stream event has arrived this many seconds after dispatch.
+      Fires a plain (non-timeout, no ``run_status``) ``sdk.error`` so the
+      run settles failed and is never auto-retried again. Inert once the
+      first event arrives; None/0 disables (the default).
 
     ``agent_id`` continues a persisted cursor agent via ``Agent.resume``
     (multi-turn / across restarts). If the resume fails, the run falls back
@@ -1173,6 +1203,8 @@ def run_sdk(
             },
         )
 
+    first_event_s = float(first_event_timeout_s or 0.0)
+
     started = time.monotonic()
     fatal: Optional[str] = None
     try:
@@ -1180,6 +1212,17 @@ def run_sdk(
             if not cancel_requested.is_set():
                 now = time.monotonic()
                 if (
+                    first_event_s > 0
+                    and not worker.stream_event_seen
+                    and now - started >= first_event_s
+                ):
+                    worker.abort_reason = "first_event"
+                    worker.abort_detail = (
+                        "produced no stream events within "
+                        f"{int(first_event_s)}s of dispatch"
+                    )
+                    cancel_requested.set()
+                elif (
                     inactivity_s > 0
                     and now - worker.last_activity_monotonic >= inactivity_s
                     # An in-flight tool call IS activity: cursor streams no

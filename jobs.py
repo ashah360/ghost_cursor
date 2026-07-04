@@ -62,7 +62,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import eventlog as _eventlog
 from . import handles as _handles
@@ -169,6 +169,16 @@ class CursorJob:
     pending_tool_since: Optional[float] = None
     progress_buffer: str = ""
     progress_events: int = 0
+    # --- auto-retry progress evidence (guarded by _lock; issue #17) ---
+    # Durable evidence that this prompt did real work, accumulated across
+    # auto-retry attempts (a job IS one prompt) and read by the
+    # zero-progress gate (__init__._made_progress). ``files`` above is the
+    # third signal (any file_diff folded). The tool ids are a set keyed by
+    # call id, so a re-observed stream can never double-count a completed
+    # call; the plain event count only ever grows — nothing resets either
+    # mid-job, so streamed progress is never forgotten by a later attempt.
+    nonlifecycle_events: int = 0
+    completed_tool_ids: Set[str] = field(default_factory=set)
     run_error: Optional[str] = None
     # Typed detail riding a terminal-error run.failed (see sdk_runner's
     # sdk.error payload): None = unknown, not "no".

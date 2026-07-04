@@ -533,6 +533,11 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
 
     kind = envelope.get("kind")
     with job._lock:
+        # Progress evidence for the auto-retry gate (issue #17): every
+        # non-lifecycle envelope counts toward the since-prompt total;
+        # completed tool calls are tracked by id (replay-safe).
+        if kind != "lifecycle":
+            job.nonlifecycle_events += 1
         if kind == "file_diff":
             path = str(envelope.get("path") or "")
             entry = job.files.setdefault(
@@ -569,6 +574,8 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
             job.segment_open = False
             job.pending_tool = ""
             job.pending_tool_since = None
+            if envelope.get("status") == _events.STATUS_DONE:
+                job.completed_tool_ids.add(str(envelope.get("id") or "tool"))
         elif kind == "lifecycle":
             event = envelope.get("event")
             if event == "run.completed":
@@ -592,31 +599,49 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
 # dispatched through a stale, hours-old cursor-sdk-bridge sidecar reached
 # terminal "error" within seconds having produced ZERO meaningful events,
 # while fresh bridges worked — killing the stale bridges fixed everything.
-# A run matching that signature (terminal error + nothing meaningful
-# streamed + retryable-or-unknown) is re-sent on the SAME agent up to
+# A run matching that signature (terminal error + no progress since the
+# prompt + retryable-or-unknown) is re-sent on the SAME agent up to
 # _MAX_AUTO_RETRIES times with backoff, recycling the workspace bridge
 # before the first retry. Nothing user-facing: the job stays "running"
 # (digest numbering/subscription continue) and only jsonl lifecycle events
-# ("sdk.autoretry") record it. A run with ANY meaningful progress, a
-# non-retryable error, or an exhausted budget surfaces the detailed
-# failure instead.
+# ("sdk.autoretry") record it. A run WITH progress, a non-retryable error,
+# or an exhausted budget surfaces the detailed failure instead — delivered
+# immediately through the normal failure path.
 _MAX_AUTO_RETRIES = 2
 # Backoff ladder before retry N (1-based); a parseable server retry_after
 # on the error overrides the step. Module-level so tests can zero it.
 _AUTO_RETRY_BACKOFF_S = (15.0, 60.0)
+# Tight first-event watchdog for retry attempts, independent of the user's
+# inactivity_timeout_s (issue #17): a retried run that streams NOTHING in
+# this window is settled failed and the failure delivered, instead of
+# sitting as a silent "running" zombie until the (possibly 30-minute)
+# inactivity timeout. Module-level so tests can shrink it.
+_AUTO_RETRY_FIRST_EVENT_S = 75.0
 
-# Envelope kinds that mean the run actually did something. Reasoning rides
-# a lifecycle envelope, so it is matched by event name; all other
-# session/lifecycle plumbing (run.started, model warnings, usage, task
-# status, stream reattaches) does NOT count as progress.
-_MEANINGFUL_KINDS = ("tool_use", "tool_result", "file_diff", "content")
+# The progress gate's triviality threshold (issue #17): any file_diff or
+# any COMPLETED tool call is progress outright; otherwise more than this
+# many non-lifecycle envelopes since the prompt counts too. At or below
+# it (e.g. a half-sentence of narration before a transient server error)
+# the run is still the zero-progress signature and may be retried.
+_TRIVIAL_PROGRESS_EVENTS = 3
 
 
-def _is_meaningful(envelope: Dict[str, Any]) -> bool:
-    kind = envelope.get("kind")
-    if kind in _MEANINGFUL_KINDS:
-        return True
-    return kind == "lifecycle" and envelope.get("event") == "reasoning"
+def _made_progress(job: "_jobs.CursorJob") -> bool:
+    """Durable since-prompt progress evidence for the auto-retry gate.
+
+    Read from JOB-level aggregation folded by :func:`_fold_envelope` — a
+    job is one prompt, so this accumulates across auto-retry attempts and
+    is never reset by attempt-local stream state. Any file diff, any
+    completed tool call (a run that committed/pushed work always has
+    both), or a non-trivial number of non-lifecycle envelopes means the
+    run did real work and must never be re-prompted automatically.
+    """
+    with job._lock:
+        return bool(
+            job.files
+            or job.completed_tool_ids
+            or job.nonlifecycle_events > _TRIVIAL_PROGRESS_EVENTS
+        )
 
 
 def _auto_retry_delay_s(state: Dict[str, Any], attempt: int) -> float:
@@ -631,22 +656,30 @@ def _auto_retry_delay_s(state: Dict[str, Any], attempt: int) -> float:
     return _AUTO_RETRY_BACKOFF_S[min(attempt - 1, len(_AUTO_RETRY_BACKOFF_S) - 1)]
 
 
-def _run_attempt(job: "_jobs.CursorJob", workdir: str) -> Dict[str, Any]:
+def _run_attempt(
+    job: "_jobs.CursorJob",
+    workdir: str,
+    first_event_timeout_s: Optional[float] = None,
+) -> Dict[str, Any]:
     """One run_sdk pass for ``job``: stream, fold, persist the handle.
+
+    ``first_event_timeout_s`` (retry attempts only) arms sdk_runner's tight
+    first-event watchdog so a zero-event retry settles failed within the
+    window instead of riding the user's inactivity timeout.
 
     Returns the attempt state the auto-retry decision needs:
 
     * ``preflight`` — a final result dict when the run never happened
       (bridge/auth/repo preflight failure); the caller returns it as-is.
-    * ``meaningful`` — True when any tool call / diff / content / reasoning
-      envelope was folded (session/lifecycle events don't count).
     * ``terminal_error`` (+ ``retryable`` / ``retry_after``) — True when
       the run settled with SDK status "error" (the enriched ``sdk.error``
       payload, see sdk_runner).
+
+    Progress evidence is NOT attempt state: it accumulates on the job via
+    :func:`_fold_envelope` (see :func:`_made_progress`).
     """
     state: Dict[str, Any] = {
         "preflight": None,
-        "meaningful": False,
         "terminal_error": False,
         "retryable": None,
         "retry_after": None,
@@ -663,6 +696,13 @@ def _run_attempt(job: "_jobs.CursorJob", workdir: str) -> Dict[str, Any]:
             # attempt (its state survives the bridge recycle on disk).
             agent_id=job.cursor_session_id or job.requested_session_id,
             model=job.requested_model,
+            # Kwarg only when armed: fakes/replays without the param keep
+            # working for ordinary (non-retry) dispatches.
+            **(
+                {"first_event_timeout_s": float(first_event_timeout_s)}
+                if first_event_timeout_s
+                else {}
+            ),
         ):
             job.last_event_at = time.time()
             if key == "sdk.session":
@@ -688,8 +728,6 @@ def _run_attempt(job: "_jobs.CursorJob", workdir: str) -> Dict[str, Any]:
                 state["retryable"] = obj.get("retryable")
                 state["retry_after"] = obj.get("retry_after")
             for envelope in normalizer.normalize(key, obj):
-                if not state["meaningful"] and _is_meaningful(envelope):
-                    state["meaningful"] = True
                 _fold_envelope(job, envelope)
     except _sdk.SdkRunnerError as exc:
         # Hard SDK failure (bridge/create/auth) — actionable error, no
@@ -725,12 +763,23 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
 
     attempt = 0  # auto-retries used so far
     while True:
-        state = _run_attempt(job, workdir)
+        state = _run_attempt(
+            job,
+            workdir,
+            # Retry attempts get the tight first-event watchdog (issue
+            # #17); the user's inactivity_timeout_s still applies once the
+            # retry starts streaming.
+            first_event_timeout_s=_AUTO_RETRY_FIRST_EVENT_S if attempt else None,
+        )
         if state["preflight"] is not None:
             return state["preflight"]
         if not (
             state["terminal_error"]
-            and not state["meaningful"]
+            # Durable since-prompt evidence, not attempt-local stream
+            # state: a run that already did real work (committed/pushed,
+            # edited files, completed tools) is never re-prompted — its
+            # failure surfaces immediately instead (issue #17).
+            and not _made_progress(job)
             and state["retryable"] is not False  # retryable or unknown
             and attempt < _MAX_AUTO_RETRIES
             and not job.cancel_event.is_set()
