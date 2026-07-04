@@ -223,6 +223,10 @@ class _Ticker:
             pending_tool_s=snap.get("pending_tool_s"),
             events=events,
             new_count=new_count,
+            # The CURRENT interval at tick time (not the dispatch-time
+            # value): a mid-run cursor_subscribe retune shows in the very
+            # next digest.
+            next_update_s=self.interval_s,
         )
 
         try:

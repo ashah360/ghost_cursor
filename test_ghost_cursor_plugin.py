@@ -1609,6 +1609,29 @@ class TestProgressSubscriptions:
             release.set()
             assert job.done_event.wait(10)
 
+    def test_digest_next_update_line_reflects_midrun_interval_change(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The ticker hands its CURRENT interval to the digest at tick
+        time: a run dispatched at 60s and retuned mid-run via
+        cursor_subscribe renders the NEW interval in the next digest,
+        not the dispatch-time one."""
+        name, job, release = self._held_run(
+            monkeypatch, tmp_path, update_interval_s=60
+        )
+        collected = []
+        try:
+            cursor_subscribe(name, 0.05)
+            assert _collect_queue(collected, min_digests=1)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digest = _digest_events(collected)[0]
+        # 0.05s rounds up to the 1s floor; the old 60s would say "1m".
+        assert "next update in 1s" in digest["summary"]
+        assert "next update in 1m" not in digest["summary"]
+
     def test_subscribe_zero_unsubscribes_mid_run(
         self, clean_state, monkeypatch, tmp_path
     ):
@@ -1799,9 +1822,13 @@ class TestProgressSubscriptions:
             pending_tool_s=41,
             events=events,
             new_count=8,
+            next_update_s=180,
         )
         assert "cursor session 'busy-bee' — progress update 4" in text
-        assert "status: running · elapsed: 843s · last activity: 12s ago" in text
+        assert (
+            "status: running · elapsed: 843s · last activity: 12s ago · "
+            "next update in 3m" in text
+        )
         assert "files so far (1): calc.py +4 −0" in text
         assert "pending tool call: shell `pytest -q` (41s)" in text
         assert "new events since last update (8):" in text
@@ -1823,6 +1850,21 @@ class TestProgressSubscriptions:
         )
         assert "progress update 2" in text
         assert "no new events since last update" in text
+        # No interval provided → the fragment is omitted entirely.
+        assert "next update in" not in text
+
+    def test_digest_text_next_update_reflects_changed_interval(self):
+        """The 'next update in' fragment renders whatever interval the
+        ticker holds AT TICK TIME — a mid-run retune shows immediately."""
+        kwargs = dict(
+            name="retuned-fox", n=3, status="running", elapsed_s=100,
+            last_activity_s=5, files=[], events=[], new_count=0,
+        )
+        before = gc_render.digest_text(**kwargs, next_update_s=180)
+        after = gc_render.digest_text(**kwargs, next_update_s=45)
+        assert "next update in 3m" in before
+        assert "next update in 45s" in after
+        assert "next update in 3m" not in after
 
     def test_pending_tool_call_visible_in_digest(
         self, clean_state, monkeypatch, tmp_path

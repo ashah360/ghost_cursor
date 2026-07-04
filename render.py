@@ -64,6 +64,29 @@ def secs(seconds: Any) -> str:
         return "—"
 
 
+def dur_compact(seconds: Any) -> str:
+    """'45s' / '3m' / '2m30s' / '4h' — compact duration for header lines.
+
+    "" when the value is absent, unparseable, or <= 0 (callers omit the
+    fragment entirely). Sub-second values round up to '1s' so a live
+    subscription never renders as zero.
+    """
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    total = max(int(round(value)), 1)
+    if total < 60:
+        return f"{total}s"
+    minutes, rem_s = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{rem_s}s" if rem_s else f"{minutes}m"
+    hours, rem_m = divmod(minutes, 60)
+    return f"{hours}h{rem_m}m" if rem_m else f"{hours}h"
+
+
 def clip(text: Any, limit: int, where: str = "cursor_events") -> str:
     """Hard clip with an explicit marker + where the full content lives."""
     s = str(text or "")
@@ -252,16 +275,22 @@ def digest_text(
     pending_tool_s: Any = None,
     events: Optional[List[Dict[str, Any]]] = None,
     new_count: int = 0,
+    next_update_s: Any = None,
 ) -> str:
     """One periodic progress digest: the cursor_status-style header plus
     the events since the previous tick (cursor_events-style lines, capped
     at DIGEST_MAX_EVENTS lines / DIGEST_BODY_CAP chars). Tagged with the
     session name and the digest number so concurrent sessions stay
-    distinguishable."""
+    distinguishable. ``next_update_s`` is the ticker's CURRENT interval at
+    tick time — a mid-run cursor_subscribe change shows in the very next
+    digest — rendered as 'next update in 3m' on the status line (omitted
+    when unknown/<= 0)."""
     last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
+    next_update = dur_compact(next_update_s)
     lines = [
         f"cursor session '{name}' — progress update {n}",
-        f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}",
+        f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}"
+        + (f" · next update in {next_update}" if next_update else ""),
     ]
     if files:
         lines.append(f"files so far ({len(files)}): {files_inline(files)}")
