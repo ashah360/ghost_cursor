@@ -170,6 +170,10 @@ class CursorJob:
     progress_buffer: str = ""
     progress_events: int = 0
     run_error: Optional[str] = None
+    # Typed detail riding a terminal-error run.failed (see sdk_runner's
+    # sdk.error payload): None = unknown, not "no".
+    error_retryable: Optional[bool] = None
+    error_retry_after: Optional[str] = None
     timed_out: bool = False
     completed: bool = False
     cancelled: bool = False
@@ -559,6 +563,8 @@ class CursorJobRegistry:
             summary=str(result.get("summary") or ""),
             files=result.get("files_changed") or [],
             error=str(result.get("error") or ""),
+            retryable=result.get("error_retryable"),
+            retry_after=result.get("error_retry_after"),
         )
         return (
             f"{text}\n\nfollow up in this session: "

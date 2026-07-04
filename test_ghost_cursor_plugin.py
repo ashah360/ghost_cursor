@@ -1371,6 +1371,50 @@ class TestAllTerminalStatesDeliver:
         assert evt["status"] == "failed"
         assert "boom" in evt["error"]
 
+    def test_terminal_error_detail_reaches_the_completion_summary(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A terminal-error sdk.error with typed detail (retryable /
+        retry_after) renders it on the failure line — not the bare
+        'cursor run ended with status: error'."""
+        job, evt = self._run_armed(
+            monkeypatch, tmp_path, "s-err-detail",
+            ("sdk.error", {
+                "error": "ServerError: upstream 502 from the agent backend",
+                "retryable": True,
+                "retry_after": "30",
+                "run_status": "error",
+            }),
+        )
+        assert job.status == "failed"
+        assert evt["error"] == "ServerError: upstream 502 from the agent backend"
+        assert evt["result"]["error_retryable"] is True
+        assert evt["result"]["error_retry_after"] == "30"
+        assert (
+            "run failed: ServerError: upstream 502 from the agent backend "
+            "(retryable, retry after 30s)" in evt["summary"]
+        )
+
+    def test_terminal_error_without_detail_stays_generic(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """No typed detail available: the generic terminal-error text is
+        delivered with NO retry parenthetical (None = unknown, never
+        rendered as 'not retryable')."""
+        job, evt = self._run_armed(
+            monkeypatch, tmp_path, "s-err-bare",
+            ("sdk.error", {
+                "error": "cursor run ended with status: error",
+                "retryable": None,
+                "retry_after": None,
+                "run_status": "error",
+            }),
+        )
+        assert job.status == "failed"
+        assert "run failed: cursor run ended with status: error." in evt["summary"]
+        assert "retryable" not in evt["summary"]
+        assert "error_retryable" not in evt["result"]
+
     def test_transport_drop_delivers_failed_not_completed(
         self, clean_state, monkeypatch, tmp_path
     ):
@@ -3490,6 +3534,93 @@ class TestSdkRunner:
         gc_sdk.shutdown_bridges()
         assert all(c.closed for c in launches)
         assert gc_sdk.get_bridge("/repo/a") is not a1  # relaunches after shutdown
+
+    # -- terminal-error detail mining ----------------------------------------
+
+    def test_terminal_error_with_typed_detail_emits_enriched_sdk_error(
+        self, tmp_path, monkeypatch
+    ):
+        """A run settling with status "error" mines the typed
+        CursorAgentError fields off the handle and emits them on sdk.error
+        instead of the bare status."""
+        run = _FakeRun([_sdk_msg(type="thinking", text="hm")],
+                       final_status="error")
+        run.error = _typed_sdk_error(
+            "ServerError", "upstream 502", is_retryable=True, retry_after="30"
+        )
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "ServerError: upstream 502"
+        assert obj["retryable"] is True
+        assert obj["retry_after"] == "30"
+        assert obj["run_status"] == "error"
+
+    def test_terminal_error_detail_mined_from_wait_raise(
+        self, tmp_path, monkeypatch
+    ):
+        """No error attribute on the handle, but run.wait() raises the
+        typed error (the SDK's documented no-streaming path) — still mined."""
+
+        class _WaitRaisesRun(_FakeRun):
+            def wait(self):
+                raise _typed_sdk_error(
+                    "RateLimitError", "usage limits exceeded",
+                    is_retryable=True, retry_after="120",
+                )
+
+        run = _WaitRaisesRun([_sdk_msg(type="thinking", text="hm")],
+                             final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "RateLimitError: usage limits exceeded"
+        assert obj["retryable"] is True
+        assert obj["retry_after"] == "120"
+
+    def test_terminal_error_without_detail_falls_back_to_generic(
+        self, tmp_path, monkeypatch
+    ):
+        """Nothing error-shaped recoverable off the handle: the payload
+        keeps the generic text with unknown (None) retry fields — the run
+        still settles as an error, never raises."""
+        run = _FakeRun([_sdk_msg(type="thinking", text="hm")],
+                       final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "cursor run ended with status: error"
+        assert obj["retryable"] is None
+        assert obj["retry_after"] is None
+        assert obj["run_status"] == "error"
+
+
+def _typed_sdk_error(name, message, is_retryable=None, retry_after=None):
+    """An exception duck-typing the CursorAgentError surface, with a
+    controllable type name (the payload renders '<TypeName>: <message>')."""
+    cls = type(name, (Exception,), {})
+    err = cls(message)
+    err.message = message
+    if is_retryable is not None:
+        err.is_retryable = is_retryable
+    if retry_after is not None:
+        err.retry_after = retry_after
+    return err
 
 
 class _RetryableError(Exception):

@@ -577,6 +577,10 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 job.run_error = str(envelope.get("error") or "run failed")
                 job.timed_out = job.timed_out or bool(envelope.get("timeout"))
                 job.cancelled = job.cancelled or bool(envelope.get("cancelled"))
+                if "retryable" in envelope:
+                    job.error_retryable = envelope.get("retryable")
+                if "retry_after" in envelope:
+                    job.error_retry_after = envelope.get("retry_after")
             elif event == "reasoning":
                 text = str(envelope.get("text") or "")
                 if text:
@@ -665,6 +669,8 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         prose = job.summary_text()
         completed = job.completed
         run_error = job.run_error
+        error_retryable = job.error_retryable
+        error_retry_after = job.error_retry_after
         timed_out = job.timed_out
         result_session_id = job.cursor_session_id
         resumed = job.resumed
@@ -686,6 +692,10 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
     }
     if run_error:
         result["error"] = run_error
+        if error_retryable is not None:
+            result["error_retryable"] = error_retryable
+        if error_retry_after is not None:
+            result["error_retry_after"] = error_retry_after
         if files_changed:
             result["partial"] = True
     return result
@@ -1023,6 +1033,8 @@ def _render_send_result(name: str, result: Dict[str, Any]) -> str:
             summary=str(result.get("summary") or ""),
             files=result.get("files_changed") or [],
             error=str(result.get("error") or ""),
+            retryable=result.get("error_retryable"),
+            retry_after=result.get("error_retry_after"),
         )
     # Undelivered/unsettled shapes degrade to their error sentence.
     return str(

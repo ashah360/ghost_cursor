@@ -26,11 +26,18 @@ Yielded event tuples (consumed by ``events.SdkNormalizer``):
   was substituted (see :func:`translate_model`). Yielded before any run
   events so the substitution is visible in the event log.
 * ``("sdk.result", {"status": ...})`` — terminal run status as reported by
-  the SDK: finished | error | cancelled | expired.
-* ``("sdk.error", {"error": ..., "timeout": bool})`` — mid-run hard failure
-  (watchdog abort, unrecoverable stream/bridge error). Preflight failures
-  raise :class:`SdkRunnerError` instead so the tool returns a clean,
-  actionable error.
+  the SDK: finished | cancelled | expired. A terminal status of "error" is
+  emitted as ``sdk.error`` instead (below) so the typed detail travels
+  with it.
+* ``("sdk.error", {"error": ..., ...})`` — hard failure. Two shapes:
+  mid-run (watchdog abort, unrecoverable stream/bridge error) carries
+  ``{"error": ..., "timeout": bool}``; a run that settled with terminal
+  status "error" carries ``{"error": "<TypeName>: <message>", "retryable":
+  bool|None, "retry_after": str|None, "run_status": "error"}`` — the typed
+  ``CursorAgentError`` fields mined defensively off the run handle
+  (:func:`_terminal_error_detail`), generic text when nothing was
+  recoverable. Preflight failures raise :class:`SdkRunnerError` instead so
+  the tool returns a clean, actionable error.
 
 Run watchdogs keep the ACP semantics (INACTIVITY-based, not wall-clock): a
 run that keeps streaming events is alive and is never aborted for total
@@ -417,6 +424,70 @@ def _run_status(run: Any) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Terminal-error detail mining (run settled with status "error")
+# ---------------------------------------------------------------------------
+
+def _error_fields(obj: Any, _depth: int = 0) -> Optional[Dict[str, Any]]:
+    """The ``{"error", "retryable", "retry_after"}`` view of an error-ish
+    object, or None.
+
+    Error-ish = an Exception instance, or anything carrying a non-empty
+    ``message`` string (the ``CursorAgentError`` shape). Non-error carriers
+    (e.g. a RunResult) are probed one level for a nested ``error``
+    attribute. Everything is getattr-guarded — the run-handle surface is
+    not trusted here.
+    """
+    if obj is None or isinstance(obj, str) or _depth > 2:
+        return None
+    try:
+        message = getattr(obj, "message", None)
+        if isinstance(obj, BaseException) or (isinstance(message, str) and message):
+            text = message if isinstance(message, str) and message else str(obj)
+            retryable = getattr(obj, "is_retryable", None)
+            retry_after = getattr(obj, "retry_after", None)
+            return {
+                "error": f"{type(obj).__name__}: {text}",
+                "retryable": bool(retryable) if retryable is not None else None,
+                "retry_after": str(retry_after) if retry_after else None,
+            }
+        nested = getattr(obj, "error", None)
+    except Exception:
+        return None
+    if nested is not obj:
+        return _error_fields(nested, _depth + 1)
+    return None
+
+
+def _terminal_error_detail(run: Any) -> Optional[Dict[str, Any]]:
+    """Typed error detail mined off a run that settled with status "error".
+
+    The SDK's Run/RunResult carries a ``CursorAgentError`` (message,
+    is_retryable, retry_after) somewhere on the handle, but WHERE is not
+    stable across builds — so this probes ``run.error``, ``run.result``,
+    and a final ``run.wait()`` (which either returns the RunResult or
+    raises the typed error itself), all defensively. None when nothing
+    error-shaped was recoverable.
+    """
+    candidates: List[Any] = []
+    for attr in ("error", "result"):
+        try:
+            candidates.append(getattr(run, attr, None))
+        except Exception:
+            pass
+    try:
+        wait = getattr(run, "wait", None)
+        if callable(wait):
+            candidates.append(wait())
+    except Exception as exc:
+        candidates.append(exc)
+    for candidate in candidates:
+        detail = _error_fields(candidate)
+        if detail is not None:
+            return detail
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Bounded retries for transient bridge/HTTP failures
 # ---------------------------------------------------------------------------
 
@@ -739,6 +810,21 @@ class _SdkWorker:
                 self._settled = True
                 if self.abort_reason == "timeout":
                     self._put("sdk.error", self._timeout_error())
+                elif status == "error":
+                    # Terminal "error": surface the typed detail instead of
+                    # a bare status so downstream renders more than
+                    # "cursor run ended with status: error".
+                    detail = _terminal_error_detail(run) or {}
+                    self._put(
+                        "sdk.error",
+                        {
+                            "error": detail.get("error")
+                            or f"cursor run ended with status: {status}",
+                            "retryable": detail.get("retryable"),
+                            "retry_after": detail.get("retry_after"),
+                            "run_status": status,
+                        },
+                    )
                 else:
                     self._put("sdk.result", {"status": status})
             except Exception as exc:

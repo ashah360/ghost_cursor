@@ -350,6 +350,24 @@ def _bounded_diff_blocks(name: str, files: List[Dict[str, Any]]) -> List[str]:
     return blocks
 
 
+def _retry_qualifier(retryable: Any, retry_after: Any) -> str:
+    """' (retryable, retry after 30s)' from typed error detail; '' when
+    nothing is known (None = unknown, never rendered as 'not retryable')."""
+    parts = []
+    if retryable is True:
+        parts.append("retryable")
+    elif retryable is False:
+        parts.append("not retryable")
+    if retry_after:
+        after = str(retry_after)
+        try:
+            after = secs(float(after))
+        except (TypeError, ValueError):
+            pass  # HTTP-date form — render verbatim
+        parts.append(f"retry after {after}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
 def completion_text(
     *,
     name: str,
@@ -359,8 +377,16 @@ def completion_text(
     summary: str,
     files: List[Dict[str, Any]],
     error: str = "",
+    retryable: Any = None,
+    retry_after: Any = None,
 ) -> str:
-    """The terminal-state report (delivered message / in-turn fast finish)."""
+    """The terminal-state report (delivered message / in-turn fast finish).
+
+    ``retryable`` / ``retry_after`` are the typed error fields mined from a
+    terminal-error run (see sdk_runner) — rendered as a parenthetical on
+    the failure line: "run failed: ServerError: … (retryable, retry after
+    30s)".
+    """
     lines = [
         f"status: {status}",
         f"session: {name} · elapsed: {secs(elapsed_s)} · repo: {repo}",
@@ -368,9 +394,10 @@ def completion_text(
     if error:
         lines += [
             "",
-            f"run {status}: {_one_line(error)}. working-tree changes are "
-            "intact. send another message to the same session to continue "
-            "— transient failures usually succeed on retry.",
+            f"run {status}: {_one_line(error)}"
+            f"{_retry_qualifier(retryable, retry_after)}. working-tree "
+            "changes are intact. send another message to the same session "
+            "to continue — transient failures usually succeed on retry.",
         ]
     if summary:
         clipped = summary[:SUMMARY_CHARS]
