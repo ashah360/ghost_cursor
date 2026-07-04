@@ -5,7 +5,7 @@ v0.4 named-session model
 Every cursor run executes as a background :class:`CursorJob` on a worker
 thread. The SINGLE public handle for a run is the session NAME minted by
 ``cursor_create_session`` (``job.session_name``); the cursor ``session_id``
-from ACP ``session/new`` rides along as an alias. ``cursor_send_message``
+(the cursor-sdk agent id) rides along as an alias. ``cursor_send_message``
 dispatches into it, and ``cursor_status`` / ``cursor_stop`` /
 ``cursor_events`` take it back. This registry is the in-process job table
 behind that handle — rolling progress buffer, status, files-changed
@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 MAX_PROGRESS_CHARS = 200_000
 # How many finished jobs to retain for cursor_status queries.
 MAX_FINISHED_JOBS = 20
-# Envelopes produced before the ACP session (the spill-log key) exists are
+# Envelopes produced before the cursor agent (the spill-log key) exists are
 # held here, then flushed the moment the handle arrives. Bounded so a run
 # that never gets a session can't grow it forever.
 MAX_PENDING_SPILL = 1_000
@@ -125,13 +125,13 @@ class CursorJob:
     job_id: str  # internal dispatch id; the PUBLIC handle is session_name
     task: str
     repo: str
-    # Watchdog knobs (see acp_runner): abort after this much SILENCE (no ACP
-    # events) — activity resets the clock — plus an optional hard ceiling on
+    # Watchdog knobs (see sdk_runner): abort after this much SILENCE (no
+    # stream events) — activity resets the clock — plus an optional ceiling on
     # total run time (0 = disabled).
     inactivity_timeout_s: float
     max_wall_s: float = 0.0
     # v0.4 handle: the human slug minted by cursor_create_session (e.g.
-    # "playful-space-bunny"). The cursor ACP UUID (cursor_session_id below)
+    # "playful-space-bunny"). The cursor agent id (cursor_session_id below)
     # stays a resolvable alias. Empty only for direct registry use in tests.
     session_name: str = ""
     session_key: str = ""
@@ -141,13 +141,13 @@ class CursorJob:
     status: str = "running"
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
-    cursor_session_id: str = ""       # THE handle, set at acp.session
+    cursor_session_id: str = ""       # the agent-id alias, set at sdk.session
     resumed: bool = False
-    model: str = ""                   # actual model reported by acp.session
-    # Wall-clock time of the last ACP event received for this run (None
+    model: str = ""                   # actual model reported by sdk.session
+    # Wall-clock time of the last stream event received for this run (None
     # until the first event). Advisory only — feeds the last_activity_s
     # field of status snapshots so callers can flag silent runs; the
-    # actual inactivity watchdog lives in acp_runner.
+    # actual inactivity watchdog lives in sdk_runner.
     last_event_at: Optional[float] = None
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -172,7 +172,7 @@ class CursorJob:
     _pending_spill: List[Dict[str, Any]] = field(default_factory=list, repr=False)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
-    # Set the instant the ACP session is established (handle available).
+    # Set the instant the cursor agent is established (handle available).
     session_event: threading.Event = field(default_factory=threading.Event, repr=False)
     _lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
     _thread: Optional[threading.Thread] = field(default=None, repr=False)
@@ -180,7 +180,7 @@ class CursorJob:
     # -- control -------------------------------------------------------------
 
     def request_cancel(self) -> None:
-        """Ask the run to stop via cursor's native session/cancel path."""
+        """Ask the run to stop via the SDK's native run.cancel() path."""
         self.cancel_event.set()
 
     def arm_delivery(self) -> bool:
@@ -246,9 +246,9 @@ class CursorJob:
                 nl = cut.find("\n")
                 self.progress_buffer = cut[nl + 1:] if nl >= 0 else cut
             self.progress_events += 1
-            # Spill key: the session NAME (stable across runs and ACP
-            # session ids, so one named session = one log). Fallbacks keep
-            # name-less jobs (direct registry use) spilling by cursor sid.
+            # Spill key: the session NAME (stable across runs and agent
+            # ids, so one named session = one log). Fallbacks keep
+            # name-less jobs (direct registry use) spilling by agent id.
             spill_sid = (
                 self.session_name
                 or self.cursor_session_id
@@ -299,7 +299,7 @@ class CursorJob:
         """A read-only status snapshot (what ``cursor_status`` returns).
 
         STRICTLY read-only: takes the lock only to copy state. Never touches
-        the cancel event, the ACP session, or the worker thread.
+        the cancel event, the cursor run, or the worker thread.
         """
         now = time.time()
         with self._lock:
@@ -316,7 +316,7 @@ class CursorJob:
                 "repo": self.repo,
                 "task": _clip(self.task, 400),
                 "elapsed_s": round((self.finished_at or now) - self.created_at, 1),
-                # Seconds since the last ACP event (advisory: lets callers
+                # Seconds since the last stream event (advisory: lets callers
                 # flag a silent run without touching it). Frozen at
                 # finished_at for terminal runs; falls back to created_at
                 # before the first event arrives.
@@ -470,7 +470,7 @@ class CursorJobRegistry:
             self._push_completion_event(job, result)
         job.done_event.set()
         # Unblock anyone still waiting for a session that will never come
-        # (e.g. handshake failure before acp.session).
+        # (e.g. bridge/create failure before sdk.session).
         job.session_event.set()
 
     def _push_completion_event(self, job: CursorJob, result: Dict[str, Any]) -> None:
@@ -504,7 +504,7 @@ class CursorJobRegistry:
             "context": None,
             "toolsets": None,
             "role": "cursor",
-            "model": job.model or job.requested_model or "cursor-agent",
+            "model": job.model or job.requested_model or "cursor",
             "status": job.status,
             "summary": self._completion_summary(job, result),
             "error": result.get("error"),
@@ -570,7 +570,7 @@ class CursorJobRegistry:
 
         Matches the ESTABLISHED handle first; falls back to the REQUESTED
         resume handle so a just-dispatched continuation (``cursor_send`` /
-        resume) is addressable in the window before its ``acp.session``
+        resume) is addressable in the window before its ``sdk.session``
         event fires.
         """
         sid = str(session_id or "").strip()

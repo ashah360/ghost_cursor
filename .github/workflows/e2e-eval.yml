@@ -38,19 +38,15 @@ jobs:
         with: { python-version: "3.11" }
       - uses: astral-sh/setup-uv@v5
 
-      - name: Install cursor-agent
+      - name: Install cursor-sdk
         run: |
-          curl https://cursor.com/install -fsS | bash
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          sudo ln -sf "$HOME/.local/bin/cursor-agent" /usr/local/bin/cursor-agent || true
+          python -m pip install -U cursor-sdk
 
-      - name: Verify cursor auth (fail fast)
+      - name: Verify cursor-sdk + API key present (fail fast)
         run: |
           set -euo pipefail
-          cd /tmp
-          out=$(cursor-agent --api-key "$CURSOR_API_KEY" -p "reply with exactly: CI-OK" \
-            --model "$GHOST_CURSOR_TEST_MODEL" --output-format json --force --trust 2>&1 || true)
-          echo "$out" | grep -q '"is_error":false' || { echo "cursor auth failed"; exit 1; }
+          python -c "import cursor_sdk; print('cursor-sdk', getattr(cursor_sdk, '__version__', 'ok'))"
+          test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY secret missing"; exit 1; }
 
       - name: Install plugin + eval into the Hermes tree
         run: |
@@ -77,5 +73,5 @@ jobs:
           GHOST_CURSOR_PLUGIN_INIT: ${{ github.workspace }}/hermes-agent/plugins/ghost_cursor/__init__.py
         run: |
           set -euo pipefail
-          uv run --with pytest --with pytest-timeout pytest tests/plugins/e2e/test_eval.py -q -v \
+          uv run --with pytest --with pytest-timeout --with cursor-sdk pytest tests/plugins/e2e/test_eval.py -q -v \
             -p no:cacheprovider --timeout=300 --timeout-method=thread

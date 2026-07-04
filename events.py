@@ -1,13 +1,13 @@
-"""Normalization of cursor-agent events into canonical envelopes.
+"""Normalization of cursor events into canonical envelopes.
 
 Two normalizers share the same envelope builders:
 
 * :func:`normalize_harness` — the legacy ``--print --output-format
   stream-json`` stdout events (kept for the fallback/reference runner).
-* :class:`AcpNormalizer` — ACP ``session/update`` notifications from
-  ``cursor-agent acp`` (the current runner). Stateful, because ACP
-  ``tool_call_update`` events carry only ``toolCallId`` + delta fields; the
-  ``kind``/``title`` arrive on the initial ``tool_call`` event.
+* :class:`SdkNormalizer` — SDKMessage dicts from the official ``cursor-sdk``
+  stream (the current runner). Stateful, because ``tool_call`` completion
+  messages inherit the kind/title resolved when the call started, and
+  because durations are measured client-side.
 
 Adapted from the Threshold bridge (``app/bridge/events.py`` — the
 ``normalize_harness`` block), so the envelopes ``cursor_edit`` emits as tool
@@ -317,40 +317,520 @@ def normalize_harness(event_key: str, data: Dict[str, Any]) -> List[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# ACP (Agent Client Protocol) normalization — cursor-agent acp
+# cursor-sdk normalization — sdk_runner.run_sdk event tuples
 # ---------------------------------------------------------------------------
-# Field names below match CAPTURED session/update payloads from a real
-# `cursor-agent acp` run (2026-07-02, cursor-agent 2026.07.01-777f564), not
-# the spec. Observed variants (`sessionUpdate` discriminator):
-#
-#   available_commands_update {availableCommands: [...]}          → (noise)
-#   session_info_update       {title}                             → (noise)
-#   agent_thought_chunk       {content: {type: "text", text}}     → reasoning
-#   agent_message_chunk       {content: {type: "text", text}}     → content
-#   tool_call        {toolCallId, title, kind: "read"|"edit"|"execute",
-#                     status: "pending", rawInput: {command?}}    → tool_use
-#   tool_call_update {toolCallId, status: "in_progress"}          → (skip)
-#   tool_call_update {toolCallId, status: "completed",
-#                     rawOutput: {content} | {exitCode, stdout, stderr},
-#                     content: [{type: "diff", path, oldText, newText}]}
-#                                            → tool_result (+ file_diff)
-#
-# New-file quirk (observed): the diff content for a brand-new file arrives as
-# oldText="-- /dev/null\n" and newText prefixed with a "++ b/<path>" line —
-# fragments of a diff header leaking into the before/after fields. Stripped
-# by _clean_acp_diff().
+# SDKMessage shapes follow the official cursor-sdk docs (type discriminator:
+# system / user / assistant / thinking / tool_call / status / task / request
+# / usage). The envelope fields (type, call_id, name, status) are stable;
+# tool_call ``args`` and ``result`` payloads are EXPLICITLY UNSTABLE upstream
+# — everything below parses them defensively and never raises on an
+# unexpected shape.
 
-_ACP_EDIT_KINDS = {"edit", "write", "delete"}
-_ACP_NOISE_UPDATES = {"available_commands_update", "session_info_update", "plan"}
+# Message types that never produce envelopes: the task echo, handshake
+# metadata, and transient status pings.
+_SDK_NOISE_TYPES = {"system", "user", "request", "status"}
 
-# Transport-level failure signatures. Observed live (2026-07-03): when the
-# model stream behind cursor-agent dies mid-run, cursor-agent streams the
-# error text as an ordinary ``agent_message_chunk`` (e.g. "RetriableError:
-# [canceled] http/2 stream closed with error code CANCEL (0x8)") and STILL
-# resolves ``session/prompt`` with ``stopReason: "end_turn"`` — a clean
-# completion from ACP's point of view. Detect those signatures in the FINAL
+# tool_call names that mean a file edit (vs shell/read). Names are unstable
+# upstream, so this is a substring match, not an enum.
+_SDK_EDIT_NAME_HINTS = ("edit", "write", "delete", "apply_patch", "applypatch")
+
+_SDK_TERMINAL_TOOL_STATUSES = {"completed", "error", "failed", "cancelled"}
+
+
+def _first_str(data: Dict[str, Any], *keys: str) -> str:
+    """The first non-empty string value among ``keys``, else ""."""
+    for key in keys:
+        val = data.get(key)
+        if isinstance(val, str) and val:
+            return val
+    return ""
+
+
+def _sdk_tool_kind(name: str) -> str:
+    lowered = str(name or "").lower()
+    if any(hint in lowered for hint in _SDK_EDIT_NAME_HINTS):
+        return TOOL_FILE_EDIT
+    return TOOL_SHELL
+
+
+def _sdk_tool_title(name: str, kind: str, args: Dict[str, Any]) -> str:
+    path = _first_str(args, "path", "file_path", "filePath")
+    if kind == TOOL_FILE_EDIT:
+        return f"Editing {path}" if path else "File edit"
+    cmd = _first_str(args, "command", "cmd")
+    if cmd:
+        return cmd.strip().splitlines()[0][:120]
+    if "read" in str(name or "").lower() and path:
+        return f"Reading {path}"
+    return str(name or "").strip() or "Tool"
+
+
+def _sdk_assistant_text(msg: Dict[str, Any]) -> str:
+    """Concatenated text blocks from an assistant message, shape-tolerant."""
+    message = msg.get("message")
+    if isinstance(message, str):
+        return message
+    if not isinstance(message, dict):
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    parts: List[str] = []
+    for block in content or []:
+        if isinstance(block, dict) and isinstance(block.get("text"), str):
+            parts.append(block["text"])
+        elif isinstance(block, str):
+            parts.append(block)
+    return "".join(parts)
+
+
+# Key aliases probed on edit-tool payloads. The REAL shape (captured live
+# 2026-07-03 from cursor-sdk, fixtures/sdk_edit_tool_call.jsonl) wraps the
+# payload in a {"status": "success", "value": {...}} envelope, keeps
+# linesAdded / linesRemoved / diffString inside "value", and carries the
+# path ONLY in the call's args — never in the result. The schema is
+# documented unstable, so the older direct shapes stay matched too.
+_DIFF_PATH_KEYS = ("path", "file_path", "filePath")
+_DIFF_BEFORE_KEYS = ("beforeFullFileContent", "oldText", "before")
+_DIFF_AFTER_KEYS = ("afterFullFileContent", "newText", "after")
+_DIFF_TEXT_KEYS = ("diffString", "diff", "unifiedDiff", "patch")
+_DIFF_ADDED_KEYS = ("linesAdded", "added", "additions")
+_DIFF_REMOVED_KEYS = ("linesRemoved", "removed", "deletions")
+
+
+def _int_or_none(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_int(data: Dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        val = _int_or_none(data.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _diff_candidates(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Dict payloads that may describe file edits, envelope wrappers
+    ({"status": ..., "value": {...}} and friends) unwrapped recursively."""
+    out: List[Dict[str, Any]] = []
+
+    def add(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, dict):
+            return
+        out.append(node)
+        if depth >= 3:
+            return
+        for key in ("value", "success", "result", "edit", "data"):
+            add(node.get(key), depth + 1)
+        for key in ("content", "diffs", "edits", "files"):
+            nested = node.get(key)
+            if isinstance(nested, list):
+                for item in nested:
+                    add(item, depth + 1)
+
+    add(result)
+    return out
+
+
+def _diff_status_from_text(diff_text: str) -> str:
+    """Porcelain status inferred from unified-diff headers.
+
+    Used for pre-rendered diffString payloads (no before/after content to
+    infer from): "--- /dev/null" means the file was added, "+++ /dev/null"
+    deleted, anything else a modification.
+    """
+    for line in diff_text.splitlines()[:6]:
+        if line.startswith("--- ") and "/dev/null" in line:
+            return "A"
+        if line.startswith("+++ ") and "/dev/null" in line:
+            return "D"
+    return "M"
+
+
+def _sdk_diff_entries(
+    result: Dict[str, Any], fallback_path: str = ""
+) -> List[Dict[str, Any]]:
+    """Best-effort file_diff envelopes mined from a tool_call result.
+
+    The payload schema is unstable, so this probes every shape seen live
+    (the {"status", "value"} envelope with diffString + line counts, full
+    before/after content, oldText/newText blocks, pre-rendered diff
+    strings) and returns [] rather than guessing. ``fallback_path`` is the
+    path from the call's args / running message — the REAL edit tool's
+    result carries no path at all. Runs whose edits slip through entirely
+    still land in files_changed via the git fallback
+    (sdk_runner.git_fallback_diffs).
+    """
+    entries: List[Dict[str, Any]] = []
+    seen: set = set()
+    for cand in _diff_candidates(result):
+        path = _first_str(cand, *_DIFF_PATH_KEYS) or fallback_path
+        if not path:
+            continue
+        before = _first_str(cand, *_DIFF_BEFORE_KEYS)
+        after = _first_str(cand, *_DIFF_AFTER_KEYS)
+        pre_rendered = _first_str(cand, *_DIFF_TEXT_KEYS)
+        if not (before or after or pre_rendered):
+            continue
+        status: str | None = None
+        if before or after:
+            diff_text, added, removed = unified_diff_text(before, after, path)
+        else:
+            diff_text = pre_rendered
+            added_hint = _first_int(cand, *_DIFF_ADDED_KEYS)
+            removed_hint = _first_int(cand, *_DIFF_REMOVED_KEYS)
+            added = added_hint if added_hint is not None else sum(
+                1 for l in pre_rendered.splitlines()
+                if l.startswith("+") and not l.startswith("+++")
+            )
+            removed = removed_hint if removed_hint is not None else sum(
+                1 for l in pre_rendered.splitlines()
+                if l.startswith("-") and not l.startswith("---")
+            )
+            status = _diff_status_from_text(pre_rendered)
+        if not diff_text:
+            continue
+        dedupe_key = (path, diff_text[:500])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        entries.append(
+            file_diff(
+                path=path,
+                before=before,
+                after=after,
+                diff=diff_text,
+                added=added,
+                removed=removed,
+                status=status,
+            )
+        )
+    return entries
+
+
+def _sdk_output_text(result: Any) -> str:
+    """Shell/read output mined from a tool_call result, shape-tolerant.
+
+    Real payloads (captured live 2026-07-03) nest the useful fields inside
+    a {"status": "success", "value": {...}} envelope; older/other shapes
+    carry them at the top level. Both are probed.
+    """
+    if isinstance(result, str):
+        return result
+    if not isinstance(result, dict):
+        return "" if result is None else str(result)
+    for wrapper_key in ("value", "success", "error", "failure"):
+        nested = result.get(wrapper_key)
+        if isinstance(nested, dict):
+            inner = _sdk_output_text(nested)
+            if inner:
+                return inner
+    parts = [
+        str(result.get(k))
+        for k in ("stdout", "stderr", "content", "output", "text", "error")
+        if isinstance(result.get(k), str) and result.get(k)
+    ]
+    return "\n".join(parts)
+
+
+def _sdk_exit_code(result: Any) -> int | None:
+    """The command exit code from a tool_call result, envelope-tolerant."""
+    if not isinstance(result, dict):
+        return None
+    code = _int_or_none(result.get("exitCode", result.get("exit_code")))
+    if code is not None:
+        return code
+    nested = result.get("value")
+    if isinstance(nested, dict):
+        return _int_or_none(nested.get("exitCode", nested.get("exit_code")))
+    return None
+
+
+class SdkNormalizer:
+    """Stateful sdk_runner event → canonical-envelope mapper (one per run).
+
+    Stateful because tool_call completion messages must inherit the
+    kind/title resolved when the call started, and because durations are
+    measured client-side.
+    """
+
+    def __init__(self) -> None:
+        # call_id → {kind, title, command, started (monotonic)}
+        self._calls: Dict[str, Dict[str, Any]] = {}
+        # call_ids whose "running" tool_use envelope was already emitted
+        # (the SDK may re-emit running-status messages as args accumulate).
+        self._started: set = set()
+        # Tail of the FINAL contiguous content segment: assistant deltas
+        # accumulate here and any tool/thinking activity resets it, so at a
+        # "finished" result it holds only what the agent streamed last.
+        # Scanned for transport-error signatures (see _TRANSPORT_ERROR_RE) —
+        # observed live under ACP and kept under the SDK: a dying model
+        # stream can be narrated as ordinary content before a clean finish.
+        self._final_content_tail = ""
+
+    # -- event entry point ---------------------------------------------------
+
+    def normalize(self, event_key: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Translate one sdk_runner event into canonical envelopes.
+
+        Args:
+            event_key: ``"sdk.session" | "sdk.message" | "sdk.reattached" |
+                "sdk.model_warning" | "sdk.result" | "sdk.error"`` as
+                yielded by :func:`sdk_runner.run_sdk`.
+            data: For ``sdk.message``, the SDKMessage as a plain dict.
+        """
+        data = data if isinstance(data, dict) else {}
+
+        if event_key == "sdk.session":
+            return [
+                lifecycle(
+                    "run.started",
+                    model=data.get("model"),
+                    cwd=data.get("cwd"),
+                    harness_session_id=data.get("agentId"),
+                )
+            ]
+
+        if event_key == "sdk.model_warning":
+            # A legacy/unparseable model string was substituted (see
+            # sdk_runner.translate_model). Log-signal lifecycle event: the
+            # fold ignores unknown lifecycle events, so this lands in the
+            # progress buffer and JSONL log without touching the run.
+            return [
+                lifecycle(
+                    "model.warning",
+                    warning=data.get("warning"),
+                    requested=data.get("requested"),
+                    using=data.get("using"),
+                )
+            ]
+
+        if event_key == "sdk.reattached":
+            # Transparent stream recovery: JSONL-log signal only. The fold
+            # ignores unknown lifecycle events, so nothing user-visible
+            # changes — no synthetic messages, no re-prompt.
+            return [
+                lifecycle(
+                    "stream.reattached",
+                    offset=data.get("offset"),
+                    attempt=data.get("attempt"),
+                )
+            ]
+
+        if event_key == "sdk.result":
+            status = str(data.get("status") or "")
+            if status == "finished":
+                transport_error = _transport_error_line(self._final_content_tail)
+                if transport_error:
+                    # The "clean" finish is a lie: the stream died and the
+                    # error was narrated as the last message. Classify the
+                    # run failed, error first-class.
+                    return [
+                        lifecycle(
+                            "run.failed",
+                            status="failed",
+                            error=transport_error,
+                            transport_error=True,
+                            run_status=status,
+                        )
+                    ]
+                return [lifecycle("run.completed", status="completed",
+                                  run_status=status)]
+            if status == "cancelled":
+                return [
+                    lifecycle(
+                        "run.failed",
+                        status="failed",
+                        error="run cancelled (run.cancel)",
+                        cancelled=True,
+                    )
+                ]
+            if status == "expired":
+                return [
+                    lifecycle(
+                        "run.failed",
+                        status="failed",
+                        error="cursor run expired",
+                        timeout=True,
+                        run_status=status,
+                    )
+                ]
+            return [
+                lifecycle(
+                    "run.failed",
+                    status="failed",
+                    error=str(data.get("error") or "")
+                    or f"cursor run ended with status: {status or 'unknown'}",
+                    run_status=status,
+                )
+            ]
+
+        if event_key == "sdk.error":
+            return [
+                lifecycle(
+                    "run.failed",
+                    status="failed",
+                    error=data.get("error") or "cursor-sdk error",
+                    timeout=bool(data.get("timeout")),
+                )
+            ]
+
+        if event_key == "sdk.message":
+            return self._message(data)
+
+        # Unknown runner event: opaque passthrough so nothing is dropped.
+        return [lifecycle("passthrough", name=event_key, data=data)]
+
+    # -- SDKMessage types ------------------------------------------------------
+
+    def _message(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        mtype = str(msg.get("type") or "")
+
+        if mtype in _SDK_NOISE_TYPES:
+            return []
+
+        if mtype == "thinking":
+            self._final_content_tail = ""
+            text = msg.get("text")
+            if isinstance(text, str) and text:
+                return [lifecycle("reasoning", text=text)]
+            return []
+
+        if mtype == "assistant":
+            text = _sdk_assistant_text(msg)
+            if text:
+                self._final_content_tail = (
+                    self._final_content_tail + text
+                )[-_TRANSPORT_SCAN_CHARS:]
+            return [content_delta(text)] if text else []
+
+        if mtype == "tool_call":
+            self._final_content_tail = ""
+            return self._tool_call(msg)
+
+        if mtype == "usage":
+            # Log-only: token accounting lands in the JSONL event log.
+            return [lifecycle("usage", usage=msg.get("usage"))]
+
+        if mtype == "task":
+            return [lifecycle("task", status=msg.get("status"),
+                              text=msg.get("text"))]
+
+        # Unknown message type: opaque passthrough.
+        return [lifecycle("passthrough", name=f"sdk.{mtype or 'message'}", data=msg)]
+
+    def _tool_call(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        call_id = str(msg.get("call_id") or "tool")
+        status = str(msg.get("status") or "")
+        if status in _SDK_TERMINAL_TOOL_STATUSES:
+            return self._tool_completed(call_id, status, msg)
+        return self._tool_started(call_id, msg)
+
+    def _tool_started(self, call_id: str, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
+        if call_id in self._started:
+            return []  # re-emitted running message (args accumulating)
+        self._started.add(call_id)
+
+        name = str(msg.get("name") or "")
+        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        kind = _sdk_tool_kind(name)
+        title = _sdk_tool_title(name, kind, args)
+        state = {
+            "kind": kind,
+            "title": title,
+            "command": _first_str(args, "command", "cmd"),
+            "path": _first_str(args, *_DIFF_PATH_KEYS),
+            "started": time.monotonic(),
+        }
+        self._calls[call_id] = state
+
+        env = _envelope(
+            "tool_use",
+            id=call_id,
+            tool=kind,
+            status=STATUS_RUNNING,
+            title=title,
+        )
+        if kind == TOOL_FILE_EDIT:
+            env["path"] = _first_str(args, "path", "file_path", "filePath")
+            env["additions"] = 0
+            env["deletions"] = 0
+        else:
+            env["command"] = state["command"]
+        return [env]
+
+    def _tool_completed(
+        self, call_id: str, status: str, msg: Dict[str, Any]
+    ) -> List[Dict[str, Any]]:
+        state = self._calls.get(call_id) or {}
+        kind = state.get("kind") or _sdk_tool_kind(str(msg.get("name") or ""))
+
+        envelopes: List[Dict[str, Any]] = []
+        if call_id not in self._started:
+            # Terminal message with no prior running message (observed on
+            # very fast calls): synthesize the tool_use so the pair renders.
+            envelopes.extend(self._tool_started(call_id, msg))
+
+        is_error = status in ("error", "failed", "cancelled")
+        res_env: Dict[str, Any] = _envelope(
+            "tool_result",
+            id=call_id,
+            status=STATUS_ERROR if is_error else STATUS_DONE,
+        )
+        started = state.get("started")
+        if isinstance(started, float):
+            res_env["durationMs"] = int((time.monotonic() - started) * 1000)
+
+        envelopes.append(res_env)
+
+        result = msg.get("result")
+        result_dict = result if isinstance(result, dict) else {}
+
+        # The path from the call's args: the REAL edit tool's result carries
+        # no path (captured live 2026-07-03), only the args do — probe the
+        # terminal message's args first, then the remembered running state.
+        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        fallback_path = (
+            _first_str(args, *_DIFF_PATH_KEYS) or str(state.get("path") or "")
+        )
+
+        diffs = (
+            _sdk_diff_entries(result_dict, fallback_path=fallback_path)
+            if kind == TOOL_FILE_EDIT
+            else []
+        )
+        if diffs:
+            res_env["additions"] = sum(d["added"] for d in diffs)
+            res_env["deletions"] = sum(d["removed"] for d in diffs)
+            envelopes.extend(diffs)
+        else:
+            out = _sdk_output_text(result)
+            if out:
+                res_env["output"] = _clip(out, MAX_OUTPUT_CHARS)
+            exit_code = _sdk_exit_code(result)
+            if exit_code not in (None, 0):
+                res_env["status"] = STATUS_ERROR
+
+        return envelopes
+
+
+# ---------------------------------------------------------------------------
+# Transport-error detection + diff utilities (shared)
+# ---------------------------------------------------------------------------
+
+# Transport-level failure signatures. Observed live (2026-07-03, under the
+# old ACP transport): when the model stream behind cursor dies mid-run, the
+# error text can be streamed as ordinary assistant content (e.g.
+# "RetriableError: [canceled] http/2 stream closed with error code CANCEL
+# (0x8)") followed by a CLEAN finish. Detect those signatures in the FINAL
 # contiguous content segment (anything the agent streamed after its last
-# tool/thought activity) so the run is classified failed instead of
+# tool/thinking activity) so the run is classified failed instead of
 # completed. A signature that appears earlier and is followed by more
 # activity means cursor recovered — that run stays a normal completion.
 _TRANSPORT_ERROR_RE = re.compile(
@@ -388,241 +868,3 @@ def unified_diff_text(before: str, after: str, path: str) -> Tuple[str, int, int
     added = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
     removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
     return "".join(lines), added, removed
-
-
-def _clean_acp_diff(old_text: str, new_text: str) -> Tuple[str, str]:
-    """Strip the observed diff-header fragments from new-file diff content."""
-    old = str(old_text or "")
-    if old.strip() in ("-- /dev/null", "--- /dev/null"):
-        old = ""
-    new = str(new_text or "")
-    first, _, rest = new.partition("\n")
-    if first.startswith(("++ b/", "+++ b/")):
-        new = rest
-    return old, new
-
-
-def _acp_text(data: Dict[str, Any]) -> str:
-    """Text from an agent_message_chunk / agent_thought_chunk content block."""
-    content = data.get("content")
-    if isinstance(content, dict) and isinstance(content.get("text"), str):
-        return content["text"]
-    if isinstance(content, str):
-        return content
-    return ""
-
-
-class AcpNormalizer:
-    """Stateful session/update → canonical-envelope mapper (one per run)."""
-
-    def __init__(self) -> None:
-        # toolCallId → {kind, title, command, started (monotonic)}
-        self._calls: Dict[str, Dict[str, Any]] = {}
-        # Tail of the FINAL contiguous content segment: agent_message_chunk
-        # deltas accumulate here and any tool/thought activity resets it, so
-        # at end_turn it holds only what the agent streamed last. Scanned
-        # for transport-error signatures (see _TRANSPORT_ERROR_RE).
-        self._final_content_tail = ""
-
-    # -- event entry point ---------------------------------------------------
-
-    def normalize(self, event_key: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Translate one acp_runner event into canonical envelopes.
-
-        Args:
-            event_key: ``"acp.session" | "acp.update" | "acp.result" |
-                "acp.error"`` as yielded by :func:`acp_runner.run_acp`.
-            data: For ``acp.update``, the raw ``params.update`` payload.
-        """
-        data = data if isinstance(data, dict) else {}
-
-        if event_key == "acp.session":
-            return [
-                lifecycle(
-                    "run.started",
-                    model=data.get("model"),
-                    cwd=data.get("cwd"),
-                    harness_session_id=data.get("sessionId"),
-                )
-            ]
-
-        if event_key == "acp.result":
-            stop = str(data.get("stopReason") or "")
-            if stop == "end_turn":
-                transport_error = _transport_error_line(self._final_content_tail)
-                if transport_error:
-                    # The "clean" end_turn is a lie: the stream died and
-                    # cursor-agent narrated the transport error as its last
-                    # message. Classify the run failed, error first-class.
-                    return [
-                        lifecycle(
-                            "run.failed",
-                            status="failed",
-                            error=transport_error,
-                            transport_error=True,
-                            stop_reason=stop,
-                        )
-                    ]
-                return [lifecycle("run.completed", status="completed", stop_reason=stop)]
-            if stop == "cancelled":
-                return [
-                    lifecycle(
-                        "run.failed",
-                        status="failed",
-                        error="run cancelled (session/cancel)",
-                        cancelled=True,
-                    )
-                ]
-            return [
-                lifecycle(
-                    "run.failed",
-                    status="failed",
-                    error=f"cursor-agent stopped: {stop or 'unknown stopReason'}",
-                    stop_reason=stop,
-                )
-            ]
-
-        if event_key == "acp.error":
-            return [
-                lifecycle(
-                    "run.failed",
-                    status="failed",
-                    error=data.get("error") or "ACP error",
-                    timeout=bool(data.get("timeout")),
-                )
-            ]
-
-        if event_key == "acp.update":
-            return self._update(data)
-
-        # Unknown runner event: opaque passthrough (mirrors normalize_harness).
-        return [lifecycle("passthrough", name=event_key, data=data)]
-
-    # -- session/update variants ----------------------------------------------
-
-    def _update(self, upd: Dict[str, Any]) -> List[Dict[str, Any]]:
-        variant = str(upd.get("sessionUpdate") or "")
-
-        if variant in _ACP_NOISE_UPDATES:
-            return []
-
-        if variant == "agent_thought_chunk":
-            self._final_content_tail = ""  # thought after content: not final
-            text = _acp_text(upd)
-            return [lifecycle("reasoning", text=text)] if text else []
-
-        if variant == "agent_message_chunk":
-            text = _acp_text(upd)
-            if text:
-                self._final_content_tail = (
-                    self._final_content_tail + text
-                )[-_TRANSPORT_SCAN_CHARS:]
-            return [content_delta(text)] if text else []
-
-        if variant == "tool_call":
-            self._final_content_tail = ""  # tool activity: content wasn't final
-            return self._tool_call(upd)
-
-        if variant == "tool_call_update":
-            self._final_content_tail = ""
-            return self._tool_call_update(upd)
-
-        # Unknown variant: opaque passthrough so nothing is silently dropped.
-        return [lifecycle("passthrough", name=f"acp.{variant or 'update'}", data=upd)]
-
-    def _tool_call(self, upd: Dict[str, Any]) -> List[Dict[str, Any]]:
-        call_id = str(upd.get("toolCallId") or "tool")
-        raw_kind = str(upd.get("kind") or "")
-        kind = TOOL_FILE_EDIT if raw_kind in _ACP_EDIT_KINDS else TOOL_SHELL
-        raw_input = upd.get("rawInput") if isinstance(upd.get("rawInput"), dict) else {}
-        title = str(upd.get("title") or "").strip() or (raw_kind or "Tool")
-
-        state = {
-            "kind": kind,
-            "title": title,
-            "command": str(raw_input.get("command") or ""),
-            "started": time.monotonic(),
-        }
-        self._calls[call_id] = state
-
-        env = _envelope(
-            "tool_use",
-            id=call_id,
-            tool=kind,
-            status=STATUS_RUNNING,
-            title=title,
-        )
-        if kind == TOOL_FILE_EDIT:
-            env["path"] = str(raw_input.get("path") or "")
-            env["additions"] = 0
-            env["deletions"] = 0
-        else:
-            env["command"] = state["command"]
-
-        envelopes = [env]
-        # Defensive: a tool_call that arrives already terminal.
-        if str(upd.get("status") or "") in ("completed", "failed"):
-            envelopes.extend(self._tool_call_update(upd))
-        return envelopes
-
-    def _tool_call_update(self, upd: Dict[str, Any]) -> List[Dict[str, Any]]:
-        status = str(upd.get("status") or "")
-        if status not in ("completed", "failed"):
-            return []  # pending / in_progress — tool_use already emitted
-
-        call_id = str(upd.get("toolCallId") or "tool")
-        state = self._calls.get(call_id) or {}
-        kind = state.get("kind") or TOOL_SHELL
-
-        res_env: Dict[str, Any] = _envelope(
-            "tool_result",
-            id=call_id,
-            status=STATUS_ERROR if status == "failed" else STATUS_DONE,
-        )
-        started = state.get("started")
-        if isinstance(started, float):
-            res_env["durationMs"] = int((time.monotonic() - started) * 1000)
-
-        envelopes = [res_env]
-
-        # File edits carry [{type: "diff", path, oldText, newText}] blocks.
-        diff_blocks = [
-            b
-            for b in (upd.get("content") or [])
-            if isinstance(b, dict) and b.get("type") == "diff"
-        ]
-        total_added = total_removed = 0
-        for block in diff_blocks:
-            path = str(block.get("path") or "")
-            before, after = _clean_acp_diff(block.get("oldText"), block.get("newText"))
-            diff_text, added, removed = unified_diff_text(before, after, path)
-            total_added += added
-            total_removed += removed
-            envelopes.append(
-                file_diff(
-                    path=path,
-                    before=before,
-                    after=after,
-                    diff=diff_text,
-                    added=added,
-                    removed=removed,
-                )
-            )
-        if diff_blocks:
-            res_env["additions"] = total_added
-            res_env["deletions"] = total_removed
-
-        # Shell / read output for the tool_result card.
-        raw_out = upd.get("rawOutput") if isinstance(upd.get("rawOutput"), dict) else {}
-        if not diff_blocks and raw_out:
-            out_parts = [
-                str(raw_out.get(k))
-                for k in ("stdout", "stderr", "content", "output")
-                if isinstance(raw_out.get(k), str) and raw_out.get(k)
-            ]
-            if out_parts:
-                res_env["output"] = _clip("\n".join(out_parts), MAX_OUTPUT_CHARS)
-            if raw_out.get("exitCode") not in (None, 0):
-                res_env["status"] = STATUS_ERROR
-
-        return envelopes

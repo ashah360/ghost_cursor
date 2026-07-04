@@ -29,7 +29,11 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, Iterator, Tuple
 
-DEFAULT_MODEL = "claude-fable-5-thinking-high"
+# Base model id only — the cursor-sdk model catalog has no combined
+# "<id>-thinking-<level>" slugs (those were ACP-era CLI shorthand; the SDK
+# rejects them with BadRequestError). Thinking/effort ride as ModelSelection
+# params instead — see sdk_runner.translate_model.
+DEFAULT_MODEL = "claude-fable-5"
 DEFAULT_TIMEOUT_S = 600.0
 # SIGTERM -> SIGKILL grace, mirrors the Threshold harness.
 TERM_GRACE_S = 10.0

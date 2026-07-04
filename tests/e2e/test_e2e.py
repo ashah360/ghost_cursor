@@ -1,6 +1,6 @@
 """End-to-end tests for ghost_cursor — NO MOCKS.
 
-Runs the real plugin against the real `cursor-agent` binary and the real Hermes
+Runs the real plugin against the real `cursor-sdk` package and the real Hermes
 core modules. Exercises every input shape of the v0.4 named-session interface:
 cursor_create_session (lazy), cursor_send_message (first task + resume),
 cursor_status (read-only), cursor_stop, cursor_events, cursor_list, the
@@ -14,7 +14,7 @@ lines like 'status: completed', never JSON keys.
 
 Requires (skips cleanly if absent):
   - CURSOR_API_KEY in env
-  - `cursor-agent` on PATH
+  - `cursor-sdk` installed (pip install cursor-sdk)
   - GHOST_CURSOR_E2E=1  (opt-in; keeps the real-network suite off by default)
 
 Model is pinned cheap via GHOST_CURSOR_TEST_MODEL (default gpt-5.4-nano-low) so
@@ -22,7 +22,6 @@ CI stays fast + cheap. Tasks are trivially small so even a weak model nails them
 """
 import importlib.util
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -40,11 +39,11 @@ _REAL_CURSOR_KEY = os.environ.get("CURSOR_API_KEY")
 
 _run = os.environ.get("GHOST_CURSOR_E2E") == "1"
 _have_key = bool(_REAL_CURSOR_KEY)
-_have_bin = shutil.which("cursor-agent") is not None
+_have_sdk = importlib.util.find_spec("cursor_sdk") is not None
 
 pytestmark = pytest.mark.skipif(
-    not (_run and _have_key and _have_bin),
-    reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and install cursor-agent",
+    not (_run and _have_key and _have_sdk),
+    reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and pip install cursor-sdk",
 )
 
 TERMINAL = ("completed", "failed", "cancelled", "timeout")
