@@ -588,23 +588,69 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 job.segment_open = False
 
 
-def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
-    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
+# Transparent zero-progress auto-retry. Live incident (2026-07-04): runs
+# dispatched through a stale, hours-old cursor-sdk-bridge sidecar reached
+# terminal "error" within seconds having produced ZERO meaningful events,
+# while fresh bridges worked — killing the stale bridges fixed everything.
+# A run matching that signature (terminal error + nothing meaningful
+# streamed + retryable-or-unknown) is re-sent on the SAME agent up to
+# _MAX_AUTO_RETRIES times with backoff, recycling the workspace bridge
+# before the first retry. Nothing user-facing: the job stays "running"
+# (digest numbering/subscription continue) and only jsonl lifecycle events
+# ("sdk.autoretry") record it. A run with ANY meaningful progress, a
+# non-retryable error, or an exhausted budget surfaces the detailed
+# failure instead.
+_MAX_AUTO_RETRIES = 2
+# Backoff ladder before retry N (1-based); a parseable server retry_after
+# on the error overrides the step. Module-level so tests can zero it.
+_AUTO_RETRY_BACKOFF_S = (15.0, 60.0)
 
-    Runs on the job worker thread. Cancellation is the job's cancel event
-    (set by cursor_stop / cursor_send_message), which triggers the native
-    ``run.cancel()``. The cursor agent id is persisted onto the session's
-    handle entry (as the alias) the instant the agent exists, so
-    ``Agent.resume`` keeps working across process restarts.
+# Envelope kinds that mean the run actually did something. Reasoning rides
+# a lifecycle envelope, so it is matched by event name; all other
+# session/lifecycle plumbing (run.started, model warnings, usage, task
+# status, stream reattaches) does NOT count as progress.
+_MEANINGFUL_KINDS = ("tool_use", "tool_result", "file_diff", "content")
+
+
+def _is_meaningful(envelope: Dict[str, Any]) -> bool:
+    kind = envelope.get("kind")
+    if kind in _MEANINGFUL_KINDS:
+        return True
+    return kind == "lifecycle" and envelope.get("event") == "reasoning"
+
+
+def _auto_retry_delay_s(state: Dict[str, Any], attempt: int) -> float:
+    """Backoff before auto-retry ``attempt`` (1-based): the server-supplied
+    retry_after when it parses as seconds, else the fixed ladder."""
+    retry_after = state.get("retry_after")
+    if retry_after:
+        try:
+            return max(float(str(retry_after)), 0.0)
+        except (TypeError, ValueError):
+            pass  # HTTP-date form — fall through to the ladder
+    return _AUTO_RETRY_BACKOFF_S[min(attempt - 1, len(_AUTO_RETRY_BACKOFF_S) - 1)]
+
+
+def _run_attempt(job: "_jobs.CursorJob", workdir: str) -> Dict[str, Any]:
+    """One run_sdk pass for ``job``: stream, fold, persist the handle.
+
+    Returns the attempt state the auto-retry decision needs:
+
+    * ``preflight`` — a final result dict when the run never happened
+      (bridge/auth/repo preflight failure); the caller returns it as-is.
+    * ``meaningful`` — True when any tool call / diff / content / reasoning
+      envelope was folded (session/lifecycle events don't count).
+    * ``terminal_error`` (+ ``retryable`` / ``retry_after``) — True when
+      the run settled with SDK status "error" (the enriched ``sdk.error``
+      payload, see sdk_runner).
     """
-    started = time.monotonic()
-    workdir = job.repo
-
-    # Pre-run git snapshot: fuels the fallback that populates files_changed
-    # when cursor edits through paths that emit no parseable diff content
-    # in the stream (e.g. shell commands; tool payloads are unstable).
-    git_before = _sdk.git_status_snapshot(workdir)
-
+    state: Dict[str, Any] = {
+        "preflight": None,
+        "meaningful": False,
+        "terminal_error": False,
+        "retryable": None,
+        "retry_after": None,
+    }
     normalizer = _events.SdkNormalizer()
     try:
         for key, obj in _sdk.run_sdk(
@@ -613,7 +659,9 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
             inactivity_timeout_s=float(job.inactivity_timeout_s),
             max_wall_s=float(job.max_wall_s),
             cancel_check=job.cancel_event.is_set,
-            agent_id=job.requested_session_id,
+            # A retry re-sends on the SAME agent established by the first
+            # attempt (its state survives the bridge recycle on disk).
+            agent_id=job.cursor_session_id or job.requested_session_id,
             model=job.requested_model,
         ):
             job.last_event_at = time.time()
@@ -635,18 +683,87 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
                     cursor_session_id=sid,
                 )
                 job.session_event.set()
+            elif key == "sdk.error" and obj.get("run_status") == "error":
+                state["terminal_error"] = True
+                state["retryable"] = obj.get("retryable")
+                state["retry_after"] = obj.get("retry_after")
             for envelope in normalizer.normalize(key, obj):
+                if not state["meaningful"] and _is_meaningful(envelope):
+                    state["meaningful"] = True
                 _fold_envelope(job, envelope)
     except _sdk.SdkRunnerError as exc:
         # Hard SDK failure (bridge/create/auth) — actionable error, no
         # silent regress.
-        return {"success": False, "error": str(exc)}
+        state["preflight"] = {"success": False, "error": str(exc)}
     except _runner.HarnessError as exc:
-        return {"success": False, "error": str(exc)}
+        state["preflight"] = {"success": False, "error": str(exc)}
     except Exception as exc:
         logger.exception("cursor run failed")
         with job._lock:
             job.run_error = f"{type(exc).__name__}: {exc}"
+    return state
+
+
+def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
+    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
+
+    Runs on the job worker thread. Cancellation is the job's cancel event
+    (set by cursor_stop / cursor_send_message), which triggers the native
+    ``run.cancel()``. The cursor agent id is persisted onto the session's
+    handle entry (as the alias) the instant the agent exists, so
+    ``Agent.resume`` keeps working across process restarts. Zero-progress
+    terminal errors are transparently retried on the same agent (see
+    _MAX_AUTO_RETRIES above) with a bridge recycle before the first retry.
+    """
+    started = time.monotonic()
+    workdir = job.repo
+
+    # Pre-run git snapshot: fuels the fallback that populates files_changed
+    # when cursor edits through paths that emit no parseable diff content
+    # in the stream (e.g. shell commands; tool payloads are unstable).
+    git_before = _sdk.git_status_snapshot(workdir)
+
+    attempt = 0  # auto-retries used so far
+    while True:
+        state = _run_attempt(job, workdir)
+        if state["preflight"] is not None:
+            return state["preflight"]
+        if not (
+            state["terminal_error"]
+            and not state["meaningful"]
+            and state["retryable"] is not False  # retryable or unknown
+            and attempt < _MAX_AUTO_RETRIES
+            and not job.cancel_event.is_set()
+        ):
+            break
+        attempt += 1
+        # The stale-bridge lever (see the incident note above): recycle the
+        # workspace bridge once, before the FIRST retry.
+        bridge_recycled = attempt == 1 and _sdk.recycle_bridge(workdir)
+        with job._lock:
+            reason = (
+                "zero-progress terminal error: "
+                f"{job.run_error or 'unknown error'}"
+            )
+        # Log-only signal (jsonl + rolling buffer) — nothing user-facing.
+        _fold_envelope(job, _events.lifecycle(
+            "sdk.autoretry",
+            attempt=attempt,
+            reason=reason,
+            bridge_recycled=bool(bridge_recycled),
+        ))
+        logger.warning(
+            "ghost_cursor auto-retry %d/%d for job %s (%s; bridge_recycled=%s)",
+            attempt, _MAX_AUTO_RETRIES, job.job_id, reason, bridge_recycled,
+        )
+        if job.cancel_event.wait(_auto_retry_delay_s(state, attempt)):
+            break  # cancelled during backoff — settle with what we have
+        # The retry owns the failure reporting now: clear the previous
+        # attempt's error state so a successful retry builds a clean result.
+        with job._lock:
+            job.run_error = None
+            job.error_retryable = None
+            job.error_retry_after = None
 
     # Git fallback: edits the stream carried no diff for (shell-driven
     # writes, kill-before-diff) still land in files_changed + progress.

@@ -250,6 +250,9 @@ def model_id_of(model: Optional[ModelValue]) -> str:
 # ---------------------------------------------------------------------------
 
 _bridges: Dict[str, Any] = {}
+# Monotonic launch timestamp per workspace — feeds the bridge max-age
+# staleness guard in get_bridge. Guarded by _bridges_lock.
+_bridge_launched_at: Dict[str, float] = {}
 # Live python Agent handles, keyed (workspace, agent_id). Reusing the SAME
 # handle for follow-up sends is the SDK's canonical multi-turn flow —
 # ``Agent.resume`` is for process restarts. It also matters for stability:
@@ -304,6 +307,7 @@ def get_bridge(workspace: str) -> Any:
         with _bridges_lock:
             if _bridges.get(key) is client:
                 del _bridges[key]
+                _bridge_launched_at.pop(key, None)
                 _drop_agents_for_workspace_locked(key)
         _close_client(client)
 
@@ -320,6 +324,7 @@ def get_bridge(workspace: str) -> Any:
             _close_client(client)
             return existing
         _bridges[key] = client
+        _bridge_launched_at[key] = time.monotonic()
     return client
 
 
@@ -343,6 +348,40 @@ def cache_agent(workspace: str, agent_id: str, agent: Any) -> None:
         _agents[(str(workspace), str(agent_id))] = agent
 
 
+def recycle_bridge(workspace: str) -> bool:
+    """Force-replace the cached bridge for ``workspace`` with a fresh one.
+
+    Live incident (2026-07-04): every run dispatched through an hours-old
+    ``cursor-sdk-bridge`` sidecar silent-errored within seconds while fresh
+    bridges worked — killing the stale processes fixed everything. This is
+    the recovery lever: close the cached client (terminating its bridge),
+    drop the cached agent handles that lived on it, and launch a
+    replacement eagerly. Agent state is unaffected — it lives in the
+    bridge's on-disk store and the next send resumes by agent_id.
+
+    Returns True when a cached client was actually recycled; False when
+    the workspace had none (nothing to do).
+    """
+    key = str(workspace)
+    with _bridges_lock:
+        client = _bridges.pop(key, None)
+        _bridge_launched_at.pop(key, None)
+        _drop_agents_for_workspace_locked(key)
+    if client is None:
+        return False
+    _close_client(client)
+    try:
+        get_bridge(key)
+    except Exception:
+        # The next send's get_bridge will retry the launch and surface a
+        # proper error if it keeps failing.
+        logger.warning(
+            "cursor-sdk bridge relaunch after recycle failed for %s",
+            key, exc_info=True,
+        )
+    return True
+
+
 def _close_client(client: Any) -> None:
     try:
         close = getattr(client, "close", None)
@@ -357,6 +396,7 @@ def shutdown_bridges() -> None:
     with _bridges_lock:
         clients = list(_bridges.values())
         _bridges.clear()
+        _bridge_launched_at.clear()
         _agents.clear()
     for client in clients:
         _close_client(client)

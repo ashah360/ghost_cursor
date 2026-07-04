@@ -1308,16 +1308,19 @@ class TestGitFallback:
 # ---------------------------------------------------------------------------
 
 class TestAllTerminalStatesDeliver:
-    def _run_armed(self, monkeypatch, tmp_path, sid, terminal_event):
+    def _run_armed(self, monkeypatch, tmp_path, sid, terminal_event,
+                   pre_events=()):
         """Dispatch through create + first send so delivery gets armed; the replay
-        emits ``terminal_event`` only after the running handle was returned
-        (deterministic — the run cannot finalize before arming)."""
+        emits ``pre_events`` + ``terminal_event`` only after the running
+        handle was returned (deterministic — the run cannot finalize before
+        arming)."""
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                    cancel_check=None, agent_id=None, model=None):
             yield ("sdk.session", {"agentId": sid, "cwd": str(workdir), "model": "m"})
             release.wait(10)
+            yield from pre_events
             yield terminal_event
 
         monkeypatch.setattr(gc_sdk, "run_sdk", replay)
@@ -1376,7 +1379,8 @@ class TestAllTerminalStatesDeliver:
     ):
         """A terminal-error sdk.error with typed detail (retryable /
         retry_after) renders it on the failure line — not the bare
-        'cursor run ended with status: error'."""
+        'cursor run ended with status: error'. (The run streamed content
+        first, so the zero-progress auto-retry stays out of the way.)"""
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-err-detail",
             ("sdk.error", {
@@ -1385,6 +1389,7 @@ class TestAllTerminalStatesDeliver:
                 "retry_after": "30",
                 "run_status": "error",
             }),
+            pre_events=[_narration_chunk("started digging in")],
         )
         assert job.status == "failed"
         assert evt["error"] == "ServerError: upstream 502 from the agent backend"
@@ -1409,6 +1414,7 @@ class TestAllTerminalStatesDeliver:
                 "retry_after": None,
                 "run_status": "error",
             }),
+            pre_events=[_narration_chunk("started digging in")],
         )
         assert job.status == "failed"
         assert "run failed: cursor run ended with status: error." in evt["summary"]
@@ -1946,6 +1952,213 @@ class TestProgressSubscriptions:
             release.set()
             assert job.done_event.wait(10)
         assert "pending tool call:" in _digest_events(collected)[0]["summary"]
+
+
+# ---------------------------------------------------------------------------
+# Zero-progress auto-retry — stale-bridge recovery (live incident 2026-07-04)
+# ---------------------------------------------------------------------------
+
+def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
+                           meaningful=False, release=None):
+    """A replay that settles with terminal status "error" (the enriched
+    sdk.error payload from sdk_runner), optionally after one meaningful
+    tool round, optionally held open on ``release`` first."""
+
+    def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+               cancel_check=None, agent_id=None, model=None):
+        yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
+                               "model": "m", "resumed": bool(agent_id)})
+        if release is not None:
+            while not release.is_set():
+                if cancel_check and cancel_check():
+                    yield ("sdk.result", {"status": "cancelled"})
+                    return
+                time.sleep(0.01)
+        if meaningful:
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "running", "args": {"command": "ls"},
+            })
+            yield ("sdk.message", {
+                "type": "tool_call", "call_id": "t1", "name": "shell",
+                "status": "completed",
+                "result": {"exitCode": 0, "stdout": "ok"},
+            })
+        yield ("sdk.error", {
+            "error": "ServerError: bridge went stale",
+            "retryable": retryable,
+            "retry_after": retry_after,
+            "run_status": "error",
+        })
+
+    return replay
+
+
+def _lifecycle_trail(name):
+    """(event, record) for every lifecycle event in a session's jsonl log,
+    in seq order."""
+    page = gc_eventlog.read_events(name, offset=0, limit=500)
+    return [
+        (e.get("event"), e)
+        for e in (page or {}).get("events") or []
+        if e.get("kind") == "lifecycle"
+    ]
+
+
+class TestZeroProgressAutoRetry:
+    """A terminal-error run with ZERO meaningful events (the stale-bridge
+    signature, live incident 2026-07-04) is transparently re-sent on the
+    same agent — bridge recycled before the first retry, jsonl-only
+    lifecycle signal, no user-facing failure. Meaningful progress, a
+    non-retryable error, or an exhausted budget surfaces the detailed
+    failure from the error-observability path instead."""
+
+    def _fast_retries(self, monkeypatch):
+        """Zero the backoff ladder and stub the bridge recycle, returning
+        the recorded recycle calls."""
+        monkeypatch.setattr(gc, "_AUTO_RETRY_BACKOFF_S", (0.0, 0.0))
+        recycles = []
+        monkeypatch.setattr(
+            gc_sdk, "recycle_bridge",
+            lambda workspace: recycles.append(workspace) or True,
+        )
+        return recycles
+
+    def test_zero_progress_error_recycles_bridge_and_retry_succeeds(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-zp"),
+            _gated_replay_factory(release, sid="agent-zp"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-zp")
+        # Same job across the retry — the digest subscription (default
+        # 180s) keeps its ticker.
+        assert gc_progress._tickers[job.session_name].job is job
+        release.set()
+        assert job.done_event.wait(10)
+
+        # One job, retried in place, clean success — no user-facing failure.
+        assert job.status == "completed"
+        assert job.result["success"] is True
+        assert "error" not in job.result
+        assert len(seq.calls) == 2
+        assert seq.calls[1]["agent_id"] == "agent-zp"  # SAME agent resumed
+        assert recycles == [job.repo]
+
+        events = _drain_completion_queue()
+        completions = _completion_events(events)
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+        assert completions[0]["error"] is None
+
+        # The jsonl log shows the transparent recovery, in order: failed
+        # first run → autoretry marker (bridge recycled) → clean second run.
+        trail = _lifecycle_trail(job.session_name)
+        marks = [n for n, _ in trail
+                 if n in ("run.started", "run.failed", "sdk.autoretry",
+                          "run.completed")]
+        assert marks == ["run.started", "run.failed", "sdk.autoretry",
+                         "run.started", "run.completed"]
+        autoretry = next(e for n, e in trail if n == "sdk.autoretry")
+        assert autoretry["attempt"] == 1
+        assert autoretry["bridge_recycled"] is True
+        assert "zero-progress" in autoretry["reason"]
+        assert "ServerError: bridge went stale" in autoretry["reason"]
+
+    def test_error_after_meaningful_progress_does_not_auto_retry(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-mp", meaningful=True,
+                                   release=release),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-mp")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1  # no re-send
+        assert recycles == []
+        assert job.status == "failed"
+        assert not [n for n, _ in _lifecycle_trail(job.session_name)
+                    if n == "sdk.autoretry"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["status"] == "failed"
+        assert evt["error"] == "ServerError: bridge went stale"
+        # The detailed failure from the error-observability path.
+        assert ("run failed: ServerError: bridge went stale (retryable)"
+                in evt["summary"])
+
+    def test_retries_exhausted_surface_the_detailed_failure(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-ex", release=release,
+                                   retry_after="0"),
+            _terminal_error_replay(sid="agent-ex"),
+            _terminal_error_replay(sid="agent-ex"),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-ex")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 3  # the send + both retries
+        assert recycles == [job.repo]  # recycled ONCE, on the first retry
+        assert job.status == "failed"
+        trail = [e for n, e in _lifecycle_trail(job.session_name)
+                 if n == "sdk.autoretry"]
+        assert [e["attempt"] for e in trail] == [1, 2]
+        assert [e["bridge_recycled"] for e in trail] == [True, False]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["error"] == "ServerError: bridge went stale"
+        assert evt["result"]["error_retryable"] is True
+        assert ("run failed: ServerError: bridge went stale (retryable)"
+                in evt["summary"])
+
+    def test_non_retryable_zero_progress_error_does_not_retry(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        recycles = self._fast_retries(monkeypatch)
+        release = threading.Event()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="agent-nr", retryable=False,
+                                   release=release),
+        )
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("agent-nr")
+        release.set()
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1
+        assert recycles == []
+        assert job.status == "failed"
+        assert not [n for n, _ in _lifecycle_trail(job.session_name)
+                    if n == "sdk.autoretry"]
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert ("run failed: ServerError: bridge went stale (not retryable)"
+                in completions[0]["summary"])
 
 
 # ---------------------------------------------------------------------------
@@ -3534,6 +3747,52 @@ class TestSdkRunner:
         gc_sdk.shutdown_bridges()
         assert all(c.closed for c in launches)
         assert gc_sdk.get_bridge("/repo/a") is not a1  # relaunches after shutdown
+
+    # -- bridge recycling (stale-bridge recovery lever) ------------------------
+
+    def test_recycle_bridge_closes_cached_client_and_relaunches(
+        self, monkeypatch
+    ):
+        closed = []
+
+        class _Client:
+            def __init__(self, ws):
+                self.ws = ws
+
+            def close(self):
+                closed.append(self)
+
+        launches = []
+
+        def fake_launch_bridge(workspace=None, **kw):
+            client = _Client(workspace)
+            launches.append(client)
+            return client
+
+        import sys as _sys
+        monkeypatch.setattr(gc_sdk, "_bridges", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_launched_at", {})
+        monkeypatch.setattr(gc_sdk, "_agents", {})
+        monkeypatch.setitem(_sys.modules, "cursor_sdk", SimpleNamespace(
+            CursorClient=SimpleNamespace(launch_bridge=fake_launch_bridge)
+        ))
+
+        old = gc_sdk.get_bridge("/repo/a")
+        gc_sdk.cache_agent("/repo/a", "agent-1", object())
+
+        assert gc_sdk.recycle_bridge("/repo/a") is True
+        # The stale client was closed and its agent handles dropped with it
+        # (the agent itself survives on disk, resumable by agent_id)...
+        assert closed == [old]
+        assert gc_sdk.get_cached_agent("/repo/a", "agent-1") is None
+        # ...and a FRESH bridge was launched eagerly.
+        assert len(launches) == 2
+        assert gc_sdk.get_bridge("/repo/a") is launches[-1]
+
+    def test_recycle_bridge_without_cached_client_is_a_noop(self, monkeypatch):
+        monkeypatch.setattr(gc_sdk, "_bridges", {})
+        monkeypatch.setattr(gc_sdk, "_bridge_launched_at", {})
+        assert gc_sdk.recycle_bridge("/repo/none") is False
 
     # -- terminal-error detail mining ----------------------------------------
 
