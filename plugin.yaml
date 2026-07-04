@@ -10,3 +10,4 @@ provides_tools:
   - cursor_stop
   - cursor_events
   - cursor_list
+  - cursor_subscribe

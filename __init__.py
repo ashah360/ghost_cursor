@@ -81,6 +81,7 @@ from . import events as _events
 from . import handles as _handles
 from . import jobs as _jobs
 from . import names as _names
+from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
 from . import sdk_runner as _sdk
@@ -93,6 +94,7 @@ STATUS_TOOL_NAME = "cursor_status"
 STOP_TOOL_NAME = "cursor_stop"
 EVENTS_TOOL_NAME = "cursor_events"
 LIST_TOOL_NAME = "cursor_list"
+SUBSCRIBE_TOOL_NAME = "cursor_subscribe"
 TOOLSET = "ghost_cursor"
 
 # Env var naming is Threshold's (the Ghost frontend), not HERMES_* — it points
@@ -207,6 +209,16 @@ CURSOR_SEND_SCHEMA = {
                     "The coding task or follow-up instruction, e.g. 'add a "
                     "multiply function to calc.py with tests'. Be specific; "
                     "include file names and acceptance criteria when known."
+                ),
+            },
+            "update_interval_s": {
+                "type": "number",
+                "description": (
+                    "Optional. While the run is active, deliver a compact "
+                    "progress digest (status header + new events) as a new "
+                    "message every this-many seconds. Default 180; 0 "
+                    "disables digests. The setting persists on the session "
+                    "(cursor_subscribe changes it mid-run)."
                 ),
             },
             **_TIMEOUT_PROPERTIES,
@@ -325,6 +337,37 @@ CURSOR_LIST_SCHEMA = {
         "required": [],
     },
 }
+
+CURSOR_SUBSCRIBE_SCHEMA = {
+    "name": SUBSCRIBE_TOOL_NAME,
+    "description": (
+        "Change how often a cursor session pushes progress digests while "
+        "a run is active. Each digest arrives as a new message: a "
+        "cursor_status-style header (status, elapsed, last activity, "
+        "files so far, pending tool call) plus the events since the "
+        "previous update. Takes effect on the next tick (sooner if the "
+        "new interval is shorter); interval_s=0 unsubscribes. Works "
+        "whether or not a run is active — the setting persists on the "
+        "session and applies to the next run. Use this to watch a long "
+        "run more closely, or to silence a chatty one; the final result "
+        "is always delivered separately regardless of this setting."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "session": {"type": "string", "description": _SESSION_DOC},
+            "interval_s": {
+                "type": "number",
+                "description": (
+                    "Seconds between progress digests. 0 unsubscribes "
+                    "(no digests; completion delivery is unaffected)."
+                ),
+            },
+        },
+        "required": ["session", "interval_s"],
+    },
+}
+
 
 def _default_repo() -> Optional[str]:
     """Resolve the default workspace repo: env var, then terminal cwd."""
@@ -511,8 +554,18 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 else:
                     job.assistant_segments.append([delta])
                     job.segment_open = True
-        elif kind in ("tool_use", "tool_result"):
+        elif kind == "tool_use":
             job.segment_open = False
+            tool = str(envelope.get("tool") or "tool")
+            detail = str(
+                envelope.get("command") or envelope.get("title") or ""
+            ).strip()
+            job.pending_tool = f"{tool} `{detail}`" if detail else tool
+            job.pending_tool_since = time.time()
+        elif kind == "tool_result":
+            job.segment_open = False
+            job.pending_tool = ""
+            job.pending_tool_since = None
         elif kind == "lifecycle":
             event = envelope.get("event")
             if event == "run.completed":
@@ -647,6 +700,7 @@ def _dispatch_run(
     model: Optional[str],
     inactivity_timeout_s: float,
     max_wall_s: float,
+    update_interval_s: float = 0.0,
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -679,10 +733,12 @@ def _dispatch_run(
             "session_id": existing.cursor_session_id,
             "repo": str(workdir),
         }
-    return _await_handle(job)
+    return _await_handle(job, update_interval_s=update_interval_s)
 
 
-def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
+def _await_handle(
+    job: "_jobs.CursorJob", update_interval_s: float = 0.0
+) -> Dict[str, Any]:
     """Block until the run has a session handle (or died trying).
 
     Exactly-once outcome reporting: the job is dispatched with delivery
@@ -720,6 +776,10 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
         # final result in-turn (nothing was enqueued).
         return {**_jobs.trim_result(job.result or {}), "status": job.status}
 
+    # The run is live and its outcome will arrive as a delivered message —
+    # start the progress-digest timer alongside (no-op at interval 0).
+    _progress.start_for_job(job, update_interval_s)
+
     return {
         "success": True,
         "status": "running",
@@ -755,6 +815,7 @@ def _send_to_session(
     message: str,
     inactivity_timeout_s: Optional[float],
     max_wall_s: Optional[float],
+    update_interval_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """The shared send path: interrupt a live run if needed, then dispatch.
 
@@ -801,6 +862,11 @@ def _send_to_session(
         if job is not None and job.cursor_session_id
         else _resume_sid(name, entry)
     )
+    # Subscription at dispatch: explicit param > the session's persisted
+    # setting > the 180s default. Persisted so it survives restarts and
+    # carries over interrupt-and-reprompt (digest numbering continues).
+    interval = _progress.resolve_interval(entry, update_interval_s)
+    _handles.record(name, update_interval_s=interval)
     result = _dispatch_run(
         task=str(message),
         workdir=repo,
@@ -809,6 +875,7 @@ def _send_to_session(
         model=_resolve_model(entry.get("model")),
         inactivity_timeout_s=_resolve_inactivity_timeout(inactivity_timeout_s),
         max_wall_s=_resolve_max_wall(max_wall_s),
+        update_interval_s=interval,
     )
     result.setdefault("session", name)
     if interrupted:
@@ -908,6 +975,7 @@ def cursor_send_message(
     message: str,
     inactivity_timeout_s: Optional[float] = None,
     max_wall_s: Optional[float] = None,
+    update_interval_s: Optional[float] = None,
     **_kwargs: Any,
 ) -> str:
     """Send work to a session (first message = the task; later = follow-up,
@@ -924,7 +992,8 @@ def cursor_send_message(
     entry = _handles.get(name) or {}
 
     result = _send_to_session(
-        name, entry, str(message), inactivity_timeout_s, max_wall_s
+        name, entry, str(message), inactivity_timeout_s, max_wall_s,
+        update_interval_s,
     )
     return _render_send_result(name, result)
 
@@ -1112,6 +1181,26 @@ def cursor_events(
     return _render.events_text(name, page)
 
 
+def cursor_subscribe(session: str, interval_s: Any = None, **_kwargs: Any) -> str:
+    """Set/change/cancel a session's progress-digest interval (see
+    CURSOR_SUBSCRIBE_SCHEMA). Persists; retunes a live run's timer."""
+    ident = str(session or "").strip()
+    if not ident:
+        return "session is required — pass the name from cursor_create_session."
+    name = _resolve_session(ident)
+    if name is None:
+        return _unknown_session_text(ident)
+    try:
+        interval = float(interval_s)
+    except (TypeError, ValueError):
+        return "interval_s is required — seconds between digests (0 unsubscribes)."
+    if interval < 0:
+        return "interval_s must be >= 0 (0 unsubscribes)."
+
+    _progress.subscribe(name, interval)
+    return _render.subscribe_ack(name, interval)
+
+
 def cursor_list(scope: str = "session", **_kwargs: Any) -> str:
     """TSV listing of session handles (default: this Hermes session's)."""
     scope = scope if scope in _handles.VALID_SCOPES else "session"
@@ -1138,6 +1227,7 @@ def _handle_cursor_send_message(args: Dict[str, Any], **kwargs: Any) -> str:
         message=args.get("message", ""),
         inactivity_timeout_s=args.get("inactivity_timeout_s"),
         max_wall_s=args.get("max_wall_s"),
+        update_interval_s=args.get("update_interval_s"),
     )
 
 
@@ -1165,8 +1255,15 @@ def _handle_cursor_list(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_list(scope=args.get("scope", "session"))
 
 
+def _handle_cursor_subscribe(args: Dict[str, Any], **kwargs: Any) -> str:
+    return cursor_subscribe(
+        session=args.get("session") or args.get("session_id", ""),
+        interval_s=args.get("interval_s"),
+    )
+
+
 def register(ctx) -> None:
-    """Register the 6 cursor tools. Called once by the plugin loader.
+    """Register the 7 cursor tools. Called once by the plugin loader.
 
     Also arranges clean bridge shutdown: the plugin loader has no unload
     hook, so the per-workspace cursor-sdk bridge sidecars are closed at
@@ -1180,6 +1277,7 @@ def register(ctx) -> None:
         (STOP_TOOL_NAME, CURSOR_STOP_SCHEMA, _handle_cursor_stop, "🛑"),
         (EVENTS_TOOL_NAME, CURSOR_EVENTS_SCHEMA, _handle_cursor_events, "📜"),
         (LIST_TOOL_NAME, CURSOR_LIST_SCHEMA, _handle_cursor_list, "📋"),
+        (SUBSCRIBE_TOOL_NAME, CURSOR_SUBSCRIBE_SCHEMA, _handle_cursor_subscribe, "🔔"),
     ):
         ctx.register_tool(
             name=name,

@@ -45,6 +45,9 @@ LARGEST_DIFF_COUNT = 3
 EVENT_INLINE_CLIP = 2048
 EVENTS_RESPONSE_CAP = 20 * 1024
 EVENTS_TRUNCATION_NOTE = "page truncated at 20KB — narrow with limit/kind"
+# progress digest: events-since-last-tick body caps (~5 lines / ~1KB).
+DIGEST_MAX_EVENTS = 5
+DIGEST_BODY_CAP = 1024
 
 _STATUS_WORDS = {"A": "added", "M": "modified", "D": "deleted"}
 
@@ -217,6 +220,75 @@ def status_text(
         lines += ["", "recent:"] + [f"- {b}" for b in bullets]
     if note:
         lines += ["", note]
+    return "\n".join(lines)
+
+
+def subscribe_ack(name: str, interval_s: float) -> str:
+    """The 1-line cursor_subscribe ack."""
+    if interval_s <= 0:
+        return (
+            f"session '{name}': progress updates off (completion delivery "
+            "unaffected)."
+        )
+    return (
+        f"session '{name}': progress updates every {secs(interval_s)} "
+        "(applies to the running/next run; takes effect on the next tick)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# progress digest (periodic subscription updates)
+# ---------------------------------------------------------------------------
+
+def digest_text(
+    *,
+    name: str,
+    n: int,
+    status: str,
+    elapsed_s: Any,
+    last_activity_s: Any,
+    files: List[Dict[str, Any]],
+    pending_tool: str = "",
+    pending_tool_s: Any = None,
+    events: Optional[List[Dict[str, Any]]] = None,
+    new_count: int = 0,
+) -> str:
+    """One periodic progress digest: the cursor_status-style header plus
+    the events since the previous tick (cursor_events-style lines, capped
+    at DIGEST_MAX_EVENTS lines / DIGEST_BODY_CAP chars). Tagged with the
+    session name and the digest number so concurrent sessions stay
+    distinguishable."""
+    last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
+    lines = [
+        f"cursor session '{name}' — progress update {n}",
+        f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}",
+    ]
+    if files:
+        lines.append(f"files so far ({len(files)}): {files_inline(files)}")
+    if pending_tool:
+        since = f" ({secs(pending_tool_s)})" if pending_tool_s is not None else ""
+        lines.append(f"pending tool call: {pending_tool}{since}")
+    lines.append("")
+    if not events:
+        lines.append("no new events since last update")
+        return "\n".join(lines)
+
+    lines.append(f"new events since last update ({new_count}):")
+    used = 0
+    rows = 0
+    for record in events[-DIGEST_MAX_EVENTS:]:
+        row = clip(
+            f"{record.get('seq')}  {_eventlog.display_kind(record):<11}  "
+            f"{_event_summary(record)}",
+            200,
+        )
+        if used + len(row) + 1 > DIGEST_BODY_CAP:
+            break
+        lines.append(row)
+        used += len(row) + 1
+        rows += 1
+    if new_count > rows:
+        lines.append(f"… {new_count - rows} more — cursor_events('{name}')")
     return "\n".join(lines)
 
 
