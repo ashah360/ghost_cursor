@@ -84,6 +84,10 @@ from plugins.ghost_cursor import runner as gc_runner
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cursor_stream.jsonl"
 SDK_FIXTURE = Path(__file__).parent / "fixtures" / "sdk_stream.jsonl"
+# Raw tool_call SDKMessages captured VERBATIM from a real cursor-sdk run
+# (2026-07-03, model gpt-5.4-nano) that created + committed a file — the
+# reproduction of the "completion said no files were changed" blind spot.
+SDK_EDIT_FIXTURE = Path(__file__).parent / "fixtures" / "sdk_edit_tool_call.jsonl"
 
 
 def _prepend_path_env(stub_dir):
@@ -565,6 +569,35 @@ class TestSendMessageResume:
         finally:
             release.set()
         assert _job_for("s-prior").done_event.wait(10)
+
+    def test_legacy_acp_model_record_is_sanitized_on_resume(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A pre-swap handle recorded the ACP-era bracket model string
+        verbatim; re-sending must translate it to base id + params before
+        Agent.resume (passing it straight through was a live
+        BadRequestError). End-to-end through cursor_send_message with the
+        REAL run_sdk against the fake bridge client."""
+        legacy = "claude-fable-5[thinking=true,context=300k,effort=high]"
+        gc_handles.record(
+            "s-legacy", repo=_resolved(tmp_path), status="completed",
+            model=legacy,
+        )
+        agent = _FakeAgent(agent_id="s-legacy",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+
+        cursor_send_message("s-legacy", "continue the work")
+        job = _job_for("s-legacy")
+        assert job.done_event.wait(10)
+
+        assert client.agents.resume_calls[0]["options"] == {
+            "model": _FABLE_BRACKET_SELECTION
+        }
+        # The handle heals: sdk.session reports the base id, which is what
+        # gets recorded for the next resume.
+        assert gc_handles.get("s-legacy")["model"] == "claude-fable-5"
 
     def test_expired_handle_falls_back_to_fresh_session(
         self, clean_state, monkeypatch, tmp_path
@@ -2456,6 +2489,16 @@ def _sdk_error(text, is_retryable=False, retry_after=None):
     return err
 
 
+def _model_selection_ns(model):
+    """Mimic the real bridge's model normalization: a string or raw-dict
+    ModelSelection becomes a typed selection whose ``.id`` is the base id."""
+    if not model:
+        return None
+    if isinstance(model, dict):
+        return SimpleNamespace(id=model.get("id"), params=model.get("params") or [])
+    return SimpleNamespace(id=model)
+
+
 class _FakeAgents:
     def __init__(self, agent, resume_error=None, create_error=None):
         self._agent = agent
@@ -2472,8 +2515,7 @@ class _FakeAgents:
         # ONLY from the resume options — the stored conversation model is
         # NOT rehydrated ("agent.model is None on resume unless you pass
         # model again", SDK docs).
-        model = (options or {}).get("model")
-        self._agent.model = SimpleNamespace(id=model) if model else None
+        self._agent.model = _model_selection_ns((options or {}).get("model"))
         return self._agent
 
     def create(self, **kw):
@@ -2972,6 +3014,179 @@ class _RetryableError(Exception):
 
 
 # ---------------------------------------------------------------------------
+# translate_model — legacy ACP-era model strings → SDK id + params
+# ---------------------------------------------------------------------------
+
+# The exact params the legacy forms below must translate to (parameter ids
+# verified live against Cursor.models.list() for claude-fable-5).
+_FABLE_BRACKET_SELECTION = {
+    "id": "claude-fable-5",
+    "params": [
+        {"id": "thinking", "value": "true"},
+        {"id": "context", "value": "300k"},
+        {"id": "effort", "value": "high"},
+    ],
+}
+_FABLE_THINKING_HIGH_SELECTION = {
+    "id": "claude-fable-5",
+    "params": [
+        {"id": "thinking", "value": "true"},
+        {"id": "effort", "value": "high"},
+    ],
+}
+
+
+class TestModelTranslation:
+    """The sdk model catalog has BASE ids only — combined slugs like
+    "claude-fable-5-thinking-high" (the old CLI shorthand, previously our
+    DEFAULT_MODEL) and ACP-era handle records like
+    "claude-fable-5[thinking=true,context=300k,effort=high]" are rejected
+    with BadRequestError. translate_model maps both onto id + params."""
+
+    def test_default_model_is_a_base_catalog_id(self):
+        assert gc_runner.DEFAULT_MODEL == "claude-fable-5"
+        assert "[" not in gc_runner.DEFAULT_MODEL
+        assert "-thinking" not in gc_runner.DEFAULT_MODEL
+
+    def test_plain_base_id_passes_through(self):
+        assert gc_sdk.translate_model("gpt-5.3-codex") == ("gpt-5.3-codex", None)
+
+    def test_none_and_blank_pass_through(self):
+        assert gc_sdk.translate_model(None) == (None, None)
+        assert gc_sdk.translate_model("   ") == (None, None)
+
+    def test_thinking_level_suffix_becomes_params(self):
+        value, warning = gc_sdk.translate_model("claude-fable-5-thinking-high")
+        assert warning is None
+        assert value == _FABLE_THINKING_HIGH_SELECTION
+
+    def test_bare_thinking_suffix_becomes_thinking_param(self):
+        value, warning = gc_sdk.translate_model("claude-sonnet-5-thinking")
+        assert warning is None
+        assert value == {
+            "id": "claude-sonnet-5",
+            "params": [{"id": "thinking", "value": "true"}],
+        }
+
+    def test_extra_high_level_maps_to_catalog_xhigh(self):
+        value, warning = gc_sdk.translate_model(
+            "claude-fable-5-thinking-extra-high"
+        )
+        assert warning is None
+        assert {"id": "effort", "value": "xhigh"} in value["params"]
+
+    def test_bracket_suffix_becomes_params(self):
+        value, warning = gc_sdk.translate_model(
+            "claude-fable-5[thinking=true,context=300k,effort=high]"
+        )
+        assert warning is None
+        assert value == _FABLE_BRACKET_SELECTION
+
+    def test_empty_bracket_reduces_to_base_id(self):
+        assert gc_sdk.translate_model("claude-fable-5[]") == (
+            "claude-fable-5", None,
+        )
+
+    def test_unparseable_bracket_falls_back_to_default_with_warning(self):
+        value, warning = gc_sdk.translate_model("claude-fable-5[thinking")
+        assert value == gc_runner.DEFAULT_MODEL
+        assert warning and "claude-fable-5[thinking" in warning
+        assert gc_runner.DEFAULT_MODEL in warning
+
+    def test_malformed_bracket_pair_falls_back_with_warning(self):
+        value, warning = gc_sdk.translate_model("m[thinking=]")
+        assert value == gc_runner.DEFAULT_MODEL
+        assert warning
+
+    def test_unknown_thinking_level_falls_back_with_warning(self):
+        value, warning = gc_sdk.translate_model("m-thinking-banana")
+        assert value == gc_runner.DEFAULT_MODEL
+        assert warning
+
+    def test_dash_suffix_threads_params_into_create(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(model_id="claude-fable-5",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            model="claude-fable-5-thinking-high",
+        ))
+        assert client.agents.create_calls[0]["model"] == (
+            _FABLE_THINKING_HIGH_SELECTION
+        )
+        assert events[0][1]["model"] == "claude-fable-5"
+        assert not [o for k, o in events if k == "sdk.model_warning"]
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_legacy_bracket_record_threads_params_into_resume(
+        self, tmp_path, monkeypatch
+    ):
+        """The exact model string a pre-swap handle recorded must never
+        reach Agent.resume verbatim (BadRequestError live)."""
+        agent = _FakeAgent(agent_id="agent-prior",
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "follow up", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-prior",
+            model="claude-fable-5[thinking=true,context=300k,effort=high]",
+        ))
+        assert client.agents.resume_calls[0]["options"] == {
+            "model": _FABLE_BRACKET_SELECTION
+        }
+        assert events[0][1]["model"] == "claude-fable-5"
+        assert not [o for k, o in events if k == "sdk.model_warning"]
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_unparseable_model_warns_and_uses_default(self, tmp_path, monkeypatch):
+        agent = _FakeAgent(model_id=gc_runner.DEFAULT_MODEL,
+                           runs=[_FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            model="claude-fable-5[borked",
+        ))
+        # The warning is the FIRST event, so the substitution lands in the
+        # event log before any run activity.
+        key, obj = events[0]
+        assert key == "sdk.model_warning"
+        assert obj["requested"] == "claude-fable-5[borked"
+        assert obj["using"] == gc_runner.DEFAULT_MODEL
+        assert client.agents.create_calls[0]["model"] == gc_runner.DEFAULT_MODEL
+        assert events[-1] == ("sdk.result", {"status": "finished"})
+
+    def test_same_base_id_with_params_reuses_the_live_handle(
+        self, tmp_path, monkeypatch
+    ):
+        """A params-only difference must not force a resume of an agent
+        still registered on the live bridge (the disposal-crash path) —
+        base-id comparison decides handle reuse."""
+        agent = _FakeAgent(agent_id="agent-live", model_id="claude-fable-5",
+                           runs=[_FakeRun(_happy_script()),
+                                 _FakeRun(_happy_script())])
+        client = _FakeClient(agent)
+        _install_fake_sdk(monkeypatch, client)
+        list(gc_sdk.run_sdk(
+            "task one", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            model="claude-fable-5",
+        ))
+        second = list(gc_sdk.run_sdk(
+            "task two", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+            agent_id="agent-live", model="claude-fable-5-thinking-high",
+        ))
+        assert client.agents.resume_calls == []
+        assert second[-1] == ("sdk.result", {"status": "finished"})
+
+
+# ---------------------------------------------------------------------------
 # events.SdkNormalizer — SDKMessage dicts → canonical envelopes
 # ---------------------------------------------------------------------------
 
@@ -3147,6 +3362,55 @@ class TestSdkNormalizer:
         assert len(diffs) == 1
         assert diffs[0]["status"] == "A"
         assert diffs[0]["after"] == "hello\n"
+
+    def test_real_sdk_edit_payload_yields_file_diff(self):
+        """Regression for the live blind spot (2026-07-03): a REAL run
+        created + committed a file but the completion said "no files were
+        changed". The real edit tool's result wraps its payload in
+        {"status": "success", "value": {linesAdded, linesRemoved,
+        diffString}} and carries the path ONLY in the call's args.
+        Payloads in the fixture were captured verbatim from the
+        reproduction (model gpt-5.4-nano)."""
+        msgs = [
+            json.loads(line)
+            for line in SDK_EDIT_FIXTURE.read_text().splitlines()
+            if line.strip()
+        ]
+        norm = self._norm()
+        envs = []
+        for msg in msgs:
+            envs.extend(norm.normalize("sdk.message", msg))
+
+        diffs = [e for e in envs if e["kind"] == "file_diff"]
+        assert len(diffs) == 1
+        assert diffs[0]["path"] == "/private/tmp/gc-probe/repo/hello.txt"
+        assert diffs[0]["status"] == "A"  # "--- /dev/null" diff header
+        assert "+hello from sdk probe" in diffs[0]["diff"]
+        assert diffs[0]["added"] == 1  # linesAdded from the payload
+
+        edit_result = next(
+            e for e in envs
+            if e["kind"] == "tool_result" and e["id"] == msgs[0]["call_id"]
+        )
+        assert edit_result["additions"] == 1
+
+        # The shell result rides the same {"status", "value"} envelope:
+        # output and the non-zero exit code must still be mined from it.
+        shell_result = [e for e in envs if e["kind"] == "tool_result"][-1]
+        assert shell_result is not edit_result
+        assert shell_result["status"] == "error"  # exitCode 128 in "value"
+        assert "not a git repository" in shell_result["output"]
+
+    def test_model_warning_maps_to_lifecycle(self):
+        envs = self._norm().normalize("sdk.model_warning", {
+            "warning": "requested model 'x[y' has an unparseable bracket "
+                       "suffix — falling back to 'claude-fable-5'",
+            "requested": "x[y", "using": "claude-fable-5",
+        })
+        assert envs[0]["kind"] == "lifecycle"
+        assert envs[0]["event"] == "model.warning"
+        assert envs[0]["requested"] == "x[y"
+        assert envs[0]["using"] == "claude-fable-5"
 
     def test_terminal_tool_call_without_start_synthesizes_tool_use(self):
         envs = self._norm().normalize("sdk.message", {

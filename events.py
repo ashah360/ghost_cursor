@@ -384,49 +384,122 @@ def _sdk_assistant_text(msg: Dict[str, Any]) -> str:
     return "".join(parts)
 
 
-def _sdk_diff_entries(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+# Key aliases probed on edit-tool payloads. The REAL shape (captured live
+# 2026-07-03 from cursor-sdk, fixtures/sdk_edit_tool_call.jsonl) wraps the
+# payload in a {"status": "success", "value": {...}} envelope, keeps
+# linesAdded / linesRemoved / diffString inside "value", and carries the
+# path ONLY in the call's args — never in the result. The schema is
+# documented unstable, so the older direct shapes stay matched too.
+_DIFF_PATH_KEYS = ("path", "file_path", "filePath")
+_DIFF_BEFORE_KEYS = ("beforeFullFileContent", "oldText", "before")
+_DIFF_AFTER_KEYS = ("afterFullFileContent", "newText", "after")
+_DIFF_TEXT_KEYS = ("diffString", "diff", "unifiedDiff", "patch")
+_DIFF_ADDED_KEYS = ("linesAdded", "added", "additions")
+_DIFF_REMOVED_KEYS = ("linesRemoved", "removed", "deletions")
+
+
+def _int_or_none(val: Any) -> int | None:
+    if val is None or isinstance(val, bool):
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _first_int(data: Dict[str, Any], *keys: str) -> int | None:
+    for key in keys:
+        val = _int_or_none(data.get(key))
+        if val is not None:
+            return val
+    return None
+
+
+def _diff_candidates(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Dict payloads that may describe file edits, envelope wrappers
+    ({"status": ..., "value": {...}} and friends) unwrapped recursively."""
+    out: List[Dict[str, Any]] = []
+
+    def add(node: Any, depth: int = 0) -> None:
+        if not isinstance(node, dict):
+            return
+        out.append(node)
+        if depth >= 3:
+            return
+        for key in ("value", "success", "result", "edit", "data"):
+            add(node.get(key), depth + 1)
+        for key in ("content", "diffs", "edits", "files"):
+            nested = node.get(key)
+            if isinstance(nested, list):
+                for item in nested:
+                    add(item, depth + 1)
+
+    add(result)
+    return out
+
+
+def _diff_status_from_text(diff_text: str) -> str:
+    """Porcelain status inferred from unified-diff headers.
+
+    Used for pre-rendered diffString payloads (no before/after content to
+    infer from): "--- /dev/null" means the file was added, "+++ /dev/null"
+    deleted, anything else a modification.
+    """
+    for line in diff_text.splitlines()[:6]:
+        if line.startswith("--- ") and "/dev/null" in line:
+            return "A"
+        if line.startswith("+++ ") and "/dev/null" in line:
+            return "D"
+    return "M"
+
+
+def _sdk_diff_entries(
+    result: Dict[str, Any], fallback_path: str = ""
+) -> List[Dict[str, Any]]:
     """Best-effort file_diff envelopes mined from a tool_call result.
 
-    The payload schema is unstable, so this probes the shapes seen from
-    cursor's edit tools (before/after full content, oldText/newText blocks,
-    pre-rendered diff strings) and returns [] rather than guessing. Runs
-    whose edits slip through entirely still land in files_changed via the
-    git fallback (sdk_runner.git_fallback_diffs).
+    The payload schema is unstable, so this probes every shape seen live
+    (the {"status", "value"} envelope with diffString + line counts, full
+    before/after content, oldText/newText blocks, pre-rendered diff
+    strings) and returns [] rather than guessing. ``fallback_path`` is the
+    path from the call's args / running message — the REAL edit tool's
+    result carries no path at all. Runs whose edits slip through entirely
+    still land in files_changed via the git fallback
+    (sdk_runner.git_fallback_diffs).
     """
-    candidates: List[Dict[str, Any]] = [result]
-    for key in ("success", "edit", "data"):
-        nested = result.get(key)
-        if isinstance(nested, dict):
-            candidates.append(nested)
-    for key in ("content", "diffs", "edits", "files"):
-        nested = result.get(key)
-        if isinstance(nested, list):
-            candidates.extend(b for b in nested if isinstance(b, dict))
-
     entries: List[Dict[str, Any]] = []
-    for cand in candidates:
-        path = _first_str(cand, "path", "file_path", "filePath")
+    seen: set = set()
+    for cand in _diff_candidates(result):
+        path = _first_str(cand, *_DIFF_PATH_KEYS) or fallback_path
         if not path:
             continue
-        before = _first_str(cand, "beforeFullFileContent", "oldText", "before")
-        after = _first_str(cand, "afterFullFileContent", "newText", "after")
-        pre_rendered = _first_str(cand, "diffString", "diff")
+        before = _first_str(cand, *_DIFF_BEFORE_KEYS)
+        after = _first_str(cand, *_DIFF_AFTER_KEYS)
+        pre_rendered = _first_str(cand, *_DIFF_TEXT_KEYS)
         if not (before or after or pre_rendered):
             continue
+        status: str | None = None
         if before or after:
             diff_text, added, removed = unified_diff_text(before, after, path)
         else:
             diff_text = pre_rendered
-            added = sum(
+            added_hint = _first_int(cand, *_DIFF_ADDED_KEYS)
+            removed_hint = _first_int(cand, *_DIFF_REMOVED_KEYS)
+            added = added_hint if added_hint is not None else sum(
                 1 for l in pre_rendered.splitlines()
                 if l.startswith("+") and not l.startswith("+++")
             )
-            removed = sum(
+            removed = removed_hint if removed_hint is not None else sum(
                 1 for l in pre_rendered.splitlines()
                 if l.startswith("-") and not l.startswith("---")
             )
+            status = _diff_status_from_text(pre_rendered)
         if not diff_text:
             continue
+        dedupe_key = (path, diff_text[:500])
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
         entries.append(
             file_diff(
                 path=path,
@@ -435,23 +508,48 @@ def _sdk_diff_entries(result: Dict[str, Any]) -> List[Dict[str, Any]]:
                 diff=diff_text,
                 added=added,
                 removed=removed,
+                status=status,
             )
         )
     return entries
 
 
 def _sdk_output_text(result: Any) -> str:
-    """Shell/read output mined from a tool_call result, shape-tolerant."""
+    """Shell/read output mined from a tool_call result, shape-tolerant.
+
+    Real payloads (captured live 2026-07-03) nest the useful fields inside
+    a {"status": "success", "value": {...}} envelope; older/other shapes
+    carry them at the top level. Both are probed.
+    """
     if isinstance(result, str):
         return result
     if not isinstance(result, dict):
         return "" if result is None else str(result)
+    for wrapper_key in ("value", "success", "error", "failure"):
+        nested = result.get(wrapper_key)
+        if isinstance(nested, dict):
+            inner = _sdk_output_text(nested)
+            if inner:
+                return inner
     parts = [
         str(result.get(k))
         for k in ("stdout", "stderr", "content", "output", "text", "error")
         if isinstance(result.get(k), str) and result.get(k)
     ]
     return "\n".join(parts)
+
+
+def _sdk_exit_code(result: Any) -> int | None:
+    """The command exit code from a tool_call result, envelope-tolerant."""
+    if not isinstance(result, dict):
+        return None
+    code = _int_or_none(result.get("exitCode", result.get("exit_code")))
+    if code is not None:
+        return code
+    nested = result.get("value")
+    if isinstance(nested, dict):
+        return _int_or_none(nested.get("exitCode", nested.get("exit_code")))
+    return None
 
 
 class SdkNormalizer:
@@ -483,8 +581,8 @@ class SdkNormalizer:
 
         Args:
             event_key: ``"sdk.session" | "sdk.message" | "sdk.reattached" |
-                "sdk.result" | "sdk.error"`` as yielded by
-                :func:`sdk_runner.run_sdk`.
+                "sdk.model_warning" | "sdk.result" | "sdk.error"`` as
+                yielded by :func:`sdk_runner.run_sdk`.
             data: For ``sdk.message``, the SDKMessage as a plain dict.
         """
         data = data if isinstance(data, dict) else {}
@@ -496,6 +594,20 @@ class SdkNormalizer:
                     model=data.get("model"),
                     cwd=data.get("cwd"),
                     harness_session_id=data.get("agentId"),
+                )
+            ]
+
+        if event_key == "sdk.model_warning":
+            # A legacy/unparseable model string was substituted (see
+            # sdk_runner.translate_model). Log-signal lifecycle event: the
+            # fold ignores unknown lifecycle events, so this lands in the
+            # progress buffer and JSONL log without touching the run.
+            return [
+                lifecycle(
+                    "model.warning",
+                    warning=data.get("warning"),
+                    requested=data.get("requested"),
+                    using=data.get("using"),
                 )
             ]
 
@@ -633,6 +745,7 @@ class SdkNormalizer:
             "kind": kind,
             "title": title,
             "command": _first_str(args, "command", "cmd"),
+            "path": _first_str(args, *_DIFF_PATH_KEYS),
             "started": time.monotonic(),
         }
         self._calls[call_id] = state
@@ -679,7 +792,19 @@ class SdkNormalizer:
         result = msg.get("result")
         result_dict = result if isinstance(result, dict) else {}
 
-        diffs = _sdk_diff_entries(result_dict) if kind == TOOL_FILE_EDIT else []
+        # The path from the call's args: the REAL edit tool's result carries
+        # no path (captured live 2026-07-03), only the args do — probe the
+        # terminal message's args first, then the remembered running state.
+        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        fallback_path = (
+            _first_str(args, *_DIFF_PATH_KEYS) or str(state.get("path") or "")
+        )
+
+        diffs = (
+            _sdk_diff_entries(result_dict, fallback_path=fallback_path)
+            if kind == TOOL_FILE_EDIT
+            else []
+        )
         if diffs:
             res_env["additions"] = sum(d["added"] for d in diffs)
             res_env["deletions"] = sum(d["removed"] for d in diffs)
@@ -688,7 +813,7 @@ class SdkNormalizer:
             out = _sdk_output_text(result)
             if out:
                 res_env["output"] = _clip(out, MAX_OUTPUT_CHARS)
-            exit_code = result_dict.get("exitCode", result_dict.get("exit_code"))
+            exit_code = _sdk_exit_code(result)
             if exit_code not in (None, 0):
                 res_env["status"] = STATUS_ERROR
 

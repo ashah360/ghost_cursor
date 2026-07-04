@@ -21,6 +21,10 @@ Yielded event tuples (consumed by ``events.SdkNormalizer``):
   dropped while the run stayed alive and was transparently re-attached via
   ``run.observe(after_offset=<last offset>)``. Lifecycle/log signal only:
   the user sees nothing, no synthetic messages, no re-prompt.
+* ``("sdk.model_warning", {"warning": ..., "requested": ..., "using":
+  ...})`` — the requested model string was unparseable and DEFAULT_MODEL
+  was substituted (see :func:`translate_model`). Yielded before any run
+  events so the substitution is visible in the event log.
 * ``("sdk.result", {"status": ...})`` — terminal run status as reported by
   the SDK: finished | error | cancelled | expired.
 * ``("sdk.error", {"error": ..., "timeout": bool})`` — mid-run hard failure
@@ -62,6 +66,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import threading
 import time
@@ -131,6 +136,106 @@ def _default_cancel_check() -> bool:
         return is_interrupted()
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Legacy model-string translation (ACP-era slugs → SDK model selection)
+# ---------------------------------------------------------------------------
+# The cursor-sdk model catalog exposes BASE ids only ("claude-fable-5");
+# thinking/effort/context are per-model parameters on a ModelSelection
+# (verified live via Cursor.models.list(), 2026-07-03: claude-fable-5 has
+# params thinking={false,true}, context={300k,1m},
+# effort={low,medium,high,xhigh,max}). Two legacy string forms still reach
+# us and would be rejected by the SDK with BadRequestError:
+#
+# * dash suffix   — "claude-fable-5-thinking-high" (the old CLI shorthand,
+#   previously our DEFAULT_MODEL and possibly in user config).
+# * bracket suffix — "claude-fable-5[thinking=true,context=300k,effort=high]"
+#   (ACP-era handle records; resumed sessions replay these verbatim).
+#
+# translate_model maps both onto a base id + params raw-dict ModelSelection
+# (the SDK's documented dict convenience — keeps this module importable
+# without the cursor_sdk dataclasses). Unparseable forms fall back to
+# DEFAULT_MODEL with a warning event rather than failing the run.
+
+# Legacy effort levels → catalog values ("extra-high" was a display-style
+# alias for what the catalog calls "xhigh").
+_EFFORT_LEVELS = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "extra-high": "xhigh",
+    "xhigh": "xhigh",
+    "max": "max",
+}
+
+_BRACKET_MODEL_RE = re.compile(r"^(?P<base>[^\[\]]*)\[(?P<params>[^\[\]]*)\]$")
+_THINKING_SUFFIX_RE = re.compile(r"^(?P<base>.+?)-thinking(?:-(?P<level>.+))?$")
+
+# str base id, raw-dict ModelSelection, or None (= cursor's default).
+ModelValue = Any
+
+
+def translate_model(model: Optional[str]) -> Tuple[Optional[ModelValue], Optional[str]]:
+    """Normalize a requested model string for the cursor-sdk.
+
+    Returns ``(sdk_model, warning)``:
+
+    * plain base ids pass through unchanged (as strings);
+    * ``<base>-thinking[-<level>]`` becomes ``{"id": base, "params":
+      [thinking=true, effort=<level>]}``;
+    * ``<base>[k=v,...]`` (legacy handle records) becomes ``{"id": base,
+      "params": [...]}``;
+    * unparseable/unknown suffix forms fall back to ``DEFAULT_MODEL`` with
+      a human-readable ``warning`` (the caller emits it as a warning event).
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return None, None
+
+    def _fallback(reason: str) -> Tuple[str, str]:
+        return DEFAULT_MODEL, (
+            f"requested model {raw!r} {reason} — "
+            f"falling back to '{DEFAULT_MODEL}'"
+        )
+
+    if "[" in raw or "]" in raw:
+        match = _BRACKET_MODEL_RE.match(raw)
+        base = (match.group("base").strip() if match else "")
+        if not match or not base:
+            return _fallback("has an unparseable bracket suffix")
+        params: List[Dict[str, str]] = []
+        for part in match.group("params").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            key, sep, val = part.partition("=")
+            if not sep or not key.strip() or not val.strip():
+                return _fallback(f"has an unparseable bracket parameter {part!r}")
+            params.append({"id": key.strip(), "value": val.strip()})
+        if not params:
+            return base, None
+        return {"id": base, "params": params}, None
+
+    match = _THINKING_SUFFIX_RE.match(raw)
+    if match:
+        level = match.group("level")
+        params = [{"id": "thinking", "value": "true"}]
+        if level is not None:
+            effort = _EFFORT_LEVELS.get(level.strip().lower())
+            if effort is None:
+                return _fallback("has an unrecognized '-thinking-…' suffix")
+            params.append({"id": "effort", "value": effort})
+        return {"id": match.group("base"), "params": params}, None
+
+    return raw, None
+
+
+def model_id_of(model: Optional[ModelValue]) -> str:
+    """The base model id of a translated model value ("" when None)."""
+    if isinstance(model, dict):
+        return str(model.get("id") or "")
+    return str(model or "")
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +462,7 @@ class _SdkWorker:
         out_q: "queue.Queue[Tuple[str, Dict[str, Any]]]",
         cancel_requested: threading.Event,
         agent_id: Optional[str] = None,
-        model: Optional[str] = None,
+        model: Optional[ModelValue] = None,
     ) -> None:
         self._task = task
         self._workdir = workdir
@@ -365,7 +470,10 @@ class _SdkWorker:
         self._cancel_requested = cancel_requested
         # Prior agent to continue via Agent.resume (None = fresh create).
         self._resume_agent_id = agent_id
-        self._model = (str(model).strip() or None) if model else None
+        # Already translated (run_sdk calls translate_model): a base-id
+        # string, a raw-dict ModelSelection, or None.
+        self._model = model or None
+        self._model_id = model_id_of(model)
 
         # "cancel" | "timeout" — written by the consumer thread before it
         # sets cancel_requested (single write, read after the event fires).
@@ -449,7 +557,10 @@ class _SdkWorker:
                 cached_model = str(
                     getattr(getattr(cached, "model", None), "id", "") or ""
                 )
-                if not self._model or self._model == cached_model:
+                # Base-id comparison: params-only differences reuse the live
+                # handle too (a resume for a param tweak is not worth the
+                # bridge-disposal crash risk documented on _agents).
+                if not self._model_id or self._model_id == cached_model:
                     return cached, True, True
             try:
                 agent = _call_with_retries(
@@ -597,7 +708,7 @@ class _SdkWorker:
                 cache_agent(str(self._workdir), agent_id, agent)
             model_sel = getattr(agent, "model", None)
             model_id = str(
-                getattr(model_sel, "id", None) or self._model or DEFAULT_MODEL
+                getattr(model_sel, "id", None) or self._model_id or DEFAULT_MODEL
             )
             self._put(
                 "sdk.session",
@@ -690,6 +801,13 @@ def run_sdk(
     to a fresh agent — the ``sdk.session`` event's ``resumed`` field reports
     what actually happened.
 
+    ``model`` accepts base ids AND the legacy ACP-era string forms
+    ("<id>-thinking-<level>" dash suffixes, "<id>[k=v,...]" bracket-suffix
+    handle records) — :func:`translate_model` maps them onto id + params
+    before anything reaches the SDK. An unparseable form falls back to
+    ``DEFAULT_MODEL`` and yields a ``("sdk.model_warning", {...})`` event
+    first so the substitution is visible in the run's event log.
+
     Raises:
         HarnessError: empty task / bad repo (preflight).
         SdkRunnerError: cursor-sdk not importable or CURSOR_API_KEY missing —
@@ -719,6 +837,10 @@ def run_sdk(
     )
     wall_s = float(max_wall_s if max_wall_s is not None else DEFAULT_MAX_WALL_S)
 
+    model_value, model_warning = translate_model(model)
+    if model_warning:
+        logger.warning("ghost_cursor model translation: %s", model_warning)
+
     out_q: "queue.Queue[Tuple[str, Dict[str, Any]]]" = queue.Queue()
     cancel_requested = threading.Event()
     worker = _SdkWorker(
@@ -727,12 +849,22 @@ def run_sdk(
         out_q=out_q,
         cancel_requested=cancel_requested,
         agent_id=(str(agent_id).strip() or None) if agent_id else None,
-        model=model,
+        model=model_value,
     )
     thread = threading.Thread(
         target=worker.run, name="ghost-cursor-sdk", daemon=True
     )
     thread.start()
+
+    if model_warning:
+        yield (
+            "sdk.model_warning",
+            {
+                "warning": model_warning,
+                "requested": str(model or "").strip(),
+                "using": model_id_of(model_value) or DEFAULT_MODEL,
+            },
+        )
 
     started = time.monotonic()
     fatal: Optional[str] = None
