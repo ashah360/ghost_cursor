@@ -581,8 +581,8 @@ class SdkNormalizer:
 
         Args:
             event_key: ``"sdk.session" | "sdk.message" | "sdk.reattached" |
-                "sdk.model_warning" | "sdk.result" | "sdk.error"`` as
-                yielded by :func:`sdk_runner.run_sdk`.
+                "sdk.bridge_died" | "sdk.model_warning" | "sdk.result" |
+                "sdk.error"`` as yielded by :func:`sdk_runner.run_sdk`.
             data: For ``sdk.message``, the SDKMessage as a plain dict.
         """
         data = data if isinstance(data, dict) else {}
@@ -620,6 +620,19 @@ class SdkNormalizer:
                     "stream.reattached",
                     offset=data.get("offset"),
                     attempt=data.get("attempt"),
+                )
+            ]
+
+        if event_key == "sdk.bridge_died":
+            # Bridge sidecar death detected mid-run (issue #11): lands in
+            # the JSONL log the instant it is detected, so status "recent"
+            # lines never show a plain healthy "running" while the runner
+            # is dealing with a dead bridge. The typed run.failed follows.
+            return [
+                lifecycle(
+                    "bridge.died",
+                    workspace=data.get("workspace"),
+                    detail=data.get("detail"),
                 )
             ]
 
@@ -678,7 +691,7 @@ class SdkNormalizer:
             # and the completion summary can render them.
             extras = {
                 key: data.get(key)
-                for key in ("retryable", "retry_after", "run_status")
+                for key in ("retryable", "retry_after", "run_status", "bridge_died")
                 if key in data
             }
             return [
