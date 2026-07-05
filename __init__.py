@@ -223,8 +223,13 @@ CURSOR_SEND_SCHEMA = {
                     "Optional. While the run is active, deliver a compact "
                     "progress digest (status header + new events) as a new "
                     "message every this-many seconds. Default 180; 0 "
-                    "disables digests. The setting persists on the session "
-                    "(cursor_subscribe changes it mid-run)."
+                    "disables digests. Negative values are rejected; "
+                    "positive values are clamped to the "
+                    f"{_render.dur_compact(_progress.MIN_UPDATE_INTERVAL_S)}–"
+                    f"{_render.dur_compact(_progress.MAX_UPDATE_INTERVAL_S)} "
+                    "range (the ack notes any clamping). The setting "
+                    "persists on the session (cursor_subscribe changes it "
+                    "mid-run)."
                 ),
             },
             **_TIMEOUT_PROPERTIES,
@@ -366,7 +371,12 @@ CURSOR_SUBSCRIBE_SCHEMA = {
                 "type": "number",
                 "description": (
                     "Seconds between progress digests. 0 unsubscribes "
-                    "(no digests; completion delivery is unaffected)."
+                    "(no digests; completion delivery is unaffected). "
+                    "Negative values are rejected; positive values are "
+                    "clamped to the "
+                    f"{_render.dur_compact(_progress.MIN_UPDATE_INTERVAL_S)}–"
+                    f"{_render.dur_compact(_progress.MAX_UPDATE_INTERVAL_S)} "
+                    "range (the ack notes any clamping)."
                 ),
             },
         },
@@ -1236,11 +1246,24 @@ def cursor_send_message(
         return _unknown_session_text(ident)
     entry = _handles.get(name) or {}
 
+    # Same validation contract as cursor_subscribe (issue #14): negative
+    # or non-numeric intervals are rejected before anything is dispatched
+    # or persisted; out-of-range positives are clamped and the ack says so.
+    try:
+        interval, interval_note = (
+            _progress.validate_interval(update_interval_s, "update_interval_s")
+            if update_interval_s is not None
+            else (None, None)
+        )
+    except ValueError as exc:
+        return str(exc)
+
     result = _send_to_session(
         name, entry, str(message), inactivity_timeout_s, max_wall_s,
-        update_interval_s,
+        interval,
     )
-    return _render_send_result(name, result)
+    text = _render_send_result(name, result)
+    return f"{text}\nnote: {interval_note}" if interval_note else text
 
 
 def _render_send_result(name: str, result: Dict[str, Any]) -> str:
@@ -1446,15 +1469,15 @@ def cursor_subscribe(session: str, interval_s: Any = None, **_kwargs: Any) -> st
     name = _resolve_session(ident)
     if name is None:
         return _unknown_session_text(ident)
-    try:
-        interval = float(interval_s)
-    except (TypeError, ValueError):
+    if interval_s is None:
         return "interval_s is required — seconds between digests (0 unsubscribes)."
-    if interval < 0:
-        return "interval_s must be >= 0 (0 unsubscribes)."
+    try:
+        interval, note = _progress.validate_interval(interval_s, "interval_s")
+    except ValueError as exc:
+        return str(exc)
 
     _progress.subscribe(name, interval)
-    return _render.subscribe_ack(name, interval)
+    return _render.subscribe_ack(name, interval, note)
 
 
 def cursor_list(scope: str = "session", **_kwargs: Any) -> str:

@@ -269,17 +269,19 @@ def status_text(
     return "\n".join(lines)
 
 
-def subscribe_ack(name: str, interval_s: float) -> str:
-    """The 1-line cursor_subscribe ack."""
+def subscribe_ack(name: str, interval_s: float, note: Optional[str] = None) -> str:
+    """The 1-line cursor_subscribe ack. ``note`` is the validation clamp
+    sentence (progress.validate_interval), appended in-line when present."""
     if interval_s <= 0:
         return (
             f"session '{name}': progress updates off (completion delivery "
             "unaffected)."
         )
-    return (
+    text = (
         f"session '{name}': progress updates every {secs(interval_s)} "
         "(applies to the running/next run; takes effect on the next tick)."
     )
+    return f"{text} {note}" if note else text
 
 
 # ---------------------------------------------------------------------------
