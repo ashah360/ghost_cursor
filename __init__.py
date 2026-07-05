@@ -178,7 +178,10 @@ CURSOR_CREATE_SCHEMA = {
                 "description": (
                     "Optional cursor model override for this session "
                     "(e.g. 'composer-2.5', 'gpt-5.3-codex'). Omit to use "
-                    "the configured/default model."
+                    "the configured/default model. Obviously-malformed "
+                    "strings are rejected here; whether a well-formed id "
+                    "exists in the model catalog is validated on the "
+                    "first cursor_send_message (create stays lazy)."
                 ),
             },
         },
@@ -1064,6 +1067,18 @@ def _send_to_session(
         update_interval_s=interval,
     )
     result.setdefault("session", name)
+    # Model validation is deferred to this first send (create is lazy by
+    # design) — so when the agent-create failure hits and this session
+    # carries an explicit model, attribute the failure to the param chosen
+    # at create instead of leaving a generic sdk error (issue #12).
+    explicit_model = str(entry.get("model") or "")
+    if explicit_model and "agent create failed" in str(result.get("error") or ""):
+        result["error"] = (
+            f"{result['error']} This session's model {explicit_model!r} "
+            f"was set at {CREATE_TOOL_NAME} — if the model is the problem, "
+            "create a new session with a valid model id (or omit model "
+            "for the default)."
+        )
     if str(result.get("status") or "") != "rejected":
         _handles.record(name, last_prompt_seq=prompt_seq)
     if interrupted:
@@ -1143,6 +1158,19 @@ def cursor_create_session(
         return f"cannot create session: {exc}"
 
     explicit_model = (str(model).strip() or None) if model else None
+    if explicit_model:
+        # Shape-only check (issue #12) — create stays lazy (no sdk
+        # contact), so obviously-malformed strings fail HERE, adjacent to
+        # the param; whether a well-formed id actually exists in the
+        # catalog is still validated on the first send.
+        reason = _sdk.invalid_model_reason(explicit_model)
+        if reason:
+            return (
+                f"cannot create session: {reason}. Pass a base model id "
+                "(e.g. 'claude-fable-5'), optionally with a "
+                "'-thinking[-<level>]' or '[param=value,...]' suffix — or "
+                "omit model for the default."
+            )
     name = _names.generate(
         taken=lambda n: _handles.resolve(n) is not None
     )

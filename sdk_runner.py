@@ -266,6 +266,36 @@ def model_id_of(model: Optional[ModelValue]) -> str:
     return str(model or "")
 
 
+# Base catalog ids are slug-like ("claude-fable-5", "gpt-5.3-codex") —
+# anything with whitespace/quotes/brackets in the BASE id is junk, not a
+# model. Deliberately loose: only rejects strings no catalog id could be.
+_MODEL_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:-]*$")
+
+
+def invalid_model_reason(model: Optional[str]) -> Optional[str]:
+    """Why ``model`` is an obviously-invalid model string, or None (issue #12).
+
+    A pure SHAPE check — no sdk/bridge contact, so it is safe at
+    ``cursor_create_session`` time (create stays lazy). Rejects the forms
+    :func:`translate_model` would otherwise silently coerce to
+    ``DEFAULT_MODEL`` at send time, plus base ids containing characters no
+    catalog id uses. A well-formed id that simply isn't in the catalog
+    passes — only the sdk knows the catalog, so that validation stays on
+    the first send.
+    """
+    raw = str(model or "").strip()
+    if not raw:
+        return None
+    value, warning = translate_model(raw)
+    if warning:
+        # The reason phrase without the send-time fallback clause: a
+        # create-time caller REJECTS the string, it never substitutes.
+        return warning.split(" — falling back", 1)[0]
+    if not _MODEL_ID_RE.match(model_id_of(value)):
+        return f"requested model {raw!r} is not a plausible model id"
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Bridge lifecycle — one sidecar per workspace, reused across sessions
 # ---------------------------------------------------------------------------
@@ -984,13 +1014,21 @@ class _SdkWorker:
             try:
                 agent, resumed, from_cache = self._establish_agent(client)
             except Exception as exc:
+                # Name the model when one was requested (issue #12): the
+                # invalid-model failure must point at the actual string in
+                # play, not a generic "the configured model".
+                model_hint = (
+                    f"the requested model {self._model_id!r}"
+                    if self._model_id
+                    else "the configured model"
+                )
                 self._put(
                     "sdk.fatal",
                     {
                         "error": (
                             f"cursor-sdk agent create failed "
                             f"({type(exc).__name__}: {exc}). Check "
-                            f"{API_KEY_ENV} and the configured model."
+                            f"{API_KEY_ENV} and {model_hint}."
                         )
                     },
                 )

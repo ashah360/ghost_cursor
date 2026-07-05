@@ -3249,6 +3249,100 @@ class TestCursorCreateSession:
 
 
 # ---------------------------------------------------------------------------
+# cursor_create_session model validation (issue #12) — obviously-invalid
+# model strings fail at CREATE (shape check only, create stays lazy); a
+# well-formed id the catalog doesn't know still fails on the first send,
+# but the failure names the model and says it was set at create.
+# ---------------------------------------------------------------------------
+
+class TestCreateModelValidation:
+    @pytest.mark.parametrize("bad", [
+        "claude-fable-5[thinking",   # unparseable bracket suffix
+        "m[thinking=]",              # malformed bracket parameter
+        "m-thinking-banana",         # unknown '-thinking-…' level
+        "totally fake model!!!",     # characters no catalog id uses
+    ])
+    def test_malformed_model_is_rejected_at_create(
+        self, clean_state, monkeypatch, tmp_path, bad
+    ):
+        # The rejection must stay lazy: no run, no bridge.
+        boom = lambda *a, **k: pytest.fail("create must not touch the sdk")
+        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
+        monkeypatch.setattr(gc_sdk, "get_bridge", boom)
+
+        out = cursor_create_session(repo=str(tmp_path), model=bad)
+        assert "cannot create session" in out
+        assert bad in out  # the failure names the offending string
+        assert "falling back" not in out  # rejected, never substituted
+        # No handle was minted for the failed create.
+        assert gc_handles.known_handles(scope="all") == []
+
+    def test_well_formed_unknown_id_still_creates_lazily(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Only the sdk knows the catalog — a shape-valid id passes create
+        (the documented deferred-validation contract) and the first send
+        owns the failure."""
+        boom = lambda *a, **k: pytest.fail("create must not start a run")
+        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
+
+        ack = cursor_create_session(
+            repo=str(tmp_path), model="totally-fake-model-9000"
+        )
+        name = _created_name(ack)
+        assert gc_handles.get(name)["model"] == "totally-fake-model-9000"
+
+    def test_legacy_translatable_forms_are_still_accepted_at_create(
+        self, clean_state, tmp_path
+    ):
+        for legacy in (
+            "claude-fable-5-thinking-high",
+            "claude-fable-5[thinking=true,context=300k,effort=high]",
+        ):
+            ack = cursor_create_session(repo=str(tmp_path), model=legacy)
+            assert ack.startswith("session: "), ack
+
+    def test_send_failure_names_the_model_set_at_create(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The deferred (catalog) failure at first send must attribute the
+        error to the model param chosen at create, not read like a generic
+        sdk failure on the send."""
+        client = _FakeClient(
+            _FakeAgent(),
+            create_error=_sdk_error(
+                'model "totally-fake-model-9000" not found',
+                is_retryable=False,
+            ),
+        )
+        _install_fake_sdk(monkeypatch, client)
+
+        name = _created_name(cursor_create_session(
+            repo=str(tmp_path), model="totally-fake-model-9000"
+        ))
+        out = cursor_send_message(name, "hi")
+        assert "agent create failed" in out
+        assert "'totally-fake-model-9000'" in out
+        assert CREATE_TOOL_NAME in out  # "...was set at cursor_create_session"
+
+    def test_send_failure_without_create_model_is_not_attributed(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """No explicit model at create → the same failure stays generic
+        (the default/configured-model path is untouched)."""
+        monkeypatch.setattr(gc, "_configured_model", lambda: None)
+        client = _FakeClient(
+            _FakeAgent(), create_error=_sdk_error("boom", is_retryable=False)
+        )
+        _install_fake_sdk(monkeypatch, client)
+
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        out = cursor_send_message(name, "hi")
+        assert "agent create failed" in out
+        assert "was set at" not in out
+
+
+# ---------------------------------------------------------------------------
 # cursor_events — tail defaults, negative offsets, kind filter, clips, cap
 # ---------------------------------------------------------------------------
 
@@ -4941,6 +5035,40 @@ class TestModelTranslation:
         ))
         assert client.agents.resume_calls == []
         assert second[-1] == ("sdk.result", {"status": "finished"})
+
+
+class TestInvalidModelReason:
+    """invalid_model_reason — the pure SHAPE check behind create-time model
+    validation (issue #12): no sdk contact, so it only rules out strings no
+    catalog id could be; catalog membership stays a first-send concern."""
+
+    def test_blank_and_well_formed_ids_pass(self):
+        for ok in (
+            None, "", "   ",
+            "claude-fable-5",
+            "gpt-5.3-codex",
+            "totally-fake-model-9000",  # shape-valid; only the catalog knows
+            "claude-fable-5-thinking-high",
+            "claude-fable-5[thinking=true,context=300k,effort=high]",
+            "claude-fable-5[]",
+        ):
+            assert gc_sdk.invalid_model_reason(ok) is None, ok
+
+    def test_forms_that_would_silently_fall_back_are_rejected(self):
+        for bad in ("claude-fable-5[thinking", "m[thinking=]", "m-thinking-banana"):
+            reason = gc_sdk.invalid_model_reason(bad)
+            assert reason and bad in reason, bad
+            # A create-time caller REJECTS — the reason must not read like
+            # the send-time DEFAULT_MODEL substitution.
+            assert "falling back" not in reason
+
+    def test_base_ids_no_catalog_id_could_be_are_rejected(self):
+        for junk in (
+            "totally fake model!!!",
+            "model with spaces[thinking=true]",
+            '"quoted-model"',
+        ):
+            assert gc_sdk.invalid_model_reason(junk), junk
 
 
 # ---------------------------------------------------------------------------
