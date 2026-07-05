@@ -969,11 +969,12 @@ class TestCursorStatusReadOnly:
         assert "not tracked live" in status
         assert "cursor_send_message" in status
 
-    def test_stale_running_record_is_reported_as_unknown(self, clean_state, tmp_path):
-        # A dead process can't have left a live run behind.
+    def test_stale_running_record_is_reconciled_not_running(self, clean_state, tmp_path):
+        # A dead process can't have left a live run behind (issue #13).
         gc_handles.record("s-stale", repo=str(tmp_path), status="running")
         status = cursor_status("s-stale")
-        assert status.startswith("status: unknown")
+        assert status.startswith("status: failed")
+        assert "orphaned: plugin process restarted mid-run" in status
 
     def test_unknown_session_is_actionable_prose(self, clean_state):
         out = cursor_status("s-nope")
@@ -985,6 +986,93 @@ class TestCursorStatusReadOnly:
     def test_handler_maps_args(self, clean_state):
         out = _handle_cursor_status({"session": "s-nope"})
         assert "no session named 's-nope'" in out
+
+
+# ---------------------------------------------------------------------------
+# orphaned-handle reconciliation — issue #13: a persisted "running" record
+# with no live job in this process (the plugin process restarted mid-run)
+# must settle to a terminal state, never render plain "running" forever
+# ---------------------------------------------------------------------------
+
+class TestOrphanedHandleReconciliation:
+    def _seed_orphan(self, tmp_path, name="s-orphan"):
+        """Exactly the post-restart world: a persisted running handle
+        (written by the dead process at sdk.session) and an empty job
+        registry — clean_state guarantees the latter."""
+        gc_handles.record(
+            name, repo=_resolved(tmp_path), status="running",
+            task="long task", cursor_session_id="agent-orphan",
+        )
+        return name
+
+    def test_status_reconciles_orphaned_running_handle(self, clean_state, tmp_path):
+        self._seed_orphan(tmp_path)
+        out = cursor_status("s-orphan")
+        assert out.startswith("status: failed")
+        assert "orphaned: plugin process restarted mid-run" in out
+        # The persisted record is repaired, not just the rendering.
+        entry = gc_handles.get("s-orphan")
+        assert entry["status"] == "failed"
+        assert entry["status_note"] == "orphaned: plugin process restarted mid-run"
+
+    def test_list_reconciles_orphaned_running_handle(self, clean_state, tmp_path):
+        self._seed_orphan(tmp_path)
+        out = cursor_list(scope="all")
+        row = next(l for l in out.splitlines() if "s-orphan" in l)
+        assert "failed (orphaned: plugin process restarted mid-run)" in row
+        assert "running" not in row
+        assert gc_handles.get("s-orphan")["status"] == "failed"
+
+    def test_reconciliation_fires_no_completion_delivery(self, clean_state, tmp_path):
+        """No consumer exists for a run whose process died — reconciliation
+        only fixes the record, it never enqueues a completion/digest."""
+        self._seed_orphan(tmp_path)
+        cursor_status("s-orphan")
+        cursor_list(scope="all")
+        assert _drain_completion_queue() == []
+
+    def test_reconciled_session_stays_continuable(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Only the run died; the agent id is durable — a follow-up send
+        still resumes the reconciled session via Agent.resume."""
+        self._seed_orphan(tmp_path)
+        assert cursor_status("s-orphan").startswith("status: failed")
+
+        release = threading.Event()
+        seq = _SdkSequence(_gated_replay_factory(release, sid="agent-orphan",
+                                                 early_edit=False))
+        monkeypatch.setattr(gc, "_configured_model", lambda: None)
+        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+
+        ack = cursor_send_message("s-orphan", "pick it back up")
+        try:
+            _assert_running_ack(ack)
+            assert seq.calls[0]["agent_id"] == "agent-orphan"  # Agent.resume
+        finally:
+            release.set()
+        assert _job_for("agent-orphan").done_event.wait(10)
+
+    def test_handle_with_live_job_is_untouched(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(gc_sdk, "run_sdk",
+                            _gated_replay_factory(release, sid="s-live"))
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-live")
+        name = job.session_name
+        try:
+            assert cursor_status(name).startswith("status: running")
+            row = next(
+                l for l in cursor_list(scope="all").splitlines() if name in l
+            )
+            assert "running" in row
+            assert "orphaned" not in row
+            assert gc_handles.get(name)["status"] == "running"
+        finally:
+            release.set()
+        assert job.done_event.wait(10)
 
 
 # ---------------------------------------------------------------------------

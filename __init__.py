@@ -499,6 +499,33 @@ def _live_job(name: str, entry: Optional[Dict[str, Any]]) -> Optional["_jobs.Cur
     return _jobs.registry.get_by_session(sid)
 
 
+# Persisted onto a handle whose recorded run cannot exist anymore: runs are
+# worker threads, so the restart that emptied this process's job registry
+# also destroyed the run before it could finalize its record (issue #13).
+_ORPHANED_NOTE = "orphaned: plugin process restarted mid-run"
+
+
+def _reconcile_orphan(
+    name: str, entry: Dict[str, Any], job: Optional["_jobs.CursorJob"]
+) -> Dict[str, Any]:
+    """Settle a persisted "running" record that has NO job behind it.
+
+    Only the run's own worker thread ever moves a "running" handle to a
+    terminal state — after a process restart nothing would, so cursor_list
+    / cursor_status would claim "running" forever (issue #13). Any read
+    that observes the contradiction repairs the record to "failed" with an
+    explanatory ``status_note``. The session stays continuable
+    (cursor_send_message resumes by the durable agent id — only the run
+    died) and nothing is delivered: there is no run left to deliver for.
+    A handle with ANY job in this process (running or just settled) is
+    left to the normal lifecycle.
+    """
+    if job is not None or str(entry.get("status") or "") != "running":
+        return entry
+    _handles.record(name, status="failed", status_note=_ORPHANED_NOTE)
+    return _handles.get(name) or entry
+
+
 def _resume_sid(name: str, entry: Dict[str, Any]) -> Optional[str]:
     """The cursor agent id to resume, or None for a fresh agent.
 
@@ -1117,13 +1144,15 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
                 ),
             })
             continue
+        entry = _reconcile_orphan(name, entry, job)
         status = str(entry.get("status") or "created")
+        status_note = str(entry.get("status_note") or "")
         duration = entry.get("duration_s")
         files_count = entry.get("files_changed_count")
         rows.append({
             "session": name,
             "repo": str(entry.get("repo") or "—"),
-            "status": status,
+            "status": f"{status} ({status_note})" if status_note else status,
             "elapsed": _render.secs(duration) if duration is not None else "—",
             "files": str(files_count) if files_count is not None else "—",
             "last_activity": "—",
@@ -1296,9 +1325,11 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
     if entry is not None:
         # Known handle, but no live job in this process (e.g. restart).
         # The JSONL event log persists, so history stays visible.
+        entry = _reconcile_orphan(name, entry, job)
         status = str(entry.get("status") or "unknown")
         if status == "running":
-            # A dead process can't have left a live run behind.
+            # A dead process can't have left a live run behind. Reconciled
+            # above; this fallback only fires if that write failed.
             status = "unknown (recorded as running by a previous process)"
         return _render.status_text(
             name=name,
@@ -1310,6 +1341,7 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             task=str(entry.get("task") or ""),
             files=[],
             bullets=bullets,
+            error=str(entry.get("status_note") or ""),
             note=(
                 "not tracked live in this process — showing the persisted "
                 "record. cursor_send_message continues the session."
