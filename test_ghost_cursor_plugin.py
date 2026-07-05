@@ -165,7 +165,13 @@ def _drain_completion_queue():
 @pytest.fixture
 def clean_state(monkeypatch):
     """Fresh job registry + handle table + event-log writer state + drained
-    completion queue + no live progress tickers."""
+    completion queue + no live progress tickers.
+
+    Also drops the tool-boundary interval minimum (issue #14 clamps
+    sub-15s requests UP) — the timing-based tests here rely on
+    sub-second digest cadences. Validation-contract tests patch their
+    own minimum back in."""
+    monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 0.0)
     gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
@@ -2047,6 +2053,171 @@ class TestProgressSubscriptions:
             release.set()
             assert job.done_event.wait(10)
         assert "pending tool call:" in _digest_events(collected)[0]["summary"]
+
+
+# ---------------------------------------------------------------------------
+# Interval validation at the tool boundary (issue #14)
+# ---------------------------------------------------------------------------
+
+def _reject_dispatch(*_args, **_kwargs):
+    """run_sdk sentinel for rejection tests: an invalid interval must be
+    refused BEFORE any run is dispatched, so reaching the SDK is a bug."""
+    raise AssertionError("run dispatched despite invalid interval")
+
+
+class TestIntervalValidation:
+    """Issue #14: one shared validation contract for cursor_subscribe's
+    interval_s and cursor_send_message's update_interval_s — negatives
+    and non-numbers rejected with a clear message, 0 stays the documented
+    unsubscribe, positives clamped into [MIN_UPDATE_INTERVAL_S,
+    MAX_UPDATE_INTERVAL_S] with the clamp spelled out in the ack.
+
+    clean_state drops MIN_UPDATE_INTERVAL_S to 0 for the timing tests
+    above, so clamp tests patch their own minimum back in."""
+
+    def test_production_bounds(self):
+        # The real (unpatched) contract values: 15s floor, 24h ceiling.
+        assert gc_progress.MIN_UPDATE_INTERVAL_S == 15.0
+        assert gc_progress.MAX_UPDATE_INTERVAL_S == 24 * 3600.0
+
+    # -- rejection: negative + non-numeric ----------------------------------
+
+    def test_subscribe_negative_rejected_not_unsubscribed(
+        self, clean_state, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        out = cursor_subscribe(name, -5)
+        assert "interval_s must be >= 0" in out
+        # NOT silently treated as unsubscribe: nothing was persisted.
+        assert "update_interval_s" not in (gc_handles.get(name) or {})
+
+    def test_send_negative_rejected_before_dispatch(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_sdk, "run_sdk", _reject_dispatch)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        out = cursor_send_message(name, "task", update_interval_s=-5)
+        assert "update_interval_s must be >= 0" in out
+        assert gc_progress._tickers == {}
+        assert "update_interval_s" not in (gc_handles.get(name) or {})
+
+    def test_subscribe_non_numeric_rejected(self, clean_state, tmp_path):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        assert "interval_s must be a number" in cursor_subscribe(name, "soon")
+        assert "interval_s must be a number" in cursor_subscribe(
+            name, float("nan")
+        )
+        assert "update_interval_s" not in (gc_handles.get(name) or {})
+
+    def test_send_non_numeric_rejected_before_dispatch(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_sdk, "run_sdk", _reject_dispatch)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        out = cursor_send_message(name, "task", update_interval_s="fast")
+        assert "update_interval_s must be a number" in out
+        assert gc_progress._tickers == {}
+
+    # -- 0 stays the documented unsubscribe ----------------------------------
+
+    def test_subscribe_zero_still_unsubscribes(self, clean_state, tmp_path):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 0)
+        assert "progress updates off" in ack
+        assert "clamped" not in ack
+        assert gc_handles.get(name)["update_interval_s"] == 0.0
+
+    # -- clamping: below minimum / above maximum -----------------------------
+
+    def test_subscribe_subminimum_clamps_up_with_ack_note(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 20.0)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 5)
+        assert "progress updates every 20s" in ack
+        assert "interval_s clamped to the 20s minimum" in ack
+        assert "\n" not in ack  # still the 1-line ack
+        assert gc_handles.get(name)["update_interval_s"] == 20.0
+
+    def test_subscribe_huge_clamps_down_to_max_with_ack_note(
+        self, clean_state, tmp_path
+    ):
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 999_999_999)
+        assert "interval_s clamped to the 24h maximum" in ack
+        assert gc_handles.get(name)["update_interval_s"] == 24 * 3600.0
+
+    def test_send_subminimum_clamps_up_and_ack_notes_it(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 20.0)
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-clamp")
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_send_message(name, "task", update_interval_s=2)
+        _assert_running_ack(ack)
+        job = _job_for("agent-clamp")
+        try:
+            assert "update_interval_s clamped to the 20s minimum" in ack
+            assert gc_handles.get(name)["update_interval_s"] == 20.0
+            assert gc_progress._tickers[name].interval_s == 20.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_send_huge_clamps_down_and_ack_notes_it(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-max")
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_send_message(name, "task", update_interval_s=999_999_999)
+        _assert_running_ack(ack)
+        job = _job_for("agent-max")
+        try:
+            assert "update_interval_s clamped to the 24h maximum" in ack
+            assert gc_handles.get(name)["update_interval_s"] == 24 * 3600.0
+            assert gc_progress._tickers[name].interval_s == 24 * 3600.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    # -- in-range values pass through unchanged -------------------------------
+
+    def test_subscribe_valid_value_unchanged(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 15.0)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_subscribe(name, 60)
+        assert ack == gc_render.subscribe_ack(name, 60.0)
+        assert "clamped" not in ack
+        assert gc_handles.get(name)["update_interval_s"] == 60.0
+
+    def test_send_valid_value_unchanged(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 15.0)
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-ok")
+        )
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        ack = cursor_send_message(name, "task", update_interval_s=45)
+        _assert_running_ack(ack)
+        job = _job_for("agent-ok")
+        try:
+            assert "clamped" not in ack
+            assert gc_handles.get(name)["update_interval_s"] == 45.0
+            assert gc_progress._tickers[name].interval_s == 45.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
 
 
 # ---------------------------------------------------------------------------

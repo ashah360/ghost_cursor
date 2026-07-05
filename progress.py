@@ -74,9 +74,10 @@ the completion event.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import eventlog as _eventlog
 from . import handles as _handles
@@ -87,6 +88,16 @@ logger = logging.getLogger(__name__)
 # Default digest cadence when cursor_send_message doesn't say otherwise
 # (spec: 180s; 0 disables).
 DEFAULT_UPDATE_INTERVAL_S = 180.0
+
+# Validation bounds for intervals supplied at the tool boundary (issue
+# #14): positive requests below the minimum clamp UP (a sub-15s cadence
+# is digest spam — the emit-time floor above already drops deliveries
+# inside the interval, this keeps the CONTRACT honest too), and requests
+# above the maximum clamp DOWN (a >24h "subscription" is a typo, not a
+# cadence). 0 stays the documented unsubscribe value and negatives are
+# rejected outright — see validate_interval.
+MIN_UPDATE_INTERVAL_S = 15.0
+MAX_UPDATE_INTERVAL_S = 24 * 3600.0
 
 _RUNNING = "running"
 
@@ -111,6 +122,51 @@ def _floor_slack(interval_s: float) -> float:
     absolute terms and capped relative to the interval so short (test)
     intervals keep a meaningful floor."""
     return min(0.02, interval_s * 0.1)
+
+
+def validate_interval(value: Any, param: str = "interval_s") -> Tuple[float, Optional[str]]:
+    """Validate/clamp a subscription interval supplied at a tool boundary.
+
+    The shared contract for ``cursor_subscribe.interval_s`` and
+    ``cursor_send_message.update_interval_s`` (issue #14):
+
+    * non-numeric / NaN → ``ValueError`` with a user-facing message
+    * negative → ``ValueError`` (NOT silently treated as unsubscribe)
+    * 0 → unsubscribe, accepted as-is
+    * 0 < value < :data:`MIN_UPDATE_INTERVAL_S` → clamped UP
+    * value > :data:`MAX_UPDATE_INTERVAL_S` → clamped DOWN
+
+    Returns ``(effective_interval, note)`` where ``note`` is the clamp
+    sentence for the tool ack, or ``None`` when the value was accepted
+    unchanged. ``param`` names the offending parameter in messages.
+    """
+    try:
+        interval = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{param} must be a number — seconds between digests "
+            "(0 unsubscribes)."
+        ) from None
+    if math.isnan(interval):
+        raise ValueError(
+            f"{param} must be a number — seconds between digests "
+            "(0 unsubscribes)."
+        )
+    if interval < 0:
+        raise ValueError(f"{param} must be >= 0 (0 unsubscribes).")
+    if interval == 0:
+        return 0.0, None
+    if interval < MIN_UPDATE_INTERVAL_S:
+        return MIN_UPDATE_INTERVAL_S, (
+            f"{param} clamped to the "
+            f"{_render.dur_compact(MIN_UPDATE_INTERVAL_S)} minimum."
+        )
+    if interval > MAX_UPDATE_INTERVAL_S:
+        return MAX_UPDATE_INTERVAL_S, (
+            f"{param} clamped to the "
+            f"{_render.dur_compact(MAX_UPDATE_INTERVAL_S)} maximum."
+        )
+    return interval, None
 
 
 def resolve_interval(entry: Optional[Dict[str, Any]], explicit: Optional[float]) -> float:
