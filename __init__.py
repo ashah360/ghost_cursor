@@ -114,10 +114,18 @@ _RESULT_DIFF_CHARS = 20_000
 # retry budget plus slack; a healthy run yields it in seconds.
 _HANDLE_WAIT_S = 150.0
 
-# How long cursor_send_message/cursor_stop wait for a cancelled run to
-# settle. Native run.cancel() resolves ~immediately; the ceiling covers
-# the sdk_runner CANCEL_GRACE_S escalation.
+# How long cursor_send_message's interrupt path waits for a cancelled run
+# to settle before refusing to re-prompt. Native run.cancel() resolves
+# ~immediately; the ceiling covers the sdk_runner CANCEL_GRACE_S escalation.
 _INTERRUPT_WAIT_S = 40.0
+
+# How long cursor_stop waits for OBSERVED termination after signalling
+# cancel (issue #22). Matches sdk_runner.CANCEL_GRACE_S: a landed
+# run.cancel() settles the job well within this; a job still live at the
+# deadline most likely lost the signal (bridge RPC dropped / run between
+# attempts), and cursor_stop must say so instead of acking "stopped".
+# Module-level so tests can shrink it.
+_STOP_WAIT_S = 15.0
 
 _SESSION_DOC = (
     "The session handle: the name returned by cursor_create_session (e.g. "
@@ -271,10 +279,13 @@ CURSOR_STATUS_SCHEMA = {
 CURSOR_STOP_SCHEMA = {
     "name": STOP_TOOL_NAME,
     "description": (
-        "Stop a running cursor session gracefully (cursor's native cancel; "
-        "the process is only force-killed if it hangs). Reports the final "
-        "status and any partial work. Idempotent on finished runs. The "
-        "session stays continuable via cursor_send_message."
+        "Stop a running cursor session gracefully (cursor's native "
+        "cancel). Acks 'stopped' only after the run is OBSERVED to reach "
+        "a terminal state; if it hasn't settled within the bounded wait, "
+        "the status honestly stays running — retry or check "
+        "cursor_status. Reports the final status and any partial work. "
+        "Idempotent on finished runs. The session stays continuable via "
+        "cursor_send_message."
     ),
     "parameters": {
         "type": "object",
@@ -566,9 +577,41 @@ def _log_key(name: str, entry: Optional[Dict[str, Any]]) -> str:
 # Run execution (worker-thread body)
 # ---------------------------------------------------------------------------
 
+def _repair_terminal_handle(job: "_jobs.CursorJob") -> None:
+    """Repair a persisted terminal status contradicted by a live run.
+
+    Invariant (issue #22): the persisted handle status must never be
+    terminal while the job is still live in this process — events folding
+    for a session recorded as cancelled/completed means both read surfaces
+    (cursor_status / cursor_list) are lying. Belt-and-braces at the point
+    events fold: flip the record back to "running" and leave a lifecycle
+    event in the log so the contradiction is visible, not papered over.
+    """
+    name = job.session_name
+    if not name or job.status in _jobs.TERMINAL_STATUSES:
+        return
+    stale = str((_handles.get(name) or {}).get("status") or "")
+    if stale not in _jobs.TERMINAL_STATUSES:
+        return
+    _handles.record(name, status="running")
+    logger.warning(
+        "ghost_cursor: session %s was persisted %r while its run is still "
+        "streaming events — repaired to 'running'", name, stale,
+    )
+    job.append_progress(_events.lifecycle(
+        "status.repaired",
+        was=stale,
+        note=(
+            f"persisted status '{stale}' contradicted a live run still "
+            "streaming events — repaired to 'running'"
+        ),
+    ))
+
+
 def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
     """Fold one canonical envelope into the job's aggregation state and
     append a compact line to the rolling buffer status views read."""
+    _repair_terminal_handle(job)
     job.append_progress(envelope)
 
     kind = envelope.get("kind")
@@ -1064,6 +1107,10 @@ def _send_to_session(
     if job is not None and job.status == "running":
         interrupted = True
         if not _settle_job(job):
+            # Same honesty rule as cursor_stop (issue #22): the run is
+            # still live, so re-arm the delivery mark_handled suppressed —
+            # otherwise a run whose cancel was lost settles silently.
+            job.arm_delivery()
             return {
                 "success": False,
                 "status": "running",
@@ -1414,15 +1461,26 @@ def cursor_stop(session: str, **_kwargs: Any) -> str:
             already_finished=True,
         )
 
-    settled = _settle_job(job)
-    if not settled:
+    settled = _settle_job(job, wait_s=_STOP_WAIT_S)
+    if not settled and job.arm_delivery():
+        # No terminal state was OBSERVED inside the window — the cancel
+        # signal may have been lost (issue #22: the bridge owns the run;
+        # our native run.cancel() is best-effort and there is no local
+        # process to kill). Never claim "stopped" or persist a terminal
+        # status on faith: the job stays running, the cancel event stays
+        # signalled, and delivery is re-armed so the real outcome still
+        # reaches the conversation whenever the run does settle.
         return (
-            f"the run in session '{name}' did not settle within "
-            f"{int(_INTERRUPT_WAIT_S)}s of a native cancel — it may be "
-            "hung; the kill escalation is in progress. check again with "
-            "cursor_status."
+            f"cancel signalled, but the run in session '{name}' has not "
+            f"stopped within {int(_STOP_WAIT_S)}s — it is still executing. "
+            "status stays running; nothing terminal was recorded. retry "
+            "cursor_stop, or watch cursor_status; the final outcome will "
+            "be delivered when the run actually settles."
         )
 
+    # Either the settle wait succeeded, or finalize won the race with the
+    # re-arm above (arm_delivery returned False, nothing was enqueued) —
+    # both mean an observed terminal state to report in-turn.
     result = _jobs.trim_result(job.result or {})
     return _render.stop_text(
         name=name,

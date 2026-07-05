@@ -247,6 +247,43 @@ def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=T
     return replay
 
 
+def _cancel_deaf_replay_factory(release, sid="agent-deaf"):
+    """A replay whose run IGNORES the cancel signal (issue #22).
+
+    Models the lost native run.cancel(): ``cancel_check`` is never
+    consulted, so a stop mid-run leaves the run executing. It yields the
+    session handle plus one early edit, keeps running until ``release``,
+    then streams a wrap-up message and finishes normally.
+    """
+
+    def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+               cancel_check=None, agent_id=None, model=None,
+               first_event_timeout_s=None):
+        yield ("sdk.session", {
+            "agentId": sid, "cwd": str(workdir),
+            "model": model or "fake-model", "resumed": bool(agent_id),
+        })
+        yield ("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "edit_file",
+            "status": "running", "args": {"path": f"{workdir}/f1.py"},
+        })
+        yield ("sdk.message", {
+            "type": "tool_call", "call_id": "t1", "name": "edit_file",
+            "status": "completed",
+            "result": {"path": f"{workdir}/f1.py",
+                       "oldText": "a\n", "newText": "a\nb\n"},
+        })
+        while not release.is_set():
+            time.sleep(0.01)  # deaf: never checks cancel_check
+        yield ("sdk.message", {
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "kept going"}]},
+        })
+        yield ("sdk.result", {"status": "finished"})
+
+    return replay
+
+
 class _SdkSequence:
     """Route successive run_sdk calls to successive replay factories,
     recording each call's kwargs for assertion."""
@@ -1113,6 +1150,45 @@ class TestCursorStop:
         # Handle table settled too.
         assert gc_handles.get("s-stop")["status"] == "cancelled"
 
+    def test_stop_on_cancel_deaf_run_is_honest_and_keeps_status_running(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Issue #22: a run that never honors the cancel signal must NOT
+        get the confident "stopped" ack — the caller is told the run is
+        still executing, and no terminal status is persisted while the
+        job is live."""
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _cancel_deaf_replay_factory(release, sid="s-deaf")
+        )
+        monkeypatch.setattr(gc, "_STOP_WAIT_S", 0.3)
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-deaf")
+        name = job.session_name
+        try:
+            out = cursor_stop(name)
+            # Honest ack: cancel signalled, run NOT observed to stop.
+            assert "still executing" in out
+            assert "status stays running" in out
+            assert "stopped after" not in out
+            assert not out.startswith("status: cancelled")
+            # The cancel WAS signalled...
+            assert job.cancel_event.is_set()
+            # ...but nothing terminal was recorded on faith, anywhere.
+            assert job.status == "running"
+            assert gc_handles.get(name)["status"] == "running"
+            assert cursor_status(name).startswith("status: running")
+        finally:
+            release.set()
+        assert job.done_event.wait(10)
+        # Delivery was re-armed: the REAL outcome arrives as a delivered
+        # message when the run actually settles, never silently swallowed.
+        events = _drain_completion_queue()
+        assert len(events) == 1
+        assert events[0]["status"] == "completed"
+        assert gc_handles.get(name)["status"] == "completed"
+
     def test_stop_on_finished_run_is_graceful_and_idempotent(
         self, clean_state, monkeypatch, tmp_path
     ):
@@ -1155,6 +1231,68 @@ class TestCursorStop:
     def test_handler_maps_args(self, clean_state):
         out = _handle_cursor_stop({"session": "s-nope"})
         assert "no session named 's-nope'" in out
+
+
+# ---------------------------------------------------------------------------
+# Terminal-status repair invariant (issue #22 belt-and-braces)
+# ---------------------------------------------------------------------------
+
+class TestTerminalStatusRepairInvariant:
+    """The persisted handle status must never be terminal while the run's
+    events are still folding in this process — the fold path repairs the
+    record back to running and logs the contradiction."""
+
+    def test_events_folding_repair_a_persisted_terminal_status(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        gate_event, gate_end = threading.Event(), threading.Event()
+
+        def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
+                   cancel_check=None, agent_id=None, model=None,
+                   first_event_timeout_s=None):
+            yield ("sdk.session", {"agentId": "s-repair", "cwd": str(workdir),
+                                   "model": "m", "resumed": False})
+            while not gate_event.is_set():
+                time.sleep(0.01)
+            yield ("sdk.message", {
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "still here"}]},
+            })
+            while not gate_end.is_set():
+                time.sleep(0.01)
+            yield ("sdk.result", {"status": "finished"})
+
+        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        job = _job_for("s-repair")
+        name = job.session_name
+        try:
+            # Simulate the issue #22 corruption: a terminal status lands
+            # on the persisted handle while the run is still live here.
+            gc_handles.record(name, status="cancelled")
+            assert gc_handles.get(name)["status"] == "cancelled"
+
+            gate_event.set()  # one more event folds for the live run
+            assert _wait_until(
+                lambda: gc_handles.get(name)["status"] == "running"
+            ), "a folding event must repair the persisted terminal status"
+
+            # The contradiction is surfaced as a lifecycle event, not
+            # silently papered over (the event append trails the status
+            # write by a beat — poll for it).
+            def _repaired_events():
+                page = gc_eventlog.read_events(name, offset=0, limit=200)
+                return [e for e in (page or {}).get("events", [])
+                        if e.get("event") == "status.repaired"]
+
+            assert _wait_until(lambda: _repaired_events())
+            assert _repaired_events()[0].get("was") == "cancelled"
+        finally:
+            gate_event.set()
+            gate_end.set()
+        assert job.done_event.wait(10)
+        # The normal lifecycle still owns the real terminal state.
+        assert gc_handles.get(name)["status"] == "completed"
 
 
 # ---------------------------------------------------------------------------
