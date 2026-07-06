@@ -2864,6 +2864,44 @@ class TestZeroProgressAutoRetry:
         assert ("run failed: ServerError: bridge went stale (not retryable)"
                 in completions[0]["summary"])
 
+    def test_autoretry_reason_embeds_streamed_status_error_text(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """End-to-end through the REAL run_sdk over a fake bridge (live
+        incident 2026-07-06, session sleek-jade-wolf): a zero-progress
+        terminal error whose only cause text arrived as the stream's final
+        status-ERROR message. run.failed's ``error`` and the sdk.autoretry
+        ``reason`` must both carry that text with NO jobs-layer changes,
+        and retryable stays unknown (None) so the gate still retries."""
+        recycles = self._fast_retries(monkeypatch)
+        failing = _FakeRun([
+            _sdk_msg(type="status", status="RUNNING"),
+            _sdk_msg(type="status", status="ERROR",
+                     message="[unknown] Invalid User API Key"),
+        ], final_status="error")
+        agent = _FakeAgent(runs=[failing, _FakeRun(_happy_script())])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+
+        _assert_running_ack(_start_run("t", repo=str(tmp_path)))
+        assert _wait_until(
+            lambda: gc_jobs.registry.get_by_session("agent-fake-1") is not None
+        )
+        job = _job_for("agent-fake-1")
+        assert job.done_event.wait(10)
+
+        # Transparent recovery: retried once on the same agent, clean end.
+        assert job.status == "completed"
+        assert recycles == [job.repo]
+        assert agent.sent == ["t", "t"]
+
+        trail = _lifecycle_trail(job.session_name)
+        failed = next(e for n, e in trail if n == "run.failed")
+        assert "Invalid User API Key" in failed["error"]
+        assert failed["retryable"] is None
+        autoretry = next(e for n, e in trail if n == "sdk.autoretry")
+        assert "zero-progress" in autoretry["reason"]
+        assert "Invalid User API Key" in autoretry["reason"]
+
 
 # ---------------------------------------------------------------------------
 # Registration + availability gate
@@ -4887,6 +4925,86 @@ class TestSdkRunner:
         assert obj["retryable"] is None
         assert obj["retry_after"] is None
         assert obj["run_status"] == "error"
+
+    def test_terminal_error_uses_streamed_status_error_text(
+        self, tmp_path, monkeypatch
+    ):
+        """Live incident 2026-07-06 (session sleek-jade-wolf): the ONLY
+        copy of the failure cause arrives as the stream's final
+        status-ERROR SDKMessage — nothing mineable on the handle. The
+        sdk.error must carry that text instead of the bare status. The
+        LAST error-status wins, case-insensitively (ERROR/failed), and
+        the retry fields stay unknown (None) — no auto-retry gate change."""
+        run = _FakeRun([
+            _sdk_msg(type="status", status="RUNNING"),
+            _sdk_msg(type="status", status="ERROR",
+                     message="Authentication error If you are logged in, "
+                             "try logging out and back in."),
+            _sdk_msg(type="status", status="failed",
+                     message="[unknown] Invalid User API Key"),
+        ], final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == (
+            "cursor run ended with status: error — "
+            "[unknown] Invalid User API Key"
+        )
+        assert obj["retryable"] is None
+        assert obj["retry_after"] is None
+        assert obj["run_status"] == "error"
+
+    def test_streamed_status_error_text_defers_to_typed_detail(
+        self, tmp_path, monkeypatch
+    ):
+        """Typed detail mined off the handle keeps precedence over the
+        streamed status-ERROR text — the stream capture is a fallback,
+        not an override."""
+        run = _FakeRun([
+            _sdk_msg(type="status", status="ERROR",
+                     message="[unknown] Invalid User API Key"),
+        ], final_status="error")
+        run.error = _typed_sdk_error(
+            "ServerError", "upstream 502", is_retryable=True, retry_after="30"
+        )
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "ServerError: upstream 502"
+        assert obj["retryable"] is True
+        assert obj["retry_after"] == "30"
+
+    def test_non_error_or_empty_status_messages_leave_bare_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        """A RUNNING status ping, or an error status with no message text,
+        must not enrich anything: the existing bare fallback string is
+        byte-for-byte unchanged."""
+        run = _FakeRun([
+            _sdk_msg(type="status", status="RUNNING"),
+            _sdk_msg(type="status", status="ERROR", message=""),
+        ], final_status="error")
+        agent = _FakeAgent(runs=[run])
+        _install_fake_sdk(monkeypatch, _FakeClient(agent))
+        events = list(gc_sdk.run_sdk(
+            "t", str(tmp_path),
+            inactivity_timeout_s=30.0, cancel_check=lambda: False,
+        ))
+        key, obj = events[-1]
+        assert key == "sdk.error"
+        assert obj["error"] == "cursor run ended with status: error"
+        assert obj["retryable"] is None
+        assert obj["retry_after"] is None
 
 
 class TestBridgeHealthGuard:

@@ -754,6 +754,15 @@ class _SdkWorker:
         # worker thread; the consumer only reads truthiness (GIL-safe).
         self._pending_tool_calls: set = set()
 
+        # The message text of the LAST streamed status-ERROR/FAILED
+        # SDKMessage. Live incident (2026-07-06): a run that settles with
+        # status "error" delivers its cause ONLY as the stream's final
+        # `{"type": "status", "status": "ERROR", "message": ...}` event —
+        # nothing mineable off the handle — so it is captured here and used
+        # to enrich the terminal sdk.error (observability only; the retry
+        # fields are untouched).
+        self.last_error_status_text: Optional[str] = None
+
         self._run: Optional[Any] = None
         self._client: Optional[Any] = None
         self._settled = False
@@ -777,6 +786,21 @@ class _SdkWorker:
             self._pending_tool_calls.discard(call_id)
         else:
             self._pending_tool_calls.add(call_id)
+
+    def _capture_error_status(self, message: Dict[str, Any]) -> None:
+        """Remember the LAST streamed status-ERROR/FAILED message text.
+
+        Status messages stay non-envelope noise for rendering (see
+        events._SDK_NOISE_TYPES) — this capture happens on the raw stream,
+        before normalization, purely so the terminal sdk.error can name
+        the cause."""
+        if str(message.get("type") or "") != "status":
+            return
+        if str(message.get("status") or "").upper() not in {"ERROR", "FAILED"}:
+            return
+        text = message.get("message")
+        if isinstance(text, str) and text.strip():
+            self.last_error_status_text = text.strip()
 
     def _timeout_error(self) -> Dict[str, Any]:
         detail = self.abort_detail or "watchdog abort"
@@ -811,6 +835,9 @@ class _SdkWorker:
             workspace, detail,
             "invalidated" if invalidated else "already replaced",
         )
+        # A cause streamed as a status-ERROR message before the death is
+        # the only surviving detail — append it (observability only).
+        stream_text = self.last_error_status_text
         self._put(
             "sdk.error",
             {
@@ -818,6 +845,7 @@ class _SdkWorker:
                     f"cursor-sdk bridge for {workspace} died mid-run; the "
                     "run was lost — a fresh bridge will be started on the "
                     "next send"
+                    + (f" (last streamed status: {stream_text})" if stream_text else "")
                 ),
                 "bridge_died": True,
             },
@@ -987,6 +1015,7 @@ class _SdkWorker:
             message = _message_dict(event)
             if message is not None:
                 self._track_tool_call(message)
+                self._capture_error_status(message)
                 self._put("sdk.message", message)
 
     # -- main flow -----------------------------------------------------------
@@ -1083,13 +1112,22 @@ class _SdkWorker:
                 elif status == "error":
                     # Terminal "error": surface the typed detail instead of
                     # a bare status so downstream renders more than
-                    # "cursor run ended with status: error".
+                    # "cursor run ended with status: error". When nothing is
+                    # mineable off the handle, fall back to the cause text
+                    # streamed as the final status-ERROR message (live
+                    # incident 2026-07-06). Retry fields stay typed-or-None
+                    # either way — the auto-retry gate is unchanged.
                     detail = _terminal_error_detail(run) or {}
+                    stream_text = self.last_error_status_text
+                    error_text = detail.get("error") or (
+                        f"cursor run ended with status: {status} — {stream_text}"
+                        if stream_text
+                        else f"cursor run ended with status: {status}"
+                    )
                     self._put(
                         "sdk.error",
                         {
-                            "error": detail.get("error")
-                            or f"cursor run ended with status: {status}",
+                            "error": error_text,
                             "retryable": detail.get("retryable"),
                             "retry_after": detail.get("retry_after"),
                             "run_status": status,
