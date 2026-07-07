@@ -20,9 +20,11 @@ v0.4: explicit named sessions + plain-text tool output. Seven tools in the
   tool_use / content / lifecycle); limit clamps at 500.
 * ``cursor_list(scope='session'|'all')`` — TSV listing of session handles,
   scoped to the current Hermes session by default.
-* ``cursor_subscribe(session, interval_s)`` — periodic progress digests
-  while a run is active (see ``progress.py``); ``cursor_send_message``
-  seeds the interval via ``update_interval_s`` (default 180s, 0 off).
+* ``cursor_subscribe(session, interval_s)`` — subscribe the CALLING
+  hermes session to periodic progress digests while a run is active (see
+  ``progress.py``; per-subscriber, multiple hermes sessions each get
+  their own copy). ``cursor_send_message`` auto-subscribes the caller at
+  ``update_interval_s`` (explicit > persisted > 180s default, 0 off).
 
 (v0.3's ``cursor_start``/``cursor_send`` are gone — create + send replaced
 them outright; pre-launch, no deprecation shim.)
@@ -228,16 +230,20 @@ CURSOR_SEND_SCHEMA = {
             "update_interval_s": {
                 "type": "number",
                 "description": (
-                    "Optional. While the run is active, deliver a compact "
-                    "progress digest (status header + new events) as a new "
-                    "message every this-many seconds. Default 180; 0 "
-                    "disables digests. Negative values are rejected; "
-                    "positive values are clamped to the "
+                    "Optional. Sending AUTO-SUBSCRIBES the calling Hermes "
+                    "session to progress digests: while the run is active, "
+                    "a compact digest (status header + new events) arrives "
+                    "as a new message every this-many seconds. Explicit "
+                    "value wins, else this Hermes session's persisted "
+                    "subscription, else 180; 0 disables digests for THIS "
+                    "session only (other subscribed sessions keep theirs). "
+                    "Negative values are rejected; positive values are "
+                    "clamped to the "
                     f"{_render.dur_compact(_progress.MIN_UPDATE_INTERVAL_S)}–"
                     f"{_render.dur_compact(_progress.MAX_UPDATE_INTERVAL_S)} "
-                    "range (the ack notes any clamping). The setting "
-                    "persists on the session (cursor_subscribe changes it "
-                    "mid-run)."
+                    "range (the ack notes any clamping). The subscription "
+                    "persists per Hermes session (cursor_subscribe changes "
+                    "it mid-run)."
                 ),
             },
             **_TIMEOUT_PROPERTIES,
@@ -363,16 +369,23 @@ CURSOR_LIST_SCHEMA = {
 CURSOR_SUBSCRIBE_SCHEMA = {
     "name": SUBSCRIBE_TOOL_NAME,
     "description": (
-        "Change how often a cursor session pushes progress digests while "
-        "a run is active. Each digest arrives as a new message: a "
+        "Subscribe THIS Hermes session to a cursor session's progress "
+        "digests (or retune/cancel its existing subscription — the "
+        "subscription belongs to the calling Hermes session; other "
+        "sessions' subscriptions are never affected). Each digest arrives "
+        "as a new message in the subscribing session: a "
         "cursor_status-style header (status, elapsed, last activity, "
         "files so far, pending tool call) plus the events since the "
-        "previous update. Takes effect on the next tick (sooner if the "
-        "new interval is shorter); interval_s=0 unsubscribes. Works "
-        "whether or not a run is active — the setting persists on the "
-        "session and applies to the next run. Use this to watch a long "
-        "run more closely, or to silence a chatty one; the final result "
-        "is always delivered separately regardless of this setting."
+        "previous update. Every subscribed Hermes session gets its own "
+        "copy of every digest at its own cadence. Takes effect on the "
+        "next tick (sooner if the new interval is shorter); interval_s=0 "
+        "removes only this session's subscription. Works whether or not "
+        "a run is active — the subscription persists on the session and "
+        "applies to the running/next run. Use this to watch a long run "
+        "more closely, to follow a run dispatched from another Hermes "
+        "session, or to silence a chatty one; the final result is "
+        "delivered separately to every subscriber (and always to the "
+        "dispatching session) regardless of this setting."
     ),
     "parameters": {
         "type": "object",
@@ -381,10 +394,11 @@ CURSOR_SUBSCRIBE_SCHEMA = {
             "interval_s": {
                 "type": "number",
                 "description": (
-                    "Seconds between progress digests. 0 unsubscribes "
-                    "(no digests; completion delivery is unaffected). "
-                    "Negative values are rejected; positive values are "
-                    "clamped to the "
+                    "Seconds between progress digests for the calling "
+                    "Hermes session. 0 unsubscribes this session only "
+                    "(no digests here; other subscribers and completion "
+                    "delivery are unaffected). Negative values are "
+                    "rejected; positive values are clamped to the "
                     f"{_render.dur_compact(_progress.MIN_UPDATE_INTERVAL_S)}–"
                     f"{_render.dur_compact(_progress.MAX_UPDATE_INTERVAL_S)} "
                     "range (the ack notes any clamping)."
@@ -962,7 +976,6 @@ def _dispatch_run(
     model: Optional[str],
     inactivity_timeout_s: float,
     max_wall_s: float,
-    update_interval_s: float = 0.0,
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -995,12 +1008,10 @@ def _dispatch_run(
             "session_id": existing.cursor_session_id,
             "repo": str(workdir),
         }
-    return _await_handle(job, update_interval_s=update_interval_s)
+    return _await_handle(job)
 
 
-def _await_handle(
-    job: "_jobs.CursorJob", update_interval_s: float = 0.0
-) -> Dict[str, Any]:
+def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
     """Block until the run has a session handle (or died trying).
 
     Exactly-once outcome reporting: the job is dispatched with delivery
@@ -1039,8 +1050,12 @@ def _await_handle(
         return {**_jobs.trim_result(job.result or {}), "status": job.status}
 
     # The run is live and its outcome will arrive as a delivered message —
-    # start the progress-digest timer alongside (no-op at interval 0).
-    _progress.start_for_job(job, update_interval_s)
+    # start one progress-digest timer per persisted subscriber alongside
+    # (the dispatch path persisted the caller's auto-subscription before
+    # dispatching, so the map is current; an empty map starts nothing).
+    _progress.start_for_job(
+        job, _handles.subscribers_of(_handles.get(job.session_name))
+    )
 
     return {
         "success": True,
@@ -1135,11 +1150,15 @@ def _send_to_session(
     prompt_seq = (
         _eventlog.stats(_log_key(name, entry)) or {}
     ).get("total_events", 0)
-    # Subscription at dispatch: explicit param > the session's persisted
-    # setting > the 180s default. Persisted so it survives restarts and
-    # carries over interrupt-and-reprompt (digest numbering continues).
-    interval = _progress.resolve_interval(entry, update_interval_s)
-    _handles.record(name, update_interval_s=interval)
+    # AUTO-SUBSCRIBE the calling hermes session at dispatch: explicit
+    # param > this session's persisted subscriber interval > the 180s
+    # default — whoever prompts is always watching. Persisted (in the
+    # entry's per-subscriber map) so it survives restarts and carries
+    # over interrupt-and-reprompt (digest numbering continues); OTHER
+    # sessions' subscriptions are untouched by a send.
+    caller_key = _resolve_session_key()
+    interval = _progress.resolve_interval(entry, update_interval_s, caller_key)
+    _handles.set_subscriber(name, caller_key, interval)
     result = _dispatch_run(
         task=str(message),
         workdir=repo,
@@ -1148,7 +1167,6 @@ def _send_to_session(
         model=_resolve_model(entry.get("model")),
         inactivity_timeout_s=_resolve_inactivity_timeout(inactivity_timeout_s),
         max_wall_s=_resolve_max_wall(max_wall_s),
-        update_interval_s=interval,
     )
     result.setdefault("session", name)
     # Model validation is deferred to this first send (create is lazy by
@@ -1519,8 +1537,11 @@ def cursor_events(
 
 
 def cursor_subscribe(session: str, interval_s: Any = None, **_kwargs: Any) -> str:
-    """Set/change/cancel a session's progress-digest interval (see
-    CURSOR_SUBSCRIBE_SCHEMA). Persists; retunes a live run's timer."""
+    """Subscribe/retune the CALLING hermes session's progress digests for
+    a cursor session (see CURSOR_SUBSCRIBE_SCHEMA). Persists on the
+    session's per-subscriber map; retunes (or starts, for a subscriber
+    joining mid-run) the caller's live timer. interval_s=0 removes only
+    the caller's subscription — other subscribers are untouched."""
     ident = str(session or "").strip()
     if not ident:
         return "session is required — pass the name from cursor_create_session."
@@ -1534,7 +1555,13 @@ def cursor_subscribe(session: str, interval_s: Any = None, **_kwargs: Any) -> st
     except ValueError as exc:
         return str(exc)
 
-    _progress.subscribe(name, interval)
+    job = _live_job(name, _handles.get(name))
+    _progress.subscribe(
+        name,
+        _resolve_session_key(),
+        interval,
+        job=job if job is not None and job.status == "running" else None,
+    )
     return _render.subscribe_ack(name, interval, note)
 
 

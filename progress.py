@@ -1,15 +1,27 @@
 """Subscribable progress digests for running cursor sessions.
 
-While a run is active, a per-session timer periodically builds a compact
-progress digest (status header + the events since the previous tick) and
-pushes it to the hermes agent loop over the SAME channel run completions
-use: ``tools.process_registry.process_registry.completion_queue``. The
-subscription interval is set at dispatch (``cursor_send_message``'s
-``update_interval_s``, default 180s, 0 disables), changed mid-run via the
-``cursor_subscribe`` tool, and persisted on the session's handle entry
-(``handles.py``, field ``update_interval_s``) so it survives gateway
-restarts — the next run on the session restarts its timer from the
-persisted value.
+While a run is active, a timer per (cursor session, subscribing Hermes
+session) periodically builds a compact progress digest (status header +
+the events since the previous tick) and pushes it to the hermes agent
+loop over the SAME channel run completions use:
+``tools.process_registry.process_registry.completion_queue``.
+
+Multi-subscriber model
+----------------------
+Subscriptions are hermes_session ← cursor_session, persisted on the
+session's handle entry as ``subscribers: {hermes_session_key:
+interval_s}`` (``handles.py``) so they survive gateway restarts.
+``cursor_send_message`` AUTO-SUBSCRIBES the dispatching Hermes session at
+the effective ``update_interval_s`` (explicit param, else that session's
+persisted subscriber interval, else the 180s default) — whoever prompts
+is always watching. ``cursor_subscribe`` subscribes/retunes the CALLING
+Hermes session only (one subscription per hermes session per cursor
+session — resubscribing retunes, never duplicates; ``interval_s=0``
+removes only the caller's). Each subscriber runs its OWN ticker at its
+own interval with its own last_seq / digest counter / emit-floor state,
+and each receives its own copy of every event — duplicate events ACROSS
+Hermes sessions are by design. The event's ``session_key`` field routes
+each copy to its subscriber's session.
 
 Completion-queue consumer findings (hermes core, read 2026-07-03)
 -----------------------------------------------------------------
@@ -39,25 +51,30 @@ digest event is shaped the way it is:
   run's completion event (guarded by the job lock, see ``_Ticker._tick``).
 * The TUI poller dedups async-delegation events by ``(delegation_id,
   type)`` (``_notification_event_dedup_key``). Each digest therefore
-  carries a UNIQUE ``delegation_id`` (``{session}#progress-{n}``) so
-  successive digests aren't deduped against each other or against the
-  real completion (whose delegation_id is the plain session name).
+  carries a UNIQUE ``delegation_id``:
+  ``{session}#progress-{n}@{subscriber_suffix(session_key)}`` — the
+  counter keeps successive digests apart within one subscription, and
+  the short subscriber-key hash keeps per-subscriber copies apart from
+  each other (counters are per subscriber, so two subscribers both emit
+  an n=3) and from the real completion (whose delegation_id is the
+  plain session name for the dispatcher, suffixed for other
+  subscribers — see ``jobs._push_completion_event``).
 
 Interval enforcement + single-chain guarantee (issue #10)
 ---------------------------------------------------------
 ``interval_s`` is a HARD FLOOR between digest deliveries, enforced at
 emit time and not merely by timer scheduling: ``_deliver`` drops any
 digest attempted less than the current interval after the previously
-enqueued one (per session, ``_last_emit``, monotonic clock). The floor
-outlives individual tickers — interrupt-and-reprompt keeps it, exactly
-like the digest numbering. Independently, only ONE timer chain per
-session can stay alive: registration in ``_tickers`` is swapped
-atomically (``start_for_job``), a tick fired by a ticker that is no
-longer the registered one cancels itself instead of delivering or
-re-arming (``_is_registered``), and arming always supersedes a pending
-timer so a chain cannot fork. Re-prompting therefore cannot stack
-digest loops, and even a stale chain that fires once before noticing
-is muted by the floor.
+enqueued one (per (session, subscriber), ``_last_emit``, monotonic
+clock). The floor outlives individual tickers — interrupt-and-reprompt
+keeps it, exactly like the digest numbering. Independently, only ONE
+timer chain per (session, subscriber) can stay alive: registration in
+``_tickers`` is swapped atomically (``start_for_job``), a tick fired by
+a ticker that is no longer the registered one cancels itself instead of
+delivering or re-arming (``_is_registered``), and arming always
+supersedes a pending timer so a chain cannot fork. Re-prompting
+therefore cannot stack digest loops, and even a stale chain that fires
+once before noticing is muted by the floor.
 
 Delivery-order guarantee
 ------------------------
@@ -73,6 +90,7 @@ the completion event.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 import threading
@@ -102,18 +120,30 @@ MAX_UPDATE_INTERVAL_S = 24 * 3600.0
 _RUNNING = "running"
 
 _lock = threading.Lock()
-# session name -> live ticker (one active run per session).
-_tickers: Dict[str, "_Ticker"] = {}
-# session name -> digests delivered so far. Deliberately OUTLIVES any one
-# ticker: interrupt-and-reprompt carries the subscription to the new run
-# and the numbering continues.
-_counters: Dict[str, int] = {}
-# session name -> time.monotonic() of the last digest actually enqueued.
-# The hard interval floor (issue #10): delivery is suppressed while less
-# than the current interval has elapsed since the previous digest, no
-# matter which timer chain fired the tick. Like _counters it outlives any
-# one ticker, so interrupt-and-reprompt cannot reset the floor either.
-_last_emit: Dict[str, float] = {}
+# (session name, subscriber hermes session_key) -> live ticker. One active
+# run per session, one ticker per subscriber of that run.
+_tickers: Dict[Tuple[str, str], "_Ticker"] = {}
+# (session name, subscriber key) -> digests delivered so far. Deliberately
+# OUTLIVES any one ticker: interrupt-and-reprompt carries the subscription
+# to the new run and the numbering continues.
+_counters: Dict[Tuple[str, str], int] = {}
+# (session name, subscriber key) -> time.monotonic() of the last digest
+# actually enqueued. The hard interval floor (issue #10): delivery is
+# suppressed while less than the current interval has elapsed since the
+# subscriber's previous digest, no matter which timer chain fired the
+# tick. Like _counters it outlives any one ticker, so
+# interrupt-and-reprompt cannot reset the floor either.
+_last_emit: Dict[Tuple[str, str], float] = {}
+
+
+def subscriber_suffix(session_key: str) -> str:
+    """A short stable hash of a subscriber's hermes session_key.
+
+    Suffixed onto delegation_ids so per-subscriber copies of the same
+    digest/completion stay distinct under the TUI's (delegation_id, type)
+    dedup while the ``{session}#progress-{n}`` scheme stays readable.
+    """
+    return hashlib.sha1(str(session_key or "").encode("utf-8")).hexdigest()[:8]
 
 
 def _floor_slack(interval_s: float) -> float:
@@ -169,33 +199,40 @@ def validate_interval(value: Any, param: str = "interval_s") -> Tuple[float, Opt
     return interval, None
 
 
-def resolve_interval(entry: Optional[Dict[str, Any]], explicit: Optional[float]) -> float:
-    """The effective subscription interval for a dispatch.
+def resolve_interval(
+    entry: Optional[Dict[str, Any]],
+    explicit: Optional[float],
+    session_key: str = "",
+) -> float:
+    """The effective subscription interval for the DISPATCHING session.
 
-    Explicit param (0 included) wins; otherwise the persisted subscription
-    on the handle entry; otherwise the 180s default. Never raises.
+    Explicit param (0 included) wins; otherwise that Hermes session's
+    persisted subscription on the handle entry (``subscribers`` map, with
+    the legacy scalar migrated by ``handles.subscribers_of``); otherwise
+    the 180s default. Never raises.
     """
     if explicit is not None:
         try:
             return max(float(explicit), 0.0)
         except (TypeError, ValueError):
             return DEFAULT_UPDATE_INTERVAL_S
-    persisted = (entry or {}).get("update_interval_s")
+    persisted = _handles.subscribers_of(entry).get(str(session_key or ""))
     if persisted is not None:
-        try:
-            return max(float(persisted), 0.0)
-        except (TypeError, ValueError):
-            return DEFAULT_UPDATE_INTERVAL_S
+        return persisted
     return DEFAULT_UPDATE_INTERVAL_S
 
 
 class _Ticker:
-    """The per-run digest timer. Daemon ``threading.Timer`` chain, re-armed
-    after each tick while the run stays running."""
+    """One subscriber's digest timer for one run. Daemon ``threading.Timer``
+    chain, re-armed after each tick while the run stays running."""
 
-    def __init__(self, job: Any, interval_s: float) -> None:
+    def __init__(self, job: Any, sub_key: str, interval_s: float) -> None:
         self.job = job
         self.name = job.session_name or job.job_id
+        # The subscribing hermes session (event routing key; "" = CLI).
+        self.sub_key = str(sub_key or "")
+        # Registration/state key: per (cursor session, subscriber).
+        self.key = (self.name, self.sub_key)
         self.interval_s = float(interval_s)
         # Events already in the session log when the subscription started;
         # the first digest covers only what happened after it.
@@ -265,14 +302,14 @@ class _Ticker:
     # -- the tick ----------------------------------------------------------
 
     def _is_registered(self) -> bool:
-        """Whether this ticker is still the session's live one.
+        """Whether this ticker is still its subscriber's live one.
 
         A re-prompt swaps the registration to the new run's ticker; a
         chain that fires afterwards is stale and must tear itself down
         instead of delivering or re-arming (issue #10: interrupts must
         not stack digest loops)."""
         with _lock:
-            return _tickers.get(self.name) is self
+            return _tickers.get(self.key) is self
 
     def _tick(self, fired: threading.Timer) -> None:
         try:
@@ -307,7 +344,7 @@ class _Ticker:
         # events roll into the next digest instead of being lost.
         now = time.monotonic()
         with _lock:
-            last = _last_emit.get(self.name)
+            last = _last_emit.get(self.key)
         if last is not None and now - last < self.interval_s - _floor_slack(
             self.interval_s
         ):
@@ -327,7 +364,7 @@ class _Ticker:
 
         snap = job.snapshot()
         with _lock:
-            n = _counters.get(self.name, 0) + 1
+            n = _counters.get(self.key, 0) + 1
         text = _render.digest_text(
             name=self.name,
             n=n,
@@ -360,10 +397,17 @@ class _Ticker:
             # as a generic notification; kinds are differentiated by the
             # "type" field alone, and receipt settles nothing core-side.
             "type": "async_delegation",
-            # UNIQUE per digest — the TUI dedups on (delegation_id, type),
-            # and the real completion uses the plain session name.
-            "delegation_id": f"{self.name}#progress-{n}",
-            "session_key": job.session_key,
+            # UNIQUE per digest AND per subscriber — the TUI dedups on
+            # (delegation_id, type), counters are per subscriber (two
+            # subscribers both emit an n=3), and the real completion uses
+            # the plain session name (dispatcher) / suffixed name (other
+            # subscribers).
+            "delegation_id": (
+                f"{self.name}#progress-{n}@{subscriber_suffix(self.sub_key)}"
+            ),
+            # Routes this copy to the SUBSCRIBING hermes session, not the
+            # dispatching one — the multi-subscriber fix.
+            "session_key": self.sub_key,
             "goal": (
                 f"cursor progress update {n} for session '{self.name}' "
                 "(run still active — NOT the final result; it arrives "
@@ -403,62 +447,88 @@ class _Ticker:
             )
             return
         with _lock:
-            _counters[self.name] = n
-            _last_emit[self.name] = time.monotonic()
+            _counters[self.key] = n
+            _last_emit[self.key] = time.monotonic()
 
 
 # ---------------------------------------------------------------------------
 # Public API (called from __init__.py tool handlers and jobs.py)
 # ---------------------------------------------------------------------------
 
-def start_for_job(job: Any, interval_s: float) -> None:
-    """Start (or restart) the digest timer for a freshly-armed run.
+def start_for_job(job: Any, subscribers: Dict[str, float]) -> None:
+    """Start (or restart) the digest timers for a freshly-armed run.
 
     Called by the dispatch path once the running handle has been handed
-    back. interval <= 0 means no subscription — any stale ticker for the
-    session is cancelled either way.
+    back, with the session's persisted ``subscribers`` map — one ticker
+    per subscriber with a positive interval. Any stale tickers for the
+    session (previous run's, including subscribers no longer in the map)
+    are cancelled either way.
     """
-    key = job.session_name or job.job_id
-    ticker = _Ticker(job, interval_s) if interval_s > 0 else None
-    # Swap the registration in ONE lock hold: there is never a window in
-    # which two tickers are (or believe they are) live for the session —
-    # the moment the new one is visible the old one is stale, and a stale
-    # chain tears itself down on its next fire (_is_registered).
+    name = job.session_name or job.job_id
+    fresh = {
+        (name, str(sub_key or "")): _Ticker(job, sub_key, interval)
+        for sub_key, interval in (subscribers or {}).items()
+        if float(interval) > 0
+    }
+    # Swap the registrations in ONE lock hold: there is never a window in
+    # which two tickers are (or believe they are) live for one subscriber
+    # — the moment the new one is visible the old one is stale, and a
+    # stale chain tears itself down on its next fire (_is_registered).
     with _lock:
-        old = _tickers.pop(key, None)
-        if ticker is not None:
-            _tickers[key] = ticker
-    if old is not None:
-        old.cancel()
-    if ticker is not None:
+        old = [
+            _tickers.pop(key)
+            for key in [k for k in _tickers if k[0] == name]
+        ]
+        _tickers.update(fresh)
+    for ticker in old:
+        ticker.cancel()
+    for ticker in fresh.values():
         ticker.start()
 
 
 def cancel_for_job(job: Any) -> None:
-    """Cancel the pending timer at terminal state (called by _finalize)."""
-    key = job.session_name or job.job_id
+    """Cancel every pending timer at terminal state (called by _finalize)."""
+    name = job.session_name or job.job_id
     with _lock:
-        ticker = _tickers.get(key)
-        if ticker is not None and ticker.job is job:
-            _tickers.pop(key, None)
-        else:
-            ticker = None
-    if ticker is not None:
+        victims = [
+            _tickers.pop(key)
+            for key in [
+                k for k, t in _tickers.items()
+                if k[0] == name and t.job is job
+            ]
+        ]
+    for ticker in victims:
         ticker.cancel()
 
 
-def subscribe(name: str, interval_s: float) -> None:
-    """Set a session's subscription: persist it and retune any live ticker.
+def subscribe(
+    name: str, session_key: str, interval_s: float, job: Any = None
+) -> None:
+    """Set ONE Hermes session's subscription: persist it and retune (or
+    start, or cancel) that subscriber's live ticker.
 
-    Works whether or not a run is active — with no live run the persisted
-    value simply seeds the next run's timer.
+    Works whether or not a run is active — with no live run (``job`` is
+    None) the persisted value simply seeds the next run's timers. With a
+    live run, a subscriber that had no ticker yet (e.g. a Hermes session
+    other than the dispatching one, subscribing mid-run) gets one started
+    against the running job. Other subscribers are never touched.
     """
     interval = max(float(interval_s), 0.0)
-    _handles.record(name, update_interval_s=interval)
+    sub_key = str(session_key or "")
+    _handles.set_subscriber(name, sub_key, interval)
+    key = (name, sub_key)
+    created: Optional[_Ticker] = None
     with _lock:
-        ticker = _tickers.get(name)
-        if interval <= 0 and ticker is not None:
-            _tickers.pop(name, None)
+        ticker = _tickers.get(key)
+        if interval <= 0:
+            if ticker is not None:
+                _tickers.pop(key, None)
+        elif ticker is None and job is not None and job.status == _RUNNING:
+            created = _Ticker(job, sub_key, interval)
+            _tickers[key] = created
+    if created is not None:
+        created.start()
+        return
     if ticker is None:
         return
     if interval <= 0:
