@@ -27,7 +27,9 @@ single-box plugin.
 ### 1. supervision state is durable, owned by a supervisor loop, not the tool call
 
 - `handles.json` grows a `supervision` record per session:
-  `{ phase, last_seq_delivered: {subscriber: seq}, watchdog: {last_poll_ts, last_remote_status}, attempt: n }`
+  `{ phase, current_attempt_id, attempt_n, last_seq_delivered: {subscriber: seq}, watchdog: {last_poll_ts, last_remote_status} }`
+  (`current_attempt_id` is the stable id stamped on every event as `attemptId`;
+  `attempt_n` is display/debug only)
 - one supervisor task per live session, spawned by a **reconciler** that runs
   at plugin init and every 60s: for every handle in a non-terminal phase with
   no live supervisor task, spawn one. this is the k8s controller pattern twin
@@ -45,9 +47,11 @@ single-box plugin.
   failure (verified live).
 - fallback watchdog: if the stream is silent AND unreconnectable for
   `watchdog_interval` (default 60s), poll `GET /v1/agents/{id}/runs` for
-  remote status. remote terminal + local non-terminal → settle from the GET
-  (never from stream replay — a cancelled run's replay lies `FINISHED`,
-  verified live).
+  remote status. remote terminal + local non-terminal → settle from the GET.
+  **INVARIANT (terminal precedence): the remote GET's terminal status always
+  wins over a replayed stream's terminal status** — a cancelled run's replay
+  emits `status: FINISHED` while the GET says CANCELLED (verified live).
+  settlement never reads terminal state from replay.
 - stream retention is 4 days server-side (`410 stream_expired`) — a supervisor
   re-attaching after any realistic gateway downtime always has full replay.
 
@@ -63,13 +67,16 @@ wrong run, interrupt stacking ticker loops, double completions.
 - dedupe `interaction_update` twins by provider event id BEFORE seq assignment
 - assign monotonic per-session `seq` post-dedupe, append to jsonl
 - stamp `attemptId` on every event (mandatory — retry forensics)
-- derive `lifecycle.durable_progress` server-side from observed `file_diff` /
-  irreversible completed `tool_use`. never trust agent self-report.
+- derive `lifecycle.durable_progress` supervisor-side (controller-derived from
+  observed `file_diff` / irreversible completed `tool_use` events). never trust
+  agent self-report. same rule as twin's server-derived variant — the deriver
+  is whoever owns the event log, not the agent.
 
 ### 5. retry policy (mechanical, from derived events)
 
 - attempt has zero `durable_progress` events → auto-retry allowed, cap 3,
-  emit `sdk.autoretry` lifecycle event with attempt id
+  emit `lifecycle.retry_started` with the new attemptId (legacy `sdk.autoretry`
+  kept as an alias during migration for existing log tooling)
 - any `durable_progress` → no auto-reprompt (double-apply risk); emit
   `lifecycle.retry_suppressed`, surface failure, require explicit resume
 - death-shape tagging on the terminal event: `fast_fail` (<2min,
@@ -82,6 +89,12 @@ with the reconciler, "orphaned" only means "handle whose remote agent id no
 longer resolves". read-time reconciliation stays (list calls never lie) but
 should fire ~never.
 
+## portability note
+
+implementations may store the registry differently (twin: server table;
+ghost_cursor: handles.json + jsonl); the portable contract is the append-only
+event envelope and lifecycle semantics (schematic T-055).
+
 ## non-goals
 
 - no server-side registry service: handles.json + jsonl per session IS the
@@ -89,7 +102,10 @@ should fire ~never.
   storage.
 - no digest storage: digests remain derived views (status header + files
   rollup + events since subscriber's last_seq). optional
-  `lifecycle.digest_sent` audit event only.
+  `lifecycle.digest_sent` audit event only. `last_seq_delivered` advances
+  only after successful delivery onto the completion queue; duplicate digest
+  delivery is acceptable (consumers dedupe on delegation id), completion
+  delivery is exactly-once per subscriber.
 - interrupt-send semantics unchanged at the tool surface; internally it
   becomes a supervisor-mediated transition (cancel in-flight turn → emit
   `lifecycle.interrupt_requested`/`interrupted` → re-prompt), aligned with
