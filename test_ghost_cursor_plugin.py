@@ -3036,12 +3036,12 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 3  # the send + both retries
-        assert recycles == [job.repo]  # recycled ONCE, on the first retry
+        assert recycles == [job.repo, job.repo]  # recycled before EVERY retry
         assert job.status == "failed"
         trail = [e for n, e in _lifecycle_trail(job.session_name)
                  if n == "sdk.autoretry"]
         assert [e["attempt"] for e in trail] == [1, 2]
-        assert [e["bridge_recycled"] for e in trail] == [True, False]
+        assert [e["bridge_recycled"] for e in trail] == [True, True]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         evt = completions[0]
@@ -5421,8 +5421,11 @@ class TestBridgeHealthGuard:
         assert gc_sdk.get_bridge("/repo/a") is client
         assert launches == []
 
-    def test_max_age_default_is_four_hours_and_configurable(self, monkeypatch):
-        assert gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S == 4 * 3600.0
+    def test_max_age_default_is_fifty_minutes_and_configurable(self, monkeypatch):
+        # 50min: the @cursor/sdk bridge holds a ~1h access token exchanged
+        # once per process with no refresh — the bridge must die before
+        # its token does (2026-07-08 root cause).
+        assert gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S == 50 * 60.0
         # No config readable in tests → the default.
         assert gc_sdk._bridge_max_age_s() == gc_sdk.DEFAULT_BRIDGE_MAX_AGE_S
 
