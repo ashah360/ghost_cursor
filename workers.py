@@ -158,17 +158,53 @@ def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
             "agent CLI (it provides `agent worker start`) or use "
             "runtime='cloud'"
         )
+    env = _spawn_env()
+    argv = [cli, "worker", "start", "--name", name, "--worker-dir", str(repo_path)]
+    # Temporary CI spawn diagnostics (GHOST_CURSOR_SPAWN_DIAG=1).
+    diag = (
+        Path(os.environ.get("RUNNER_TEMP") or "/tmp") / f"gc-spawn-diag-{name}.txt"
+        if os.environ.get("GHOST_CURSOR_SPAWN_DIAG")
+        else None
+    )
+    if diag is not None:
+        argv = ["bash", "-c", f'echo "wrapper up pid=$$" >> "{diag}"; exec "$@"', "bash", *argv]
+        redacted = {
+            key: (f"<redacted len={len(value)}>" if re.search(r"KEY|TOKEN|SECRET|PASSWORD", key) else value)
+            for key, value in sorted(env.items())
+        }
+        diag.write_text(
+            json.dumps(
+                {"cli": cli, "cwd": str(repo_path), "argv": argv, "env": redacted},
+                indent=1,
+            )
+            + "\n"
+        )
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with open(log_path, "ab") as log_file:
         proc = subprocess.Popen(
-            [cli, "worker", "start", "--name", name, "--worker-dir", str(repo_path)],
+            argv,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             cwd=str(repo_path),
-            env=_spawn_env(),
+            env=env,
             start_new_session=True,
         )
+    if diag is not None:
+        time.sleep(2.0)
+        exit_status = proc.poll()  # authoritative: reaps if it exited
+        ps = subprocess.run(
+            ["ps", "-p", str(proc.pid), "-o", "stat=,command="],
+            capture_output=True, text=True,
+        )
+        log_bytes = log_path.stat().st_size if log_path.exists() else -1
+        with open(diag, "a") as fh:
+            fh.write(
+                f"after 2s: pid={proc.pid} poll={exit_status} "
+                f"pid_alive={_pid_alive(proc.pid)} ps_rc={ps.returncode} "
+                f"ps={ps.stdout.strip()!r} log_bytes={log_bytes}\n"
+                f"log: {_log_tail(log_path)!r}\n"
+            )
     return proc.pid
 
 
