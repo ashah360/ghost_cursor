@@ -19,6 +19,15 @@ global view. Direct ``get(session_id)`` lookups are deliberately UNSCOPED —
 an explicit handle is explicit intent, and cross-session continuation must
 keep working.
 
+Digest subscriptions: the entry's ``subscribers`` map
+(``{hermes_session_key: interval_s}``) is the source of truth for who
+receives progress digests and completion fan-out — one subscription per
+Hermes session per cursor session (see ``subscribers_of`` /
+``set_subscriber``). The pre-multi-subscriber scalar ``update_interval_s``
+is MIGRATED on read as a subscription by the entry's dispatching
+``session_key``, and kept mirrored on write (the dispatching session's
+interval) so older readers of the file keep working.
+
 Storage: ``<HERMES_HOME>/state/ghost_cursor_handles.json``.
 
 Bounded growth: terminal-state entries older than
@@ -153,6 +162,72 @@ def record(session_id: Optional[str], **fields: Any) -> None:
             _save_locked()
     except Exception:
         logger.debug("ghost_cursor handle record failed", exc_info=True)
+
+
+def subscribers_of(entry: Optional[Dict[str, Any]]) -> Dict[str, float]:
+    """The entry's digest subscribers: ``{hermes_session_key: interval_s}``.
+
+    The ``subscribers`` map is the source of truth; when an entry predates
+    it, the legacy scalar ``update_interval_s`` migrates on read as a
+    subscription by the entry's dispatching ``session_key``. Only positive
+    intervals are subscriptions (0 = unsubscribed = absent). Never raises.
+    """
+    try:
+        subs = (entry or {}).get("subscribers")
+        if isinstance(subs, dict):
+            out: Dict[str, float] = {}
+            for key, value in subs.items():
+                try:
+                    interval = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if interval > 0:
+                    out[str(key)] = interval
+            return out
+        try:
+            legacy = float((entry or {}).get("update_interval_s"))
+        except (TypeError, ValueError):
+            return {}
+        if legacy > 0:
+            return {str((entry or {}).get("session_key") or ""): legacy}
+        return {}
+    except Exception:
+        logger.debug("ghost_cursor subscribers read failed", exc_info=True)
+        return {}
+
+
+def set_subscriber(
+    session_id: Optional[str], session_key: str, interval_s: float
+) -> None:
+    """Set (interval > 0) or remove (interval <= 0) ONE Hermes session's
+    subscription in the entry's ``subscribers`` map. Other subscribers are
+    untouched. Read-modify-write under the table lock, migrating the
+    legacy scalar first so an old entry's subscription is never clobbered.
+    The legacy scalar is kept mirrored to the DISPATCHING session's
+    interval (0 when it is unsubscribed) for older readers. Never raises.
+    """
+    try:
+        if not session_id:
+            return
+        key = str(session_key or "")
+        interval = max(float(interval_s), 0.0)
+        with _lock:
+            _load_locked()
+            entry = _table.setdefault(str(session_id), {})
+            subs = subscribers_of(entry)
+            if interval > 0:
+                subs[key] = interval
+            else:
+                subs.pop(key, None)
+            entry["subscribers"] = subs
+            entry["update_interval_s"] = subs.get(
+                str(entry.get("session_key") or ""), 0.0
+            )
+            entry["updated_at"] = time.time()
+            _prune_locked()
+            _save_locked()
+    except Exception:
+        logger.debug("ghost_cursor subscriber write failed", exc_info=True)
 
 
 def _resolve_locked(identifier: str) -> Optional[str]:

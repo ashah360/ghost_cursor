@@ -270,16 +270,19 @@ def status_text(
 
 
 def subscribe_ack(name: str, interval_s: float, note: Optional[str] = None) -> str:
-    """The 1-line cursor_subscribe ack. ``note`` is the validation clamp
-    sentence (progress.validate_interval), appended in-line when present."""
+    """The 1-line cursor_subscribe ack — the subscription belongs to the
+    CALLING hermes session. ``note`` is the validation clamp sentence
+    (progress.validate_interval), appended in-line when present."""
     if interval_s <= 0:
         return (
-            f"session '{name}': progress updates off (completion delivery "
+            f"session '{name}': progress updates off for this hermes "
+            "session (other subscribers and completion delivery "
             "unaffected)."
         )
     text = (
-        f"session '{name}': progress updates every {secs(interval_s)} "
-        "(applies to the running/next run; takes effect on the next tick)."
+        f"session '{name}': progress updates every {secs(interval_s)} to "
+        "this hermes session (applies to the running/next run; takes "
+        "effect on the next tick)."
     )
     return f"{text} {note}" if note else text
 

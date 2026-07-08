@@ -1740,6 +1740,16 @@ def _collect_queue(collected, min_digests=1, timeout=5.0):
     return _wait_until(_pump, timeout=timeout)
 
 
+def _sub_tickers(name):
+    """A session's live tickers, keyed by subscriber hermes session_key."""
+    return {k[1]: t for k, t in gc_progress._tickers.items() if k[0] == name}
+
+
+def _digest_id(name, n, sub_key=""):
+    """The expected per-subscriber digest delegation_id."""
+    return f"{name}#progress-{n}@{gc_progress.subscriber_suffix(sub_key)}"
+
+
 class TestProgressSubscriptions:
     """cursor_send_message(update_interval_s) + cursor_subscribe: periodic
     digests ride the same completion_queue rail as terminal completions,
@@ -1765,8 +1775,10 @@ class TestProgressSubscriptions:
         name, job, release = self._held_run(monkeypatch, tmp_path)
         try:
             entry = gc_handles.get(name)
-            assert entry["update_interval_s"] == 180.0
-            ticker = gc_progress._tickers.get(name)
+            # The send AUTO-SUBSCRIBED the calling hermes session ("" =
+            # CLI in tests) in the per-subscriber map.
+            assert gc_handles.subscribers_of(entry) == {"": 180.0}
+            ticker = gc_progress._tickers.get((name, ""))
             assert ticker is not None
             assert ticker.interval_s == 180.0
         finally:
@@ -1780,8 +1792,8 @@ class TestProgressSubscriptions:
             monkeypatch, tmp_path, update_interval_s=45
         )
         try:
-            assert gc_handles.get(name)["update_interval_s"] == 45.0
-            assert gc_progress._tickers[name].interval_s == 45.0
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 45.0}
+            assert gc_progress._tickers[(name, "")].interval_s == 45.0
         finally:
             release.set()
             assert job.done_event.wait(10)
@@ -1793,8 +1805,9 @@ class TestProgressSubscriptions:
             monkeypatch, tmp_path, update_interval_s=0
         )
         try:
-            assert gc_handles.get(name)["update_interval_s"] == 0.0
-            assert name not in gc_progress._tickers
+            # Explicit 0 = the caller is NOT subscribed (no map entry).
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {}
+            assert _sub_tickers(name) == {}
             time.sleep(0.15)
             assert _digest_events(_drain_completion_queue()) == []
         finally:
@@ -1821,10 +1834,12 @@ class TestProgressSubscriptions:
 
         digest = _digest_events(collected)[0]
         # The exact event shape every hermes-core consumer differentiates
-        # on: type field, unique delegation_id (TUI dedup), session_key
-        # routing — and NOT deregistering anything is the producer's job.
+        # on: type field, unique delegation_id (TUI dedup — per digest AND
+        # per subscriber), session_key routing to the SUBSCRIBER — and NOT
+        # deregistering anything is the producer's job.
         assert digest["type"] == "async_delegation"
-        assert digest["delegation_id"] == f"{name}#progress-1"
+        assert digest["delegation_id"] == _digest_id(name, 1)
+        assert digest["session_key"] == ""
         assert digest["status"] == "running"
         assert digest["cursor_progress_update"] == 1
         assert "NOT the final result" in digest["goal"]
@@ -1892,7 +1907,7 @@ class TestProgressSubscriptions:
             assert ack == gc_render.subscribe_ack(name, 0.05)
             assert "\n" not in ack  # 1-line plain-text ack
             assert name in ack
-            assert gc_handles.get(name)["update_interval_s"] == 0.05
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 0.05}
             assert _collect_queue(collected, min_digests=1)
         finally:
             release.set()
@@ -1932,8 +1947,9 @@ class TestProgressSubscriptions:
             assert _collect_queue(collected, min_digests=1)
             ack = cursor_subscribe(name, 0)
             assert "off" in ack and name in ack
-            assert gc_handles.get(name)["update_interval_s"] == 0.0
-            assert name not in gc_progress._tickers
+            # 0 REMOVED the caller's subscription from the map.
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {}
+            assert _sub_tickers(name) == {}
             _drain_completion_queue()
             time.sleep(0.2)
             assert _digest_events(_drain_completion_queue()) == []
@@ -1950,7 +1966,7 @@ class TestProgressSubscriptions:
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_subscribe(name, 0.05)
         assert name in ack
-        assert gc_handles.get(name)["update_interval_s"] == 0.05
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 0.05}
 
         release = threading.Event()
         monkeypatch.setattr(
@@ -1961,7 +1977,7 @@ class TestProgressSubscriptions:
         job = _job_for("agent-persist")
         try:
             # No update_interval_s on send — the persisted 0.05 drives it.
-            assert gc_progress._tickers[name].interval_s == 0.05
+            assert gc_progress._tickers[(name, "")].interval_s == 0.05
             assert _collect_queue(collected, min_digests=1)
         finally:
             release.set()
@@ -2039,7 +2055,7 @@ class TestProgressSubscriptions:
         assert "interrupted" in ack
         job2 = _job_for("agent-ir")
         try:
-            assert gc_progress._tickers[name].interval_s == 0.05
+            assert gc_progress._tickers[(name, "")].interval_s == 0.05
             collected2 = []
             assert _collect_queue(collected2, min_digests=1)
             nums = [d["cursor_progress_update"] for d in _digest_events(collected2)]
@@ -2077,8 +2093,8 @@ class TestProgressSubscriptions:
         job_a, job_b = _job_for("agent-a"), _job_for("agent-b")
         collected = []
         try:
-            assert gc_progress._tickers[name_a].interval_s == 0.05
-            assert gc_progress._tickers[name_b].interval_s == 60.0
+            assert gc_progress._tickers[(name_a, "")].interval_s == 0.05
+            assert gc_progress._tickers[(name_b, "")].interval_s == 60.0
             assert _collect_queue(collected, min_digests=2)
         finally:
             release_a.set()
@@ -2263,7 +2279,7 @@ class TestIntervalValidation:
         ack = cursor_subscribe(name, 0)
         assert "progress updates off" in ack
         assert "clamped" not in ack
-        assert gc_handles.get(name)["update_interval_s"] == 0.0
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {}
 
     # -- clamping: below minimum / above maximum -----------------------------
 
@@ -2276,7 +2292,7 @@ class TestIntervalValidation:
         assert "progress updates every 20s" in ack
         assert "interval_s clamped to the 20s minimum" in ack
         assert "\n" not in ack  # still the 1-line ack
-        assert gc_handles.get(name)["update_interval_s"] == 20.0
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 20.0}
 
     def test_subscribe_huge_clamps_down_to_max_with_ack_note(
         self, clean_state, tmp_path
@@ -2284,7 +2300,9 @@ class TestIntervalValidation:
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_subscribe(name, 999_999_999)
         assert "interval_s clamped to the 24h maximum" in ack
-        assert gc_handles.get(name)["update_interval_s"] == 24 * 3600.0
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+            "": 24 * 3600.0
+        }
 
     def test_send_subminimum_clamps_up_and_ack_notes_it(
         self, clean_state, monkeypatch, tmp_path
@@ -2300,8 +2318,8 @@ class TestIntervalValidation:
         job = _job_for("agent-clamp")
         try:
             assert "update_interval_s clamped to the 20s minimum" in ack
-            assert gc_handles.get(name)["update_interval_s"] == 20.0
-            assert gc_progress._tickers[name].interval_s == 20.0
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 20.0}
+            assert gc_progress._tickers[(name, "")].interval_s == 20.0
         finally:
             release.set()
             assert job.done_event.wait(10)
@@ -2319,8 +2337,10 @@ class TestIntervalValidation:
         job = _job_for("agent-max")
         try:
             assert "update_interval_s clamped to the 24h maximum" in ack
-            assert gc_handles.get(name)["update_interval_s"] == 24 * 3600.0
-            assert gc_progress._tickers[name].interval_s == 24 * 3600.0
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "": 24 * 3600.0
+            }
+            assert gc_progress._tickers[(name, "")].interval_s == 24 * 3600.0
         finally:
             release.set()
             assert job.done_event.wait(10)
@@ -2335,7 +2355,7 @@ class TestIntervalValidation:
         ack = cursor_subscribe(name, 60)
         assert ack == gc_render.subscribe_ack(name, 60.0)
         assert "clamped" not in ack
-        assert gc_handles.get(name)["update_interval_s"] == 60.0
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 60.0}
 
     def test_send_valid_value_unchanged(
         self, clean_state, monkeypatch, tmp_path
@@ -2351,8 +2371,8 @@ class TestIntervalValidation:
         job = _job_for("agent-ok")
         try:
             assert "clamped" not in ack
-            assert gc_handles.get(name)["update_interval_s"] == 45.0
-            assert gc_progress._tickers[name].interval_s == 45.0
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 45.0}
+            assert gc_progress._tickers[(name, "")].interval_s == 45.0
         finally:
             release.set()
             assert job.done_event.wait(10)
@@ -2392,7 +2412,7 @@ class TestDigestFloodGuards:
             monkeypatch, tmp_path, update_interval_s=30
         )
         try:
-            ticker = gc_progress._tickers[name]
+            ticker = gc_progress._tickers[(name, "")]
             ticker._deliver()  # digest 1 — no floor yet
             seq_after_first = ticker.last_seq
             for _ in range(50):  # the flood
@@ -2408,7 +2428,7 @@ class TestDigestFloodGuards:
             # sleeping 30s) delivery resumes with NO numbering gap — the
             # dropped ticks never consumed counters.
             with gc_progress._lock:
-                gc_progress._last_emit[name] -= 30
+                gc_progress._last_emit[(name, "")] -= 30
             ticker._deliver()
             resumed = _digest_events(_drain_completion_queue())
             assert [d["cursor_progress_update"] for d in resumed] == [2]
@@ -2432,7 +2452,7 @@ class TestDigestFloodGuards:
         _assert_running_ack(
             cursor_send_message(name, "task", update_interval_s=30)
         )
-        gc_progress._tickers[name]._deliver()  # digest 1 on run 1
+        gc_progress._tickers[(name, "")]._deliver()  # digest 1 on run 1
 
         ack = cursor_send_message(name, "follow-up")
         _assert_running_ack(ack)
@@ -2440,7 +2460,7 @@ class TestDigestFloodGuards:
         job2 = _job_for("agent-fl-ir")
         try:
             _drain_completion_queue()  # digest 1 (run 1's cancel is in-turn)
-            ticker2 = gc_progress._tickers[name]
+            ticker2 = gc_progress._tickers[(name, "")]
             assert ticker2.job is job2
             ticker2._deliver()  # inside digest 1's 30s window → dropped
             assert _digest_events(_drain_completion_queue()) == [], (
@@ -2468,14 +2488,14 @@ class TestDigestFloodGuards:
         _assert_running_ack(
             cursor_send_message(name, "task", update_interval_s=30)
         )
-        old = gc_progress._tickers[name]
+        old = gc_progress._tickers[(name, "")]
 
         ack = cursor_send_message(name, "follow-up")
         _assert_running_ack(ack)
         assert "interrupted" in ack
         job2 = _job_for("agent-fl-stack")
         try:
-            new = gc_progress._tickers[name]
+            new = gc_progress._tickers[(name, "")]
             assert new is not old
             assert new.job is job2
             # The interrupted run's chain is dead, not merely replaced.
@@ -2485,13 +2505,13 @@ class TestDigestFloodGuards:
             # A stale duplicate chain (what stacked pre-fix) fires once,
             # notices it is not the registered ticker, and tears itself
             # down without delivering.
-            rogue = gc_progress._Ticker(job2, 0.01)
+            rogue = gc_progress._Ticker(job2, "", 0.01)
             rogue.start()
             assert _wait_until(lambda: rogue._cancelled, timeout=5), (
                 "stale digest chain kept running"
             )
             assert rogue._timer is None
-            assert gc_progress._tickers[name] is new
+            assert gc_progress._tickers[(name, "")] is new
             # Nothing reached the queue: the rogue self-terminated and the
             # legit 30s ticker never came due.
             assert _digest_events(_drain_completion_queue()) == []
@@ -2499,6 +2519,338 @@ class TestDigestFloodGuards:
             release1.set()
             release2.set()
             assert job2.done_event.wait(10)
+
+
+# ---------------------------------------------------------------------------
+# Multi-subscriber delivery — hermes_session <- cursor_session subscriptions
+# ---------------------------------------------------------------------------
+
+class TestMultiSubscriberDelivery:
+    """Subscriptions are per (hermes session, cursor session): the handle
+    entry's ``subscribers`` map. cursor_send_message auto-subscribes the
+    DISPATCHING hermes session; cursor_subscribe subscribes the CALLING
+    one — the reported bug was a cross-session cursor_subscribe silently
+    retuning the dispatcher's feed instead of delivering to the
+    subscriber. Every subscriber gets its own copy of every digest AND
+    the completion, routed by its own session_key, with distinct
+    delegation_ids (TUI dedup); the dispatcher's completion is guaranteed
+    even when unsubscribed."""
+
+    def _held_run_as(self, monkeypatch, tmp_path, key, sid, **send_kw):
+        """A held-open run dispatched by hermes session ``key``."""
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+        )
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: key)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(cursor_send_message(name, "task", **send_kw))
+        return name, _job_for(sid), release
+
+    # -- auto-subscribe on send ---------------------------------------------
+
+    def test_send_auto_subscribes_the_calling_hermes_session(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-auto"
+        )
+        try:
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "gw:alice": 180.0
+            }
+            ticker = gc_progress._tickers[(name, "gw:alice")]
+            assert ticker.interval_s == 180.0
+            assert ticker.sub_key == "gw:alice"
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    # -- cross-session subscribe (the reported bug) ---------------------------
+
+    def test_cross_session_subscribe_delivers_to_the_subscriber(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A cursor_subscribe from a hermes session OTHER than the
+        dispatching one must deliver digests to the SUBSCRIBING session
+        (its session_key on the events) — and must NOT retune the
+        dispatcher's feed (the pre-fix failure mode)."""
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-cross",
+            update_interval_s=3600,
+        )
+        collected = []
+        try:
+            monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+            ack = cursor_subscribe(name, 0.05)
+            assert name in ack
+            # Two independent subscriptions, each with its own ticker at
+            # its own interval — bob did not retune alice.
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "gw:alice": 3600.0, "gw:bob": 0.05,
+            }
+            assert gc_progress._tickers[(name, "gw:alice")].interval_s == 3600.0
+            assert gc_progress._tickers[(name, "gw:bob")].interval_s == 0.05
+            assert _collect_queue(collected, min_digests=2)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digests = _digest_events(collected)
+        # Everything delivered went to bob (alice's 1h tick never came
+        # due), routed by BOB's session_key with bob-suffixed ids and
+        # bob's own numbering from 1.
+        assert digests
+        assert all(d["session_key"] == "gw:bob" for d in digests)
+        assert digests[0]["delegation_id"] == _digest_id(name, 1, "gw:bob")
+        assert [d["cursor_progress_update"] for d in digests[:2]] == [1, 2]
+
+    def test_two_subscribers_each_get_their_own_copy(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """Duplicate events ACROSS hermes sessions are by design: both
+        subscribers receive digests, each copy carries its subscriber's
+        session_key, numbering is per subscriber, and every delegation_id
+        is unique (two n=1 digests must not dedup against each other)."""
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-dup",
+            update_interval_s=0.05,
+        )
+        collected = []
+        try:
+            monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+            cursor_subscribe(name, 0.05)
+
+            def _both_delivered():
+                collected.extend(_drain_completion_queue())
+                keys = {d["session_key"] for d in _digest_events(collected)}
+                return {"gw:alice", "gw:bob"} <= keys
+
+            assert _wait_until(_both_delivered, timeout=5)
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+        digests = _digest_events(collected)
+        ids = [d["delegation_id"] for d in digests]
+        assert len(ids) == len(set(ids)), f"delegation_ids collide: {ids}"
+        first_n = {}
+        for d in digests:
+            first_n.setdefault(d["session_key"], d["cursor_progress_update"])
+        assert first_n == {"gw:alice": 1, "gw:bob": 1}
+
+    # -- unsubscribe scoping ---------------------------------------------------
+
+    def test_unsubscribe_removes_only_the_calling_session(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-unsub",
+            update_interval_s=0.05,
+        )
+        try:
+            monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+            cursor_subscribe(name, 3600)
+            assert (name, "gw:bob") in gc_progress._tickers
+            ack = cursor_subscribe(name, 0)
+            assert "off" in ack
+            # Only bob's subscription went; alice's feed is untouched and
+            # still delivering.
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "gw:alice": 0.05
+            }
+            assert set(_sub_tickers(name)) == {"gw:alice"}
+            _drain_completion_queue()
+            collected = []
+            assert _collect_queue(collected, min_digests=1)
+            assert all(
+                d["session_key"] == "gw:alice"
+                for d in _digest_events(collected)
+            )
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    def test_same_session_resubscribe_retunes_instead_of_duplicating(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-retune",
+            update_interval_s=3600,
+        )
+        try:
+            # Same hermes session subscribing again = retune, not a
+            # second feed: still one map entry, still ONE ticker.
+            cursor_subscribe(name, 1800)
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "gw:alice": 1800.0
+            }
+            tickers = _sub_tickers(name)
+            assert set(tickers) == {"gw:alice"}
+            assert tickers["gw:alice"].interval_s == 1800.0
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
+
+    # -- completion fan-out ------------------------------------------------------
+
+    def test_completion_fans_out_to_every_subscriber(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-fan",
+            update_interval_s=3600,
+        )
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+        cursor_subscribe(name, 3600)
+        release.set()
+        assert job.done_event.wait(10)
+
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 2
+        by_key = {c["session_key"]: c for c in completions}
+        assert set(by_key) == {"gw:alice", "gw:bob"}
+        # Distinct delegation_ids (TUI dedup): the dispatcher keeps the
+        # plain session name, other subscribers get the hash suffix.
+        assert by_key["gw:alice"]["delegation_id"] == name
+        assert by_key["gw:bob"]["delegation_id"] == (
+            f"{name}@{gc_progress.subscriber_suffix('gw:bob')}"
+        )
+        # Identical payloads apart from routing.
+        assert by_key["gw:alice"]["status"] == "completed"
+        assert by_key["gw:bob"]["status"] == "completed"
+        assert by_key["gw:alice"]["result"] == by_key["gw:bob"]["result"]
+        assert by_key["gw:alice"]["summary"] == by_key["gw:bob"]["summary"]
+
+    def test_dispatcher_completion_guaranteed_even_when_unsubscribed(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """update_interval_s=0 leaves the dispatcher UNSUBSCRIBED (no
+        digests) — but its completion must never be lost, so the fan-out
+        still includes it alongside the actual subscribers."""
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-guar",
+            update_interval_s=0,
+        )
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+        cursor_subscribe(name, 3600)
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+            "gw:bob": 3600.0
+        }
+        release.set()
+        assert job.done_event.wait(10)
+
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 2
+        assert {c["session_key"] for c in completions} == {
+            "gw:alice", "gw:bob"
+        }
+
+    def test_unsubscribed_non_dispatcher_gets_nothing(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A hermes session that unsubscribed (interval 0) gets no digests
+        AND no completion — the dispatcher guarantee is only for the
+        dispatching session of the live run."""
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "gw:alice", sid="agent-gone",
+            update_interval_s=3600,
+        )
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:bob")
+        cursor_subscribe(name, 3600)
+        cursor_subscribe(name, 0)  # bob leaves before the run settles
+        release.set()
+        assert job.done_event.wait(10)
+
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["session_key"] == "gw:alice"
+
+    def test_cli_empty_key_subscribers_dedupe_to_one_copy(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The CLI's session_key is "" — an auto-subscribed "" dispatcher
+        plus a "" cursor_subscribe is ONE subscription (same hermes
+        session), so exactly one completion copy is enqueued."""
+        name, job, release = self._held_run_as(
+            monkeypatch, tmp_path, "", sid="agent-cli",
+            update_interval_s=3600,
+        )
+        cursor_subscribe(name, 3600)  # same "" session: retune, no dup
+        assert gc_handles.subscribers_of(gc_handles.get(name)) == {"": 3600.0}
+        assert set(_sub_tickers(name)) == {""}
+        release.set()
+        assert job.done_event.wait(10)
+
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["session_key"] == ""
+        assert completions[0]["delegation_id"] == name
+
+    # -- legacy scalar migration ---------------------------------------------
+
+    def test_legacy_scalar_migrates_as_the_dispatchers_subscription(
+        self, clean_state
+    ):
+        gc_handles.record(
+            "old-timer", repo="/tmp/r", status="created",
+            session_key="gw:old", update_interval_s=45.0,
+        )
+        entry = gc_handles.get("old-timer")
+        assert "subscribers" not in entry  # genuinely legacy-shaped
+        assert gc_handles.subscribers_of(entry) == {"gw:old": 45.0}
+        # The dispatch-time resolution honors the migrated subscription
+        # for THAT hermes session only; others fall to the 180s default.
+        assert gc_progress.resolve_interval(entry, None, "gw:old") == 45.0
+        assert gc_progress.resolve_interval(entry, None, "gw:new") == 180.0
+
+    def test_legacy_zero_scalar_is_no_subscription(self, clean_state):
+        gc_handles.record(
+            "old-quiet", session_key="gw:old", update_interval_s=0.0
+        )
+        assert gc_handles.subscribers_of(gc_handles.get("old-quiet")) == {}
+
+    def test_set_subscriber_migrates_before_writing(self, clean_state):
+        """A new subscriber landing on a legacy entry must not clobber the
+        legacy subscription — the scalar migrates into the map first, and
+        the scalar keeps mirroring the dispatcher for old readers."""
+        gc_handles.record(
+            "old-timer", session_key="gw:old", update_interval_s=45.0
+        )
+        gc_handles.set_subscriber("old-timer", "gw:new", 30.0)
+        entry = gc_handles.get("old-timer")
+        assert gc_handles.subscribers_of(entry) == {
+            "gw:old": 45.0, "gw:new": 30.0,
+        }
+        assert entry["update_interval_s"] == 45.0  # dispatcher mirror
+
+    def test_legacy_subscription_drives_the_next_run(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """End-to-end migration: a legacy entry's scalar seeds the
+        dispatching session's ticker on the next send (no explicit
+        interval), exactly like a persisted map subscription."""
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_sdk, "run_sdk",
+            _gated_replay_factory(release, sid="agent-legacy"),
+        )
+        monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:old")
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        # Regress the entry to the legacy shape: scalar only, no map.
+        with gc_handles._lock:
+            gc_handles._table[name].pop("subscribers", None)
+            gc_handles._table[name]["update_interval_s"] = 45.0
+        _assert_running_ack(cursor_send_message(name, "task"))
+        job = _job_for("agent-legacy")
+        try:
+            assert gc_progress._tickers[(name, "gw:old")].interval_s == 45.0
+            assert gc_handles.subscribers_of(gc_handles.get(name)) == {
+                "gw:old": 45.0
+            }
+        finally:
+            release.set()
+            assert job.done_event.wait(10)
 
 
 # ---------------------------------------------------------------------------
@@ -2603,7 +2955,7 @@ class TestZeroProgressAutoRetry:
         job = _job_for("agent-zp")
         # Same job across the retry — the digest subscription (default
         # 180s) keeps its ticker.
-        assert gc_progress._tickers[job.session_name].job is job
+        assert gc_progress._tickers[(job.session_name, "")].job is job
         release.set()
         assert job.done_event.wait(10)
 

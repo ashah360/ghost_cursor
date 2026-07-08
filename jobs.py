@@ -26,9 +26,12 @@ shared ``tools.process_registry.process_registry.completion_queue`` with
 uses (see ``tools/async_delegation.py``). The CLI ``process_loop`` drain and
 the gateway's ``_async_delegation_watcher`` already consume that queue while
 the agent is idle and inject each event as a fresh turn, which keeps strict
-message-role alternation legal and the prompt cache intact. The event's
-``session_key`` (captured on the dispatching thread) routes it back to the
-originating gateway session; an empty key means CLI.
+message-role alternation legal and the prompt cache intact. Each event's
+``session_key`` routes it to one gateway session (empty key = CLI); the
+completion FANS OUT — one copy per subscriber in the handle entry's
+``subscribers`` map, plus the dispatching session (``job.session_key``,
+captured on the dispatching thread) even when it unsubscribed — see
+``_push_completion_event``.
 
 Delivery is ARMED, not assumed: a job is dispatched with ``deliver=False``
 and the dispatching tool arms it (:meth:`CursorJob.arm_delivery`) only
@@ -506,15 +509,26 @@ class CursorJobRegistry:
         job.session_event.set()
 
     def _push_completion_event(self, job: CursorJob, result: Dict[str, Any]) -> None:
-        """Deliver the terminal result into the originating session.
+        """Deliver the terminal result to EVERY subscriber's session.
 
-        Rides the shared ``process_registry.completion_queue`` as a
-        ``type="async_delegation"`` event — the same rail
+        Rides the shared ``process_registry.completion_queue`` as
+        ``type="async_delegation"`` events — the same rail
         ``delegate_task(background=true)`` uses, already drained by the CLI
         process_loop and the gateway's async-delegation watcher and injected
         as a fresh turn. Fires for EVERY terminal state (unless the outcome
         was already reported in-turn via mark_handled); a failure to enqueue
         is logged loudly because it would mean a silently-lost result.
+
+        Fan-out: one event copy per current subscriber of the session
+        (``handles.subscribers_of``), routed by the subscriber's
+        ``session_key``. The DISPATCHING session always gets its copy even
+        when unsubscribed — the dispatcher's completion must never be lost
+        — and recipients are deduped by session_key (the dispatcher is
+        normally auto-subscribed; CLI/"" subscribers collapse to one copy).
+        The dispatcher's copy keeps the plain session name as its
+        delegation_id (the pre-fan-out scheme); other subscribers' copies
+        get a short subscriber-key hash suffix so the TUI's
+        (delegation_id, type) dedup can't swallow them.
         """
         try:
             from tools.process_registry import process_registry
@@ -525,13 +539,17 @@ class CursorJobRegistry:
             )
             return
 
+        handle_key = job.session_name or job.cursor_session_id
+        subscribers = _handles.subscribers_of(
+            _handles.get(handle_key) if handle_key else None
+        )
+        dispatcher = str(job.session_key or "")
+        recipients = sorted({str(k or "") for k in subscribers} | {dispatcher})
+
+        base_id = job.session_name or job.cursor_session_id or job.job_id
         payload_result = trim_result(result)
-        evt = {
+        base_evt = {
             "type": "async_delegation",
-            "delegation_id": (
-                job.session_name or job.cursor_session_id or job.job_id
-            ),
-            "session_key": job.session_key,
             "goal": f"cursor: {_clip(job.task, 200)}",
             "context": None,
             "toolsets": None,
@@ -552,13 +570,24 @@ class CursorJobRegistry:
             "cursor_job_id": job.job_id,
             "cursor_session_id": job.cursor_session_id,
         }
-        try:
-            process_registry.completion_queue.put(evt)
-        except Exception as exc:  # pragma: no cover
-            logger.error(
-                "Cursor job %s: failed to enqueue completion event; "
-                "result lost: %s", job.job_id, exc,
-            )
+        for session_key in recipients:
+            evt = {
+                **base_evt,
+                "session_key": session_key,
+                "delegation_id": (
+                    base_id
+                    if session_key == dispatcher
+                    else f"{base_id}@{_progress.subscriber_suffix(session_key)}"
+                ),
+            }
+            try:
+                process_registry.completion_queue.put(evt)
+            except Exception as exc:  # pragma: no cover
+                logger.error(
+                    "Cursor job %s: failed to enqueue completion event for "
+                    "session_key %r; result lost for that session: %s",
+                    job.job_id, session_key, exc,
+                )
 
     @staticmethod
     def _completion_summary(job: CursorJob, result: Dict[str, Any]) -> str:
