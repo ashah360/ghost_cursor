@@ -70,7 +70,7 @@ jobs:
           setsid agent worker start --verbose --name "preflight-$RANDOM" --worker-dir "$d" >"$log" 2>&1 < /dev/null &
           pid=$!
           for i in $(seq 1 60); do
-            grep -q "Worker is now running" "$log" 2>/dev/null && { echo "worker ready"; head -20 "$log"; exit 0; }
+            grep -q "Worker is now running" "$log" 2>/dev/null && { echo "worker ready"; head -20 "$log"; kill "$pid" 2>/dev/null || true; exit 0; }
             kill -0 "$pid" 2>/dev/null || { echo "worker DIED during startup — log:"; cat "$log"; exit 1; }
             sleep 1
           done
@@ -99,7 +99,6 @@ jobs:
         env:
           PYTHONPATH: ${{ github.workspace }}/hermes-agent
           GHOST_CURSOR_PLUGIN_INIT: ${{ github.workspace }}/hermes-agent/plugins/ghost_cursor/__init__.py
-          GHOST_CURSOR_SPAWN_DIAG: "1"
         run: |
           set -euo pipefail
           uv run --with pytest --with pytest-timeout --with httpx pytest tests/plugins/e2e/test_e2e.py -q -v \

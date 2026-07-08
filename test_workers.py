@@ -134,6 +134,25 @@ class TestEnsureWorker:
         assert "exited during startup" in str(err.value)
         assert "not logged in" in str(err.value)
 
+    def test_single_dead_reading_is_not_death(self, tmp_path, monkeypatch):
+        """One dead probe (the pre-exec cmdline window) must not be treated
+        as startup death — that needs two consecutive readings."""
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        reads = iter([False])  # dead once, then alive forever
+        monkeypatch.setattr(workers, "_pid_alive", lambda pid: next(reads, True))
+
+        def spawn_slow(name, repo_path, log_path):
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text("registering...\n")
+            return 4000
+
+        monkeypatch.setattr(workers, "_spawn_worker", spawn_slow)
+        with pytest.raises(workers.WorkerError) as err:
+            workers.ensure_worker(str(repo))
+        assert "did not report ready" in str(err.value)
+        assert "exited during startup" not in str(err.value)
+
     def test_missing_agent_cli(self, tmp_path, monkeypatch):
         repo = tmp_path / "repo"
         repo.mkdir()

@@ -113,8 +113,11 @@ def _pid_alive(pid: int) -> bool:
     except PermissionError:
         return True  # exists, owned by someone else — treat as alive
     try:
+        # -ww: unlimited width — CI runners truncate ps output at 80 cols,
+        # which cut "worker start" out of the agent CLI's long cmdline and
+        # made live workers look dead.
         proc = subprocess.run(
-            ["ps", "-p", str(int(pid)), "-o", "command="],
+            ["ps", "-ww", "-p", str(int(pid)), "-o", "command="],
             capture_output=True, text=True, timeout=5,
         )
         command = (proc.stdout or "").strip()
@@ -194,7 +197,7 @@ def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
         time.sleep(2.0)
         exit_status = proc.poll()  # authoritative: reaps if it exited
         ps = subprocess.run(
-            ["ps", "-p", str(proc.pid), "-o", "stat=,command="],
+            ["ps", "-ww", "-p", str(proc.pid), "-o", "stat=,command="],
             capture_output=True, text=True,
         )
         log_bytes = log_path.stat().st_size if log_path.exists() else -1
@@ -286,10 +289,15 @@ def _wait_ready(record: WorkerRecord) -> None:
     """Poll the spawn's log for READY_LINE, bounded by READY_TIMEOUT_S."""
     log_path = Path(record.log_path)
     deadline = time.monotonic() + READY_TIMEOUT_S
+    dead_reads = 0
     while time.monotonic() < deadline:
         if READY_LINE in _log_tail(log_path):
             return
-        if not _pid_alive(record.pid):
+        # Two consecutive dead readings before declaring death: right after
+        # fork the child's cmdline is still the parent's, so a single
+        # _pid_alive probe can misread a healthy spawn.
+        dead_reads = dead_reads + 1 if not _pid_alive(record.pid) else 0
+        if dead_reads >= 2:
             raise WorkerError(
                 f"worker '{record.name}' exited during startup — log tail:\n"
                 f"{_log_tail(log_path) or '(empty log)'}"
