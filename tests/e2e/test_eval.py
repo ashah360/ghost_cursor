@@ -13,7 +13,10 @@ Requires (skips cleanly otherwise):
   - GHOST_CURSOR_E2E=1
   - CURSOR_API_KEY   (cursor)
   - OPENAI_API_KEY   (the judge model)
+  - GHOST_CURSOR_E2E_REPO (GitHub https URL for the tmp repo's origin remote;
+    GHOST_CURSOR_E2E_BRANCH optionally names its default branch)
   - httpx installed (a hermes dependency)
+  - the `agent` CLI on PATH (runtime="local" spawns a detached worker)
   - a Hermes checkout importable
 
 Models:
@@ -120,9 +123,24 @@ def test_plugin_run_is_clean_by_llm_judge(tmp_path):
     gc._resolve_progress_callback = lambda: None
     gc._resolve_session_key = lambda: f"eval-{int(time.time())}"
 
+    # The cloud runtime derives repo url + starting ref from the checkout's
+    # origin remote and branch — a bare `git init` can never pass the
+    # create preflight (same fixture contract as test_e2e._repo).
+    e2e_repo = os.environ.get("GHOST_CURSOR_E2E_REPO", "")
+    e2e_branch = os.environ.get("GHOST_CURSOR_E2E_BRANCH", "main")
+    if not e2e_repo:
+        pytest.skip(
+            "GHOST_CURSOR_E2E_REPO unset — the cloud runtime requires a "
+            "GitHub origin remote; point it at a small real repo"
+        )
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    git = ["git", "-c", "user.email=e2e@ghost-cursor", "-c", "user.name=ghost-e2e"]
+    subprocess.run([*git, "init", "-q", "-b", e2e_branch], cwd=repo, check=True)
+    subprocess.run([*git, "remote", "add", "origin", e2e_repo], cwd=repo, check=True)
+    (repo / ".gitkeep").write_text("")
+    subprocess.run([*git, "add", "."], cwd=repo, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "e2e seed"], cwd=repo, check=True)
 
     create_ack = gc._handle_cursor_create_session(
         {"repo": str(repo), "model": CURSOR_MODEL})
