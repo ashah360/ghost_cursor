@@ -754,8 +754,19 @@ class _CloudWorker:
                     return result_data  # cancel racing the teardown
                 if self._run_is_terminal(client):
                     return result_data  # run over; the stream died reporting it
-                if isinstance(exc, RestApiError) and not exc.retryable:
+                if (
+                    isinstance(exc, RestApiError)
+                    and not exc.retryable
+                    and exc.status_code != 409
+                ):
                     raise  # e.g. 404/410 on a live run — not reconnectable
+                # A 409 from the stream endpoint (e.g. stream_unavailable)
+                # means "not attachable right now", NOT "run failed" — the
+                # same condition arrives as an in-stream `error` event and is
+                # treated as reattachable there. Fall through to the reattach
+                # path; _run_is_terminal above stays the authority each cycle.
+                # (409 stays non-retryable globally: on POST /v1/agents it
+                # means agent_busy and must not be blind-retried.)
                 reattaches += 1
                 if reattaches > MAX_STREAM_REATTACHES:
                     raise
