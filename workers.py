@@ -135,6 +135,16 @@ def _agent_cli_path() -> Optional[str]:
     return shutil.which(AGENT_CLI, path=path)
 
 
+def _spawn_env() -> Dict[str, str]:
+    # CI loader/interpreter vars (e.g. setup-python's LD_LIBRARY_PATH) kill the node-based agent binary.
+    return {
+        key: value
+        for key, value in os.environ.items()
+        if not key.startswith(("LD_", "DYLD_"))
+        and key not in ("PYTHONPATH", "PYTHONHOME")
+    }
+
+
 def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
     """Start ``agent worker start`` detached, output to ``log_path``.
 
@@ -156,6 +166,7 @@ def _spawn_worker(name: str, repo_path: str, log_path: Path) -> int:
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             cwd=str(repo_path),
+            env=_spawn_env(),
             start_new_session=True,
         )
     return proc.pid

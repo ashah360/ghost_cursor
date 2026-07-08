@@ -143,6 +143,23 @@ class TestEnsureWorker:
         assert "agent" in str(err.value)
 
 
+class TestSpawnEnv:
+    def test_strips_loader_and_interpreter_vars(self, monkeypatch):
+        monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/python/lib")
+        monkeypatch.setenv("LD_PRELOAD", "/x.so")
+        monkeypatch.setenv("DYLD_LIBRARY_PATH", "/y")
+        monkeypatch.setenv("PYTHONPATH", "/z")
+        monkeypatch.setenv("PYTHONHOME", "/w")
+        monkeypatch.setenv("PATH", "/usr/bin")
+        env = workers._spawn_env()
+        assert "LD_LIBRARY_PATH" not in env
+        assert "LD_PRELOAD" not in env
+        assert "DYLD_LIBRARY_PATH" not in env
+        assert "PYTHONPATH" not in env
+        assert "PYTHONHOME" not in env
+        assert env["PATH"] == "/usr/bin"
+
+
 class TestLiveWorkersAndCleanup:
     def test_lists_only_live_and_cleans_dead(self, tmp_path, fake_spawn, fake_procs):
         repo_a, repo_b = tmp_path / "a", tmp_path / "b"
