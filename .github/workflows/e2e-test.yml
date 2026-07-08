@@ -56,6 +56,26 @@ jobs:
           "$HOME/.local/bin/agent" --version
           test -n "$CURSOR_API_KEY" || { echo "CURSOR_API_KEY secret missing"; exit 1; }
 
+      - name: Worker preflight — spawn a detached worker like the plugin does
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          d="$RUNNER_TEMP/worker-preflight/repo"; mkdir -p "$d"; cd "$d"
+          git -c user.email=e@e -c user.name=e init -q -b "$GHOST_CURSOR_E2E_BRANCH"
+          git remote add origin "$GHOST_CURSOR_E2E_REPO"
+          touch .gitkeep
+          git -c user.email=e@e -c user.name=e add .
+          git -c user.email=e@e -c user.name=e commit -q -m seed
+          log="$RUNNER_TEMP/worker-preflight/worker.log"
+          setsid agent worker start --verbose --name "preflight-$RANDOM" --worker-dir "$d" >"$log" 2>&1 < /dev/null &
+          pid=$!
+          for i in $(seq 1 60); do
+            grep -q "Worker is now running" "$log" 2>/dev/null && { echo "worker ready"; head -20 "$log"; exit 0; }
+            kill -0 "$pid" 2>/dev/null || { echo "worker DIED during startup — log:"; cat "$log"; exit 1; }
+            sleep 1
+          done
+          echo "worker never reported ready — log:"; cat "$log"; exit 1
+
       - name: Install plugin + tests into the Hermes tree
         run: |
           set -euo pipefail
