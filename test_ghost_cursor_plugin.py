@@ -1,4 +1,4 @@
-"""Tests for the ghost_cursor plugin (v0.5: cursor-sdk transport).
+"""Tests for the ghost_cursor plugin (v0.6: REST+SSE cloud transport).
 
 Six tools: ``cursor_create_session`` / ``cursor_send_message`` /
 ``cursor_status`` / ``cursor_stop`` / ``cursor_events`` / ``cursor_list`` —
@@ -6,14 +6,15 @@ all keyed on adjective-adjective-noun session names (cursor agent ids
 resolve as aliases). Every tool returns plain text (labeled headers, prose,
 raw fenced diffs, TSV) — never JSON. Covered here:
 
-* ``sdk_runner.run_sdk`` — the cursor-sdk transport against a fully faked
-  bridge/client (happy path, native run.cancel, inactivity watchdog with
-  pending-tool-call suspension, max-wall ceiling, Agent.resume + fresh
-  fallback, bounded is_retryable retries, observe(after_offset) stream
-  re-attach, bridge caching/shutdown, missing-key/missing-sdk preflight).
-* ``events.SdkNormalizer`` — SDKMessage dicts → canonical envelope mapping,
-  including defensive parsing of the (explicitly unstable) tool_call
-  payload shapes, plus a full-run fixture replay
+* ``cloud_runner.run_cloud`` — the REST+SSE transport against a fully faked
+  REST client (happy path, native REST cancel, inactivity watchdog with
+  pending-tool-call suspension, max-wall + first-event ceilings, follow-up
+  + fresh-agent fallback, Last-Event-ID stream re-attach with a bounded
+  budget, terminal settle via the final GET runs/{id} authority,
+  unroutable-worker detection, runtime=local|cloud, missing-key preflight).
+* ``events.SdkNormalizer`` — cloud_runner message dicts → canonical envelope
+  mapping, including defensive parsing of the (explicitly unstable)
+  tool_call payload shapes, plus a full-run fixture replay
   (``fixtures/sdk_stream.jsonl``).
 * The tool handlers — session lifecycle (create → lazy first send → status
   → stop/follow-up), the read-only guarantee of ``cursor_status``, the
@@ -21,9 +22,9 @@ raw fenced diffs, TSV) — never JSON. Covered here:
   alias resolution, ``cursor_events`` paging (tail defaults, negative
   offsets, kind filter, 2KB inline clip, 20KB response cap), ``cursor_list``
   TSV + scoping, model threading, completion delivery on the shared
-  async-delegation rail, and actionable prose errors for bogus/expired
-  handles. The SDK layer is replayed with fast deterministic fakes (no
-  live bridge, no network).
+  async-delegation rail, rejection of legacy bridge-era handles, and
+  actionable prose errors for bogus/expired handles. The runner layer is
+  replayed with fast deterministic fakes (no live workers, no network).
 * ``handles.py`` — the persistent handle table (explicit lookup only; the
   v0.2 auto-resume heuristic is gone by design).
 * The legacy ``--print`` runner + ``normalize_harness`` mapping (kept as
@@ -208,7 +209,7 @@ def _wait_until(cond, timeout=10.0, interval=0.01):
 def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=True):
     """A cancel-aware replay held open on ``release``.
 
-    Yields the sdk.session event (the handle), optionally one early file
+    Yields the cloud.session event (the handle), optionally one early file
     edit, then blocks until ``release`` is set — honoring ``cancel_check``
     the way the real ``run_sdk`` does (a cancel mid-run resolves with
     ``status: "cancelled"``). After release: an optional second edit, a
@@ -2881,14 +2882,14 @@ class TestMultiSubscriberDelivery:
 
 
 # ---------------------------------------------------------------------------
-# Zero-progress auto-retry — stale-bridge recovery (live incident 2026-07-04)
+# Zero-progress auto-retry (born from the stale-bridge live incident 2026-07-04)
 # ---------------------------------------------------------------------------
 
 def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
                            meaningful=False, edit=False, content_chunks=0,
                            release=None):
     """A replay that settles with terminal status "error" (the enriched
-    sdk.error payload from sdk_runner), optionally after progress —
+    cloud.error payload from cloud_runner), optionally after progress —
     ``meaningful`` = one completed shell round, ``edit`` = one completed
     file edit (folds a file_diff), ``content_chunks`` = that many trivial
     narration deltas — optionally held open on ``release`` first."""
@@ -5598,9 +5599,9 @@ class TestSdkNormalizer:
     def test_unknown_message_type_passes_through(self):
         envs = self._norm().normalize("cloud.message", {"type": "mystery", "x": 1})
         assert envs[0]["event"] == "passthrough"
-        assert envs[0]["name"] == "sdk.mystery"
+        assert envs[0]["name"] == "cloud.mystery"
 
     def test_unknown_runner_event_passes_through(self):
-        envs = self._norm().normalize("sdk.wat", {"x": 1})
+        envs = self._norm().normalize("cloud.wat", {"x": 1})
         assert envs[0]["event"] == "passthrough"
-        assert envs[0]["name"] == "sdk.wat"
+        assert envs[0]["name"] == "cloud.wat"

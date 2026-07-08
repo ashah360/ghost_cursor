@@ -13,7 +13,7 @@ Requires (skips cleanly otherwise):
   - GHOST_CURSOR_E2E=1
   - CURSOR_API_KEY   (cursor)
   - OPENAI_API_KEY   (the judge model)
-  - cursor-sdk installed (pip install cursor-sdk)
+  - httpx installed (a hermes dependency)
   - a Hermes checkout importable
 
 Models:
@@ -36,11 +36,11 @@ CURSOR_MODEL = os.environ.get("GHOST_CURSOR_TEST_MODEL", "gpt-5.4-nano")
 JUDGE_MODEL = os.environ.get("GHOST_CURSOR_JUDGE_MODEL", "gpt-5.4-nano")
 
 _run = os.environ.get("GHOST_CURSOR_E2E") == "1"
-_have_sdk = importlib.util.find_spec("cursor_sdk") is not None
+_have_http = importlib.util.find_spec("httpx") is not None
 
 pytestmark = pytest.mark.skipif(
-    not (_run and _CURSOR_KEY and _OPENAI_KEY and _have_sdk),
-    reason="e2e-eval opt-in: needs GHOST_CURSOR_E2E=1, CURSOR_API_KEY, OPENAI_API_KEY, cursor-sdk",
+    not (_run and _CURSOR_KEY and _OPENAI_KEY and _have_http),
+    reason="e2e-eval opt-in: needs GHOST_CURSOR_E2E=1, CURSOR_API_KEY, OPENAI_API_KEY, httpx",
 )
 
 TERMINAL = ("completed", "failed", "cancelled", "timeout")

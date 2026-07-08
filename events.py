@@ -749,7 +749,7 @@ class SdkNormalizer:
                               text=msg.get("text"))]
 
         # Unknown message type: opaque passthrough.
-        return [lifecycle("passthrough", name=f"sdk.{mtype or 'message'}", data=msg)]
+        return [lifecycle("passthrough", name=f"cloud.{mtype or 'message'}", data=msg)]
 
     def _tool_call(self, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
         call_id = str(msg.get("call_id") or "tool")

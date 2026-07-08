@@ -1211,7 +1211,7 @@ def _send_to_session(
     # Model validation is deferred to this first send (create is lazy by
     # design) — so when the agent-create failure hits and this session
     # carries an explicit model, attribute the failure to the param chosen
-    # at create instead of leaving a generic sdk error (issue #12).
+    # at create instead of leaving a generic api error (issue #12).
     explicit_model = str(entry.get("model") or "")
     if explicit_model and "agent create failed" in str(result.get("error") or ""):
         result["error"] = (

@@ -2,23 +2,23 @@
 
 A [Hermes Agent](https://github.com/NousResearch/hermes-agent) plugin that lets your agent **delegate coding tasks to the [Cursor](https://cursor.com) agent** — and watch it work in real time.
 
-Registers seven session tools that run Cursor agents inside a target repo over the **official [`cursor-sdk`](https://pypi.org/project/cursor-sdk/) python package**, stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
+Registers seven session tools that run Cursor **cloud agents** against a target repo over the **Cursor REST v1 API + SSE event stream** — on this machine (`runtime="local"`, a plugin-managed "My Machines" worker) or on a cursor-hosted VM (`runtime="cloud"`) — stream per-edit progress (reasoning + full file diffs) back through the calling agent's progress callback, and return a structured summary of everything that changed.
 
 Because it's an ordinary Hermes tool call inside a real session, the result **persists in the transcript and reloads for free** — and interrupts map to a native `run.cancel()`.
 
-## Why the official cursor-sdk
+## Why REST + SSE
 
-Earlier versions drove `cursor-agent` over ACP (JSON-RPC on stdio) and, before that, scraped `--print` stdout. The SDK replaces both with a supported contract:
+Earlier versions drove `cursor-agent` over ACP (JSON-RPC on stdio), scraped `--print` stdout, and then rode the python `cursor-sdk` (which spawned a local sidecar bridge). The REST v1 API replaces all of them with a direct, supported contract:
 
-| | stdout scraping | ACP (v0.4) | cursor-sdk (this plugin) |
-|---|---|---|---|
-| Event format | freeform JSON, inferred | typed `session/update` | typed `SDKMessage` dataclasses |
-| Cancellation | `kill -9` the process | native `session/cancel` | native `run.cancel()` |
-| Resume | none | `session/load` (best effort) | `Agent.resume(agent_id)` |
-| Network drop mid-run | run lost | run lost | `run.observe(after_offset=…)` re-attach |
-| Transient failures | opaque | opaque | typed errors with `is_retryable` / `retry_after` |
+| | stdout scraping | ACP (v0.4) | cursor-sdk (v0.5) | REST + SSE (this plugin) |
+|---|---|---|---|---|
+| Event format | freeform JSON, inferred | typed `session/update` | typed `SDKMessage` | typed SSE events (`assistant` / `tool_call` / `result`) |
+| Cancellation | `kill -9` the process | native `session/cancel` | native `run.cancel()` | `POST …/runs/{id}/cancel` |
+| Resume | none | `session/load` (best effort) | `Agent.resume` | follow-up `POST …/agents/{id}/runs` |
+| Network drop mid-run | run lost | run lost | `run.observe` re-attach | `Last-Event-ID` reconnect |
+| Local process state | one process per run | one process per run | sidecar bridge to babysit | **none** — agent state lives server-side |
 
-The SDK runs a local sidecar bridge (managed automatically) that owns agent state, so a dropped stream — or a restarted plugin process — can re-attach to a run that is still executing instead of losing it.
+Because agent state lives entirely on Cursor's side, a dropped stream — or a restarted plugin process — re-attaches to a run that is still executing instead of losing it, and there is no bridge process to go stale. Terminal truth comes from the `result` SSE event confirmed by a final `GET runs/{id}` — never from the lossy simplified status stream.
 
 The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
@@ -39,7 +39,8 @@ Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the age
 ## Requirements
 
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent)
-- `pip install cursor-sdk` (python ≥ 3.10)
+- `httpx` importable (already a Hermes dependency)
+- the `agent` CLI on PATH for `runtime="local"` (`curl https://cursor.com/install -fsS | bash`) — the plugin spawns and manages the detached worker for you
 - `CURSOR_API_KEY` exported (create one at the [Cursor dashboard](https://cursor.com/dashboard))
 - The target repo should be a git repo (enables the diff fallback)
 
@@ -50,7 +51,7 @@ Drop the plugin into your Hermes plugins directory and enable it:
 ```bash
 # 1. copy the plugin
 mkdir -p ~/.hermes/plugins/ghost_cursor
-cp __init__.py sdk_runner.py events.py runner.py jobs.py handles.py eventlog.py names.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
+cp __init__.py rest_client.py cloud_runner.py workers.py progress.py events.py runner.py jobs.py handles.py eventlog.py names.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
 
 # 2. enable it in ~/.hermes/config.yaml
 #    plugins:
@@ -66,7 +67,7 @@ Verify it registered:
 ```bash
 # cursor_create_session / cursor_send_message / cursor_status / cursor_stop /
 # cursor_events / cursor_list / cursor_subscribe should show up as tools once
-# cursor-sdk is importable
+# httpx is importable
 ```
 
 ## Usage
@@ -136,7 +137,7 @@ Timeouts are **inactivity-based**: a run that keeps streaming events (reasoning,
 - **`inactivity_timeout_s`** — abort after this many seconds with **no stream events**; any streamed activity resets the clock. Default **600** (10 min of silence); **0 disables** the watchdog.
 - **`max_wall_s`** — optional hard ceiling on **total** run time, a safety net for runaways that stream forever without finishing. Default **0 (disabled)**.
 
-Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last stream event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the SDK runner.
+Precedence for both: explicit tool param → config.yaml (`plugins.ghost_cursor.inactivity_timeout_s` / `plugins.ghost_cursor.max_wall_s`) → built-in default. The abort error names whichever limit fired ("no activity for Ns" vs "exceeded max wall time (Ns)"), and either one delivers a normal `timeout` completion message. `cursor_status` reports `last_activity_s` (seconds since the last stream event) so you can spot a run going quiet **before** the watchdog fires — it's advisory only; the enforcement lives in the cloud runner.
 
 The old `timeout` parameter is kept as a deprecated alias for `inactivity_timeout_s`.
 
@@ -156,8 +157,10 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 |---|---|
 | `__init__.py` | Plugin entry — registers the seven tools, resolves the progress callback, builds results |
 | `progress.py` | Progress subscriptions — per-run digest timers, `cursor_subscribe` plumbing, completion-queue delivery guards |
-| `sdk_runner.py` | cursor-sdk transport — bridge lifecycle, Agent create/resume, event streaming, observe() re-attach, bounded retries, watchdogs, native cancel |
-| `events.py` | Canonical envelope builders + `SDKMessage` → envelope mapping |
+| `rest_client.py` | Typed httpx client for the Cursor REST v1 API — error mapping, GET-only retries, SSE parser |
+| `cloud_runner.py` | REST+SSE transport — agent create/follow-up, SSE consumption with Last-Event-ID re-attach, watchdogs, native cancel, terminal settle via GET runs/{id} |
+| `workers.py` | Detached "My Machines" worker manager for runtime=local — spawn, readiness, routability |
+| `events.py` | Canonical envelope builders + cloud-event → envelope mapping |
 | `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |
 | `plugin.yaml` | Plugin manifest |
 | `test_ghost_cursor_plugin.py` | Tests |
@@ -171,7 +174,7 @@ MIT — see [LICENSE](LICENSE).
 Two GitHub Actions workflows (`.github/workflows/`):
 
 - **`unit`** (every push/PR, blocking) — the 110 hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
-- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes + the real `cursor-sdk` and exercises every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
+- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes and drives the real Cursor REST API, exercising every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
 
 Set the repo secret **`CURSOR_API_KEY`** for the e2e job. Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env in `e2e.yml` (default `gpt-5.4-nano-low` — cheap + fast; verify the slug with `cursor-agent models`).
 
