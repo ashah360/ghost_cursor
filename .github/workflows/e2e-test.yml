@@ -3,17 +3,12 @@ name: e2e-test
 # Shape 1 — E2E TEST (facts): real Hermes core + the real Cursor REST API,
 # no mocks. Asserts the cursor tools are actually invoked and do real work with
 # no errors, across every handle-interface shape (start/status/resume/stop/
-# same-repo-guard/bogus-handle). Blocking on PRs to main so tool regressions
-# can't merge.
+# same-repo-guard/bogus-handle). Manual dispatch only: every run creates REAL
+# cloud agents against the owner's cursor account (usage cost + sessions in
+# the agents UI).
 
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "0 7 * * *"
 
 concurrency:
   group: e2e-test-${{ github.ref }}
