@@ -4,16 +4,11 @@ name: e2e-eval
 # Runs a real cursor task through the plugin, captures the full context
 # (result + status + final files), and asks a cheap judge model whether the
 # run went smoothly (no error leakage, coherent result, real change). Catches
-# soft regressions that pass/fail assertions miss. Blocking on PRs to main.
+# soft regressions that pass/fail assertions miss. Manual dispatch only:
+# every run creates REAL cloud agents against the owner's cursor account.
 
 on:
-  pull_request:
-    branches: [main]
-  push:
-    branches: [main]
   workflow_dispatch:
-  schedule:
-    - cron: "30 7 * * *"
 
 concurrency:
   group: e2e-eval-${{ github.ref }}

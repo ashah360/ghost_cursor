@@ -22,19 +22,27 @@ Because agent state lives entirely on Cursor's side, a dropped stream — or a r
 
 The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
-## What you get (v0.3 — session-handle interface)
+## What you get (v0.6 — cloud-machine runtime)
 
-Four explicit tools mirroring Hermes's `terminal`/`process` split. The single handle is the cursor **`session_id`**, returned by `cursor_start` and passed to the rest.
+Seven named-session tools. The handle is a friendly **session name** (e.g. `brave-lunar-otter`) minted by `cursor_create_session`; cursor agent ids from older runs resolve as aliases.
 
-- **`cursor_start(task, repo, model?, session_id?, inactivity_timeout_s?, max_wall_s?)`** — dispatch a coding task; returns a `session_id` **immediately** and runs in the **background** (the conversation stays free). Pass a prior `session_id` to continue that Cursor session with full context (`Agent.resume`); expired → graceful fresh start (`resumed: false`). Optional `model` overrides the cursor model (config fallback: `plugins.ghost_cursor.model`).
-- **`cursor_send(session_id, message, inactivity_timeout_s?, max_wall_s?)`** — steer / follow up. Honest semantics: there is **no true mid-run queue** — this interrupts the current run (`run.cancel()`) and re-prompts the same session with `message` + full context. It's "interrupt + re-prompt with context", not "append to a running turn". Works mid-run or after a run settled.
-- **`cursor_status(session_id)`** — **strictly read-only** progress view: status, files changed with diffs so far, latest reasoning, session_id, elapsed, `last_activity_s` (seconds since the last stream event — spot a silent run without touching it). Polling **never cancels** the run (tested property — it was the footgun that killed foreground runs).
-- **`cursor_stop(session_id)`** — graceful `session/cancel`, SIGKILL only on hang. Returns final status + partial `files_changed`.
-- **`cursor_subscribe(session, interval_s)`** — subscribe the **calling Hermes session** to **periodic progress digests** while a run is active: every `interval_s` seconds a compact update (status header + the events since the previous tick) is delivered as a new message on the same rail as run completions. Subscriptions are per Hermes session per cursor session (`subscribers: {hermes_session_key: interval_s}` on the handle entry) — multiple Hermes sessions can watch one run, each at its own cadence, each getting its own copy of every digest **and** the completion. `cursor_send_message` auto-subscribes the caller at `update_interval_s` (explicit param > the caller's persisted interval > the **180s** default, `0` disables); `cursor_subscribe` retunes the caller's subscription mid-run (shorter intervals reschedule the pending tick immediately) or removes it with `interval_s=0` (other subscribers untouched). Subscriptions persist on the session across restarts; the final result is always delivered separately to every subscriber — and to the dispatching session even if it unsubscribed.
+- **`cursor_create_session(repo?, model?, runtime?)`** — mints a named session and dispatches **nothing** (the cloud agent is created lazily on the first message). `runtime="local"` (default) routes execution to a plugin-managed "My Machines" worker on this machine; `runtime="cloud"` uses a cursor-hosted VM. `repo` is a local path either way — the plugin derives the GitHub origin URL + branch itself.
+- **`cursor_send_message(session, message, ...)`** — all work goes through this. The first message on a fresh session is the task; later messages are follow-ups with full prior context. Honest semantics: there is **no mid-run queue** — sending into a live run cancels it natively and re-prompts the same session. Returns immediately; the run executes in the background and the final result is delivered as a message on every terminal state.
+- **`cursor_status(session)`** — **strictly read-only**: status, elapsed, last-activity age, files changed so far, recent events. Polling never cancels (tested property).
+- **`cursor_events(session, offset?, limit?, kind?)`** — pages the per-session JSONL event log (reasoning, tool calls, file diffs, content).
+- **`cursor_stop(session)`** — native cancel; acks "stopped" only after the run is observed terminal.
+- **`cursor_list(scope?)`** — TSV of session handles with repo, runtime, and status.
+- **`cursor_subscribe(session, interval_s)`** — subscribe the **calling Hermes session** to periodic progress digests while a run is active. Subscriptions are per Hermes session per cursor session — multiple Hermes sessions can watch one run, each at its own cadence, each getting its own copy of every digest **and** the completion. `cursor_send_message` auto-subscribes the caller (explicit `update_interval_s` param > persisted interval > 180s default, `0` disables); `interval_s=0` removes only the caller's subscription. The final result is always delivered to every subscriber — and to the dispatching session even if it unsubscribed.
 
-Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state (success/fail/error/timeout/cancel), **same-repo concurrency guard** (a second `cursor_start` on a repo with an active handle is rejected — two agents on one tree = corruption; different repos run in parallel), **handle persistence** across turns (a JSON table under `<HERMES_HOME>/state/`), **git-diff fallback** for shell-driven edits, and a **`check_fn`** so the tools only appear when `cursor-agent` is installed.
+Cross-cutting: **live streaming** (reasoning + per-edit `file_diff`s via the agent's `tool_progress_callback`), **completion delivery** on every terminal state, **same-repo concurrency guard** (a second run on a repo with an active run is rejected; different repos run in parallel), **handle persistence** across restarts (a JSON table under `<HERMES_HOME>/state/`), and a **`check_fn`** so the tools only appear when the transport is available.
 
-> Migrating from v0.2? The single blocking `cursor_edit` + hidden auto-resume registry are **gone** (breaking). Start work with `cursor_start`, resume by passing the handle back — no repo+timestamp heuristic guessing which session to continue.
+## The worker model (runtime="local")
+
+Sessions are real cloud agents either way — the agent loop always runs on Cursor's side, which is exactly why every session **syncs natively to cursor.com/agents, the web app, and mobile**. With `runtime="local"`, tool calls (terminal, edits) execute on this machine through a "My Machines" worker:
+
+- The plugin spawns `agent worker start` **detached** (own session, pidfile + log under the state dir) the first time a repo needs one, and reattaches to live workers on plugin init — **gateway restarts don't kill runs or workers**.
+- One worker per repo checkout; names are `<hostname>-<8-char path hash>` so two worktrees of the same repo (same git origin) stay distinguishable.
+- Routing match is threefold: the worker belongs to the API key's cursor account, the name matches, and the worker's registered repo (its checkout's git origin) matches the target. No match → the create is rejected server-side, no silent fallback to a cursor-hosted VM.
 
 ## Requirements
 
@@ -72,63 +80,27 @@ Verify it registered:
 
 ## Usage
 
-Once loaded, the agent gains a `cursor_edit` tool. In practice you just talk to your agent normally — when a task is coding work, it reaches for `cursor_edit`:
+In practice you just talk to your agent normally — when a task is coding work, it creates a session and dispatches:
 
 > "Add a `subtract(a, b)` function to `calc.py`"
 
-The tool spawns `cursor-agent` in the repo, streams the edit live, and returns the diff.
-
-Programmatic shape of the result:
-
-```json
-{
-  "success": true,
-  "status": "completed",
-  "repo": "/path/to/repo",
-  "summary": "Added subtract(a, b) to calc.py.",
-  "files_changed": [
-    { "path": "calc.py", "added": 4, "removed": 0, "status": "M", "diff": "--- a/calc.py\n+++ b/calc.py\n@@ ..." }
-  ],
-  "files_changed_count": 1,
-  "live_progress": true
-}
+```
+cursor_create_session(repo="/path/to/repo")      → session: brave-lunar-otter
+cursor_send_message("brave-lunar-otter", task)   → runs in background
+  … completion auto-delivers with a summary + files changed + diffs
 ```
 
-## Iterative / multi-turn
-
-Reuse the `session_id` from a result to continue that Cursor session — it keeps full prior context, so follow-ups build on earlier work (matching style, remembering decisions) instead of re-deriving from scratch:
+Follow-ups go to the same name and keep full prior context:
 
 ```
-call 1:  cursor_edit(task="Create calc.py with add(a, b).")
-         → { ..., "session_id": "b5b4dbe1-…", "resumed": false }
-
-call 2:  cursor_edit(task="Now add subtract in the same style.",
-                     session_id="b5b4dbe1-…")
-         → { ..., "session_id": "b5b4dbe1-…", "resumed": true }
+cursor_send_message("brave-lunar-otter", "now add subtract in the same style")
 ```
 
-If the prior session is gone (Cursor restarted, id expired), call 2 transparently starts fresh and reports `resumed: false` — the task still runs, just without the earlier context.
+Because the session is a real cloud agent, it also appears in Cursor's Agents UI (web + mobile) — you can open the same conversation there and watch or continue it.
 
-> Note: this is cross-turn *resume* (continue between calls), not mid-flight steering — you can't inject a nudge into a prompt that's currently running; cancel and re-prompt (with the same `session_id`) for that.
+## Steering a running task
 
-## Interject — steer a running task mid-flight
-
-Cursor has no true mid-prompt queue (a second prompt cancels and replaces the first), so "interject" is built as **stop + auto-resume**: when a `cursor_edit` run is interrupted, its cursor `session_id` is eagerly persisted to a small registry (keyed by the calling session + repo). The **next** `cursor_edit` in the same session/repo — with **no** explicit `session_id` — automatically continues that interrupted cursor session, folding your new instruction in with full prior context.
-
-So the flow is: run a task → interrupt it → send a nudge → it picks up the same cursor session and keeps going. No id-threading required. Guards: auto-resume only fires for a recently interrupted run (≤10 min, cancelled/running) — a cleanly *completed* run is never auto-resumed, so an unrelated next task starts fresh. Passing `session_id` explicitly always overrides. The result reports `auto_resumed: true` when this kicked in.
-
-Honest label: this is *interject/steer*, not seamless queuing — there's a cancel boundary, so work in flight at the moment of interruption is discarded, then continued from the nudge with context intact.
-
-## Background mode — don't block the conversation
-
-By default `cursor_edit` runs synchronously (best for quick edits — you see the diff in the same turn). For longer work, pass **`background: true`**: the tool dispatches a tracked job and returns immediately with a `job_id`, so **the conversation stays free** — you can keep talking to the agent without interrupting (or killing) the running cursor job.
-
-- **`cursor_status(job_id?)`** — a **strictly read-only** progress view: current status, files touched so far with per-edit diffs, latest reasoning, `session_id`, elapsed. Polling it **never cancels** the job (that property is tested, not assumed — it was the exact footgun that killed foreground runs). Omit `job_id` for the most recent job in this session+repo.
-- **Completion delivery** — when the job ends it delivers a message into the session for **every terminal state** (success, failure, cursor error, timeout, cancelled) — never a silent death. The payload carries the full result (`files_changed`, `session_id`, …) so resume/interject still work across the async boundary.
-- **Auto-promote-on-overrun** — a synchronous run that exceeds a soft threshold (default 90s, `plugins.ghost_cursor.promote_after_seconds` in config.yaml, 0 disables) is detached to a background job instead of blocking — belt-and-suspenders for a misjudged sync run.
-- **Same-repo concurrency guard** — a second background run against a repo that already has an active job is rejected (two agents on one working tree = corruption).
-
-Why this matters: a synchronous tool holds the conversation turn open for the whole run, so messaging the agent mid-run triggers an interrupt that cancels the turn — and the cursor work with it. Background mode decouples the run from the turn, so "how's it going?" becomes a safe read instead of a kill.
+Cursor has no true mid-prompt queue — a second prompt cancels and replaces the current one. So sending into a live run is an honest **interrupt + re-prompt with context**: the in-flight step is discarded (the ack says so), and the run continues from your new instruction with everything it already knew. Work already written to the tree survives.
 
 ## Timeouts — inactivity, not wall clock
 
@@ -161,6 +133,11 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 | `cloud_runner.py` | REST+SSE transport — agent create/follow-up, SSE consumption with Last-Event-ID re-attach, watchdogs, native cancel, terminal settle via GET runs/{id} |
 | `workers.py` | Detached "My Machines" worker manager for runtime=local — spawn, readiness, routability |
 | `events.py` | Canonical envelope builders + cloud-event → envelope mapping |
+| `jobs.py` | Background job tracking + completion/digest delivery into the agent loop |
+| `handles.py` | Session-handle persistence (name → agent id, repo, runtime, subscribers) |
+| `eventlog.py` | Per-session JSONL event log |
+| `names.py` | Friendly session-name minting |
+| `render.py` | Plain-text rendering for tool outputs |
 | `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |
 | `plugin.yaml` | Plugin manifest |
 | `test_ghost_cursor_plugin.py` | Tests |
@@ -171,12 +148,12 @@ MIT — see [LICENSE](LICENSE).
 
 ## CI
 
-Two GitHub Actions workflows (`.github/workflows/`):
+Three GitHub Actions workflows (`.github/workflows/`):
 
-- **`unit`** (every push/PR, blocking) — the 110 hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
-- **`e2e`** (scheduled daily + on-demand) — the real deal: **no mocks**. Installs real Hermes and drives the real Cursor REST API, exercising every input shape of the handle interface (`cursor_start` new/resume, `cursor_send`, read-only `cursor_status`, `cursor_stop`, same-repo guard, bogus-handle fallback) against a live cheap model. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic. It's separate from `unit` (not blocking every push) because a real LLM call is occasionally slow/flaky; that's the deliberate cost of "don't mock cursor, don't mock hermes".
+- **`unit`** (every push/PR, blocking) — the hermetic unit tests against real Hermes-core imports. Fast, deterministic, no secrets, no network.
+- **`e2e-test`** / **`e2e-eval`** (**manual dispatch only**) — the real deal: **no mocks**. They install real Hermes and drive the real Cursor REST API end to end (every handle shape, plus an LLM-as-judge quality pass). Every run creates **real cloud agents against the `CURSOR_API_KEY` account** — real usage cost, real sessions in that account's Agents UI — so they never fire automatically. Trigger from the Actions tab (or `gh workflow run e2e-test`) before releases or after transport changes. Assertions are **invariants** ("a `.py` exists / imports / `add(2,3)==5` / status never cancels the run"), never exact diffs — the model is nondeterministic.
 
-Set the repo secret **`CURSOR_API_KEY`** for the e2e job. Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env in `e2e.yml` (default `gpt-5.4-nano` — cheap + fast; verify the slug against `GET /v1/models`). Set the **`GHOST_CURSOR_E2E_REPO`** repository variable to a GitHub repo the CURSOR_API_KEY account's GitHub connection can see (cursor verifies the branch server-side at create; a public repo outside that connection is rejected).
+Set the repo secret **`CURSOR_API_KEY`** for the e2e jobs — the account must have **private workers enabled** (an account can register workers yet still 403 on machine-routed agent creation; that split is the entitlement signature, not a code bug). Pin the CI model via the `GHOST_CURSOR_TEST_MODEL` env (default `gpt-5.4-nano` — cheap + fast; verify the slug against `GET /v1/models`). Set the **`GHOST_CURSOR_E2E_REPO`** repository variable to a GitHub repo the key's GitHub connection can see (cursor verifies the branch server-side at create).
 
 Reproduce the e2e env locally with `Dockerfile.e2e`:
 
