@@ -160,10 +160,12 @@ def _diff_fence(diff: str) -> str:
 # cursor_create_session / cursor_send_message
 # ---------------------------------------------------------------------------
 
-def create_session_ack(name: str, repo: str, model: Optional[str]) -> str:
+def create_session_ack(
+    name: str, repo: str, model: Optional[str], runtime: str = "local"
+) -> str:
     return (
         f"session: {name}\n"
-        f"repo: {repo} · model: {model or 'default'}\n"
+        f"repo: {repo} · model: {model or 'default'} · runtime: {runtime}\n"
         "created. send work with cursor_send_message."
     )
 
@@ -236,14 +238,23 @@ def status_text(
     error: str = "",
     note: str = "",
     last_prompt_seq: Any = 0,
+    runtime: str = "",
+    worker: str = "",
+    agents_ui_url: str = "",
 ) -> str:
     """The read-only status view. NO inline diffs, NO reasoning content."""
     log = log_path or "(none yet)"
     last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
+    runtime_bits = [f"runtime: {runtime}"] if runtime else []
+    if worker:
+        runtime_bits.append(f"worker: {worker}")
+    if agents_ui_url:
+        runtime_bits.append(agents_ui_url)
     lines = [
         f"status: {status}",
         f"session: {name} · elapsed: {secs(elapsed_s)} · "
         f"last activity: {last}",
+        *([" · ".join(runtime_bits)] if runtime_bits else []),
         f"events: {total_events} total · log: {log}",
         since_prompt_line(name, total_events, last_prompt_seq),
         "",
@@ -413,7 +424,7 @@ def completion_text(
     """The terminal-state report (delivered message / in-turn fast finish).
 
     ``retryable`` / ``retry_after`` are the typed error fields mined from a
-    terminal-error run (see sdk_runner) — rendered as a parenthetical on
+    terminal-error run (see cloud_runner) — rendered as a parenthetical on
     the failure line: "run failed: ServerError: … (retryable, retry after
     30s)".
     """
@@ -600,7 +611,9 @@ def no_event_log(name: str) -> str:
 # cursor_list + unknown-session errors
 # ---------------------------------------------------------------------------
 
-_LIST_COLUMNS = ("session", "repo", "status", "elapsed", "files", "last_activity")
+_LIST_COLUMNS = (
+    "session", "repo", "runtime", "status", "elapsed", "files", "last_activity"
+)
 
 
 def list_text(rows: List[Dict[str, str]]) -> str:

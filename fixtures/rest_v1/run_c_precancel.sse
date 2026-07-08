@@ -1,0 +1,12 @@
+event: status
+data: {"runId":"run-0f7c7a03-2ca2-4a88-9de0-a0b593a4cc52","status":"CREATING"}
+
+event: status
+data: {"runId":"run-0f7c7a03-2ca2-4a88-9de0-a0b593a4cc52","status":"RUNNING"}
+
+event: error
+data: {"code":"stream_unavailable","message":"Run stream is no longer available"}
+
+event: done
+data: {}
+

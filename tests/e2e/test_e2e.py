@@ -1,6 +1,6 @@
 """End-to-end tests for ghost_cursor — NO MOCKS.
 
-Runs the real plugin against the real `cursor-sdk` package and the real Hermes
+Runs the real plugin against the real Cursor REST API and the real Hermes
 core modules. Exercises every input shape of the v0.4 named-session interface:
 cursor_create_session (lazy), cursor_send_message (first task + resume),
 cursor_status (read-only), cursor_stop, cursor_events, cursor_list, the
@@ -14,10 +14,16 @@ lines like 'status: completed', never JSON keys.
 
 Requires (skips cleanly if absent):
   - CURSOR_API_KEY in env
-  - `cursor-sdk` installed (pip install cursor-sdk)
+  - `httpx` installed (a hermes dependency)
   - GHOST_CURSOR_E2E=1  (opt-in; keeps the real-network suite off by default)
+  - GHOST_CURSOR_E2E_REPO — a GitHub https URL the runtime can use as the
+    session repo's `origin` remote (cloud agents start from a GitHub repo;
+    a bare `git init` tmp dir can never satisfy the create preflight). In
+    CI this is the plugin repo itself. GHOST_CURSOR_E2E_BRANCH optionally
+    names its default branch (default: main) so the starting ref is real.
+  - the `agent` CLI on PATH (runtime="local" spawns a detached worker)
 
-Model is pinned cheap via GHOST_CURSOR_TEST_MODEL (default gpt-5.4-nano-low) so
+Model is pinned cheap via GHOST_CURSOR_TEST_MODEL (default gpt-5.4-nano) so
 CI stays fast + cheap. Tasks are trivially small so even a weak model nails them.
 """
 import importlib.util
@@ -29,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-CURSOR_MODEL = os.environ.get("GHOST_CURSOR_TEST_MODEL", "gpt-5.4-nano-low")
+CURSOR_MODEL = os.environ.get("GHOST_CURSOR_TEST_MODEL", "gpt-5.4-nano")
 
 # The Hermes test suite's autouse `_hermetic_environment` fixture scrubs
 # API-key env vars (so unit tests can't hit real APIs). This is the opt-in
@@ -39,11 +45,11 @@ _REAL_CURSOR_KEY = os.environ.get("CURSOR_API_KEY")
 
 _run = os.environ.get("GHOST_CURSOR_E2E") == "1"
 _have_key = bool(_REAL_CURSOR_KEY)
-_have_sdk = importlib.util.find_spec("cursor_sdk") is not None
+_have_http = importlib.util.find_spec("httpx") is not None
 
 pytestmark = pytest.mark.skipif(
-    not (_run and _have_key and _have_sdk),
-    reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and pip install cursor-sdk",
+    not (_run and _have_key and _have_http),
+    reason="e2e opt-in: set GHOST_CURSOR_E2E=1, CURSOR_API_KEY, and pip install httpx",
 )
 
 TERMINAL = ("completed", "failed", "cancelled", "timeout")
@@ -113,10 +119,29 @@ def gc(monkeypatch, tmp_path, request):
     return mod
 
 
+_E2E_REPO = os.environ.get("GHOST_CURSOR_E2E_REPO", "")
+_E2E_BRANCH = os.environ.get("GHOST_CURSOR_E2E_BRANCH", "main")
+
+
 def _repo(tmp_path):
+    """A local checkout the cloud runtime accepts: a git repo with a real
+    GitHub `origin` remote and a commit on a named branch (the create
+    preflight derives repo url + starting ref from exactly these)."""
+    if not _E2E_REPO:
+        pytest.skip(
+            "GHOST_CURSOR_E2E_REPO unset — the cloud runtime requires a "
+            "GitHub origin remote; point it at a small real repo"
+        )
     d = tmp_path / "repo"
     d.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=d, check=True)
+    git = ["git", "-c", "user.email=e2e@ghost-cursor", "-c", "user.name=ghost-e2e"]
+    subprocess.run([*git, "init", "-q", "-b", _E2E_BRANCH], cwd=d, check=True)
+    subprocess.run([*git, "remote", "add", "origin", _E2E_REPO], cwd=d, check=True)
+    # An initial commit so HEAD resolves to a branch (detached/unborn HEAD
+    # fails the preflight).
+    (d / ".gitkeep").write_text("")
+    subprocess.run([*git, "add", "."], cwd=d, check=True)
+    subprocess.run([*git, "commit", "-q", "-m", "e2e seed"], cwd=d, check=True)
     return str(d)
 
 

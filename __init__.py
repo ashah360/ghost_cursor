@@ -33,14 +33,15 @@ Handle model (v0.4)
 -------------------
 THE handle is the session name minted by ``cursor_create_session``
 (collision-checked against the persistent handle table, ``names.py``). The
-cursor-sdk AGENT ID (``agent-<uuid>``) is recorded on the handle entry as an
+cloud AGENT ID (``bc-...``) is recorded on the handle entry as an
 alias (``handles.resolve``), so ids from older runs / completion payloads
 still resolve everywhere a name is accepted. The handle table
-(``handles.py``) persists name → repo/status/model/cursor_session_id (the
-agent id) across restarts — ``Agent.resume(agent_id)`` continues the
-conversation even across a plugin/gateway restart; the in-process job table
-(``jobs.py``) keys live state by name; the JSONL event log (``eventlog.py``)
-is also keyed by name, so one named session = one log across resumes.
+(``handles.py``) persists name → repo/status/model/runtime/
+cursor_session_id (the agent id) across restarts — a follow-up run on the
+persisted agent id continues the conversation even across a plugin/gateway
+restart; the in-process job table (``jobs.py``) keys live state by name;
+the JSONL event log (``eventlog.py``) is also keyed by name, so one named
+session = one log across resumes.
 
 Output contract (v0.4)
 ----------------------
@@ -62,25 +63,28 @@ result and the duplicate delivery is suppressed (``CursorJob.mark_handled``).
 
 Timeouts are INACTIVITY-based (``inactivity_timeout_s``: silence kills,
 activity resets the clock) with an optional ``max_wall_s`` hard ceiling —
-see ``sdk_runner``. Model override precedence: explicit param >
-``plugins.ghost_cursor.model`` in config.yaml > the plugin default,
-threaded as ``model=`` on ``Agent.create``.
+see ``cloud_runner``. Model override precedence: explicit param >
+``plugins.ghost_cursor.model`` in config.yaml > the plugin default.
 
-Transport (v0.5): the official ``cursor-sdk`` python package. One bridge
-sidecar per workspace (reused across sessions on the same repo, closed at
-process exit), agents resumed by persisted agent_id, event streams
-re-attached transparently via ``run.observe(after_offset=...)`` when a
-connection drops mid-run. Auth: the ``CURSOR_API_KEY`` env var.
+Transport (v0.6): Cursor's REST v1 API + SSE event streams
+(``rest_client.py`` / ``cloud_runner.py``) — no sdk, no bridge sidecar.
+Every session is a CLOUD agent; ``runtime="local"`` (the default) routes
+it to a plugin-managed "My Machines" worker on this box (``workers.py``)
+so tool calls execute in the local checkout, ``runtime="cloud"`` uses a
+cursor-hosted VM. Follow-ups are stateless REST runs on the persisted
+``bc-...`` agent id, so sessions survive process restarts with no resume
+handshake; dropped streams reconnect with ``Last-Event-ID``. Auth: the
+``CURSOR_API_KEY`` env var.
 """
 
 from __future__ import annotations
 
-import atexit
 import logging
 import os
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from . import cloud_runner as _cloud
 from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
@@ -89,7 +93,6 @@ from . import names as _names
 from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
-from . import sdk_runner as _sdk
 
 logger = logging.getLogger(__name__)
 
@@ -112,21 +115,20 @@ REPO_ENV_VAR = "THRESHOLD_WORKSPACE_REPO"
 _RESULT_DIFF_CHARS = 20_000
 
 # How long dispatching tools block waiting for the cursor agent to be
-# established. Bounded by the sdk_runner bridge-launch + create/resume
-# retry budget plus slack; a healthy run yields it in seconds.
+# established. Covers worker spawn (~20s ready wait) + the create POST
+# (observed >30s live) plus slack; a healthy run yields it in seconds.
 _HANDLE_WAIT_S = 150.0
 
 # How long cursor_send_message's interrupt path waits for a cancelled run
-# to settle before refusing to re-prompt. Native run.cancel() resolves
-# ~immediately; the ceiling covers the sdk_runner CANCEL_GRACE_S escalation.
+# to settle before refusing to re-prompt. The REST cancel resolves
+# ~immediately; the ceiling covers the cloud_runner CANCEL_GRACE_S drain.
 _INTERRUPT_WAIT_S = 40.0
 
 # How long cursor_stop waits for OBSERVED termination after signalling
-# cancel (issue #22). Matches sdk_runner.CANCEL_GRACE_S: a landed
-# run.cancel() settles the job well within this; a job still live at the
-# deadline most likely lost the signal (bridge RPC dropped / run between
-# attempts), and cursor_stop must say so instead of acking "stopped".
-# Module-level so tests can shrink it.
+# cancel (issue #22). Matches cloud_runner.CANCEL_GRACE_S: a landed REST
+# cancel settles the job well within this; a job still live at the
+# deadline most likely lost the signal, and cursor_stop must say so
+# instead of acking "stopped". Module-level so tests can shrink it.
 _STOP_WAIT_S = 15.0
 
 _SESSION_DOC = (
@@ -168,7 +170,7 @@ CURSOR_CREATE_SCHEMA = {
     "description": (
         "Create a named Cursor session for delegating coding work into a "
         "repository. Returns a session name handle (e.g. "
-        "'playful-space-bunny') and dispatches NOTHING — the cursor agent "
+        "'playful-space-bunny') and dispatches NOTHING — the cloud agent "
         "spawns lazily on the first cursor_send_message. Use this, then "
         "send the task as a message. Only one run may be active per repo "
         "at a time (different repos proceed in parallel)."
@@ -179,8 +181,10 @@ CURSOR_CREATE_SCHEMA = {
             "repo": {
                 "type": "string",
                 "description": (
-                    "Absolute path to the repository to work in. Optional — "
-                    "defaults to the configured workspace repo."
+                    "Absolute path to the repository to work in (must be a "
+                    "GitHub-backed checkout). Optional — defaults to the "
+                    "configured workspace repo. runtime='cloud' also "
+                    "accepts a github.com URL."
                 ),
             },
             "model": {
@@ -192,6 +196,17 @@ CURSOR_CREATE_SCHEMA = {
                     "strings are rejected here; whether a well-formed id "
                     "exists in the model catalog is validated on the "
                     "first cursor_send_message (create stays lazy)."
+                ),
+            },
+            "runtime": {
+                "type": "string",
+                "enum": ["local", "cloud"],
+                "description": (
+                    "Where the agent executes. 'local' (default): a cloud "
+                    "agent routed to a managed worker on this machine — "
+                    "tool calls run in the local checkout, chat syncs to "
+                    "cursor.com/agents. 'cloud': a cursor-hosted VM "
+                    "working on a GitHub clone."
                 ),
             },
         },
@@ -423,14 +438,14 @@ def _default_repo() -> Optional[str]:
 
 
 def check_cursor_available() -> bool:
-    """Tool gate: cursor-sdk importable + a workspace repo resolvable.
+    """Tool gate: the http layer importable + a workspace repo resolvable.
 
     Deliberately does NOT gate on CURSOR_API_KEY: a missing key surfaces as
     an actionable error on the first send instead of silently hiding the
     toolset.
     """
     try:
-        return _sdk.sdk_available() and _default_repo() is not None
+        return _cloud.rest_available() and _default_repo() is not None
     except Exception:
         return False
 
@@ -492,7 +507,7 @@ def _resolve_inactivity_timeout(explicit: Optional[float]) -> float:
     return (
         configured
         if configured is not None
-        else _sdk.DEFAULT_INACTIVITY_TIMEOUT_S
+        else _cloud.DEFAULT_INACTIVITY_TIMEOUT_S
     )
 
 
@@ -503,7 +518,7 @@ def _resolve_max_wall(explicit: Optional[float]) -> float:
     if explicit is not None:
         return float(explicit)
     configured = _configured_timeout("max_wall_s")
-    return configured if configured is not None else _sdk.DEFAULT_MAX_WALL_S
+    return configured if configured is not None else _cloud.DEFAULT_MAX_WALL_S
 
 
 # ---------------------------------------------------------------------------
@@ -692,18 +707,20 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                 job.segment_open = False
 
 
-# Transparent zero-progress auto-retry. Live incident (2026-07-04): runs
-# dispatched through a stale, hours-old cursor-sdk-bridge sidecar reached
-# terminal "error" within seconds having produced ZERO meaningful events,
-# while fresh bridges worked — killing the stale bridges fixed everything.
-# A run matching that signature (terminal error + no progress since the
-# prompt + retryable-or-unknown) is re-sent on the SAME agent up to
-# _MAX_AUTO_RETRIES times with backoff, recycling the workspace bridge
-# before the first retry. Nothing user-facing: the job stays "running"
-# (digest numbering/subscription continue) and only jsonl lifecycle events
-# ("sdk.autoretry") record it. A run WITH progress, a non-retryable error,
-# or an exhausted budget surfaces the detailed failure instead — delivered
-# immediately through the normal failure path.
+# Transparent zero-progress auto-retry. Born from a bridge-era live
+# incident (2026-07-04: stale sidecars produced instant terminal errors
+# with zero events) and kept for the REST transport because the signature
+# is transport-agnostic: a run that reaches terminal "error" within
+# seconds having produced ZERO meaningful events is a transient dispatch
+# failure, not a model failure. Such a run (terminal error + no progress
+# since the prompt + retryable-or-unknown) is re-sent on the SAME agent up
+# to _MAX_AUTO_RETRIES times with backoff. Nothing user-facing: the job
+# stays "running" (digest numbering/subscription continue) and only jsonl
+# lifecycle events ("cloud.autoretry") record it. A run WITH progress, a
+# non-retryable error, or an exhausted budget surfaces the detailed
+# failure instead — delivered immediately through the normal failure path.
+# NOTE: the unroutable-worker error is deliberately marked non-retryable
+# (cloud_runner sets retryable=False) — re-prompting can't fix routing.
 _MAX_AUTO_RETRIES = 2
 # Backoff ladder before retry N (1-based); a parseable server retry_after
 # on the error overrides the step. Module-level so tests can zero it.
@@ -758,19 +775,19 @@ def _run_attempt(
     workdir: str,
     first_event_timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
-    """One run_sdk pass for ``job``: stream, fold, persist the handle.
+    """One run_cloud pass for ``job``: stream, fold, persist the handle.
 
-    ``first_event_timeout_s`` (retry attempts only) arms sdk_runner's tight
-    first-event watchdog so a zero-event retry settles failed within the
-    window instead of riding the user's inactivity timeout.
+    ``first_event_timeout_s`` (retry attempts only) arms cloud_runner's
+    tight first-event watchdog so a zero-event retry settles failed within
+    the window instead of riding the user's inactivity timeout.
 
     Returns the attempt state the auto-retry decision needs:
 
     * ``preflight`` — a final result dict when the run never happened
-      (bridge/auth/repo preflight failure); the caller returns it as-is.
+      (api-key/worker/repo preflight failure); the caller returns it as-is.
     * ``terminal_error`` (+ ``retryable`` / ``retry_after``) — True when
-      the run settled with SDK status "error" (the enriched ``sdk.error``
-      payload, see sdk_runner).
+      the run settled with status "error" (the enriched ``cloud.error``
+      payload, see cloud_runner).
 
     Progress evidence is NOT attempt state: it accumulates on the job via
     :func:`_fold_envelope` (see :func:`_made_progress`).
@@ -783,16 +800,18 @@ def _run_attempt(
     }
     normalizer = _events.SdkNormalizer()
     try:
-        for key, obj in _sdk.run_sdk(
+        for key, obj in _cloud.run_cloud(
             job.task,
             workdir,
             inactivity_timeout_s=float(job.inactivity_timeout_s),
             max_wall_s=float(job.max_wall_s),
             cancel_check=job.cancel_event.is_set,
             # A retry re-sends on the SAME agent established by the first
-            # attempt (its state survives the bridge recycle on disk).
+            # attempt (agent state lives server-side, nothing to recycle).
             agent_id=job.cursor_session_id or job.requested_session_id,
             model=job.requested_model,
+            runtime=job.runtime,
+            session_title=job.session_name or None,
             # Kwarg only when armed: fakes/replays without the param keep
             # working for ordinary (non-retry) dispatches.
             **(
@@ -802,12 +821,14 @@ def _run_attempt(
             ),
         ):
             job.last_event_at = time.time()
-            if key == "sdk.session":
+            if key == "cloud.session":
                 sid = str(obj.get("agentId") or "")
                 with job._lock:
                     job.cursor_session_id = sid
                     job.resumed = bool(obj.get("resumed"))
                     job.model = str(obj.get("model") or "")
+                    job.worker = str(obj.get("worker") or "")
+                    job.agents_ui_url = str(obj.get("agents_ui_url") or "")
                 # Persist the handle the moment the agent exists — keyed by
                 # the session NAME, with the agent id as an alias.
                 _handles.record(
@@ -818,17 +839,23 @@ def _run_attempt(
                     model=job.model or job.requested_model,
                     session_key=job.session_key,
                     cursor_session_id=sid,
+                    runtime=str(obj.get("runtime") or job.runtime),
+                    worker=str(obj.get("worker") or "") or None,
+                    agents_ui_url=str(obj.get("agents_ui_url") or "") or None,
+                    repo_url=str(obj.get("repo_url") or "") or None,
+                    starting_ref=str(obj.get("starting_ref") or "") or None,
+                    latest_run_id=str(obj.get("run_id") or "") or None,
                 )
                 job.session_event.set()
-            elif key == "sdk.error" and obj.get("run_status") == "error":
+            elif key == "cloud.error" and obj.get("run_status") == "error":
                 state["terminal_error"] = True
                 state["retryable"] = obj.get("retryable")
                 state["retry_after"] = obj.get("retry_after")
             for envelope in normalizer.normalize(key, obj):
                 _fold_envelope(job, envelope)
-    except _sdk.SdkRunnerError as exc:
-        # Hard SDK failure (bridge/create/auth) — actionable error, no
-        # silent regress.
+    except _cloud.CloudRunnerError as exc:
+        # Hard preflight failure (api key/worker/create/auth) — actionable
+        # error, no silent regress.
         state["preflight"] = {"success": False, "error": str(exc)}
     except _runner.HarnessError as exc:
         state["preflight"] = {"success": False, "error": str(exc)}
@@ -840,15 +867,15 @@ def _run_attempt(
 
 
 def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
-    """Run cursor for ``job`` (via the cursor-sdk) and build the final result.
+    """Run cursor for ``job`` (as a cloud agent) and build the final result.
 
     Runs on the job worker thread. Cancellation is the job's cancel event
-    (set by cursor_stop / cursor_send_message), which triggers the native
-    ``run.cancel()``. The cursor agent id is persisted onto the session's
-    handle entry (as the alias) the instant the agent exists, so
-    ``Agent.resume`` keeps working across process restarts. Zero-progress
+    (set by cursor_stop / cursor_send_message), which triggers the REST
+    ``cancel`` on the run. The cloud agent id is persisted onto the
+    session's handle entry (as the alias) the instant the agent exists, so
+    follow-up runs keep working across process restarts. Zero-progress
     terminal errors are transparently retried on the same agent (see
-    _MAX_AUTO_RETRIES above) with a bridge recycle before the first retry.
+    _MAX_AUTO_RETRIES above).
     """
     started = time.monotonic()
     workdir = job.repo
@@ -856,7 +883,7 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
     # Pre-run git snapshot: fuels the fallback that populates files_changed
     # when cursor edits through paths that emit no parseable diff content
     # in the stream (e.g. shell commands; tool payloads are unstable).
-    git_before = _sdk.git_status_snapshot(workdir)
+    git_before = _cloud.git_status_snapshot(workdir)
 
     attempt = 0  # auto-retries used so far
     while True:
@@ -883,15 +910,6 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
         ):
             break
         attempt += 1
-        # The stale-bridge lever (see the incident note above): recycle the
-        # workspace bridge before EVERY retry, not just the first. The
-        # @cursor/sdk bridge exchanges the API key for a ~1h access token
-        # exactly once per process and caches it in a closure with no
-        # refresh and no re-exchange on 401 — and a FAILED exchange is
-        # cached too, permanently poisoning the process (read from vendored
-        # sdk 1.0.23 source, 2026-07-08). A fresh bridge process is the
-        # only reliable way to force a fresh token exchange.
-        bridge_recycled = _sdk.recycle_bridge(workdir)
         with job._lock:
             reason = (
                 "zero-progress terminal error: "
@@ -899,14 +917,13 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
             )
         # Log-only signal (jsonl + rolling buffer) — nothing user-facing.
         _fold_envelope(job, _events.lifecycle(
-            "sdk.autoretry",
+            "cloud.autoretry",
             attempt=attempt,
             reason=reason,
-            bridge_recycled=bool(bridge_recycled),
         ))
         logger.warning(
-            "ghost_cursor auto-retry %d/%d for job %s (%s; bridge_recycled=%s)",
-            attempt, _MAX_AUTO_RETRIES, job.job_id, reason, bridge_recycled,
+            "ghost_cursor auto-retry %d/%d for job %s (%s)",
+            attempt, _MAX_AUTO_RETRIES, job.job_id, reason,
         )
         if job.cancel_event.wait(_auto_retry_delay_s(state, attempt)):
             break  # cancelled during backoff — settle with what we have
@@ -922,7 +939,7 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
     try:
         with job._lock:
             known_paths = set(job.files)
-        for fb in _sdk.git_fallback_diffs(workdir, git_before):
+        for fb in _cloud.git_fallback_diffs(workdir, git_before):
             if fb["path"] not in known_paths:
                 _fold_envelope(job, _events.file_diff(**fb))
     except Exception:
@@ -982,6 +999,7 @@ def _dispatch_run(
     model: Optional[str],
     inactivity_timeout_s: float,
     max_wall_s: float,
+    runtime: str = "local",
 ) -> Dict[str, Any]:
     """Dispatch a run and block only until the handle exists.
 
@@ -1000,6 +1018,7 @@ def _dispatch_run(
         session_key=_resolve_session_key(),
         requested_session_id=(str(session_id).strip() or None) if session_id else None,
         requested_model=model,
+        runtime=runtime,
     )
     if job is None:
         # Same-repo concurrency guard: two cursor agents on one working tree
@@ -1036,8 +1055,8 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
         return {**_jobs.trim_result(job.result), "status": job.status}
 
     if not job.session_event.is_set():
-        # No agent and not terminal — the bridge is wedged pre-create.
-        # Cancel it (the worker's kill path takes over) and report.
+        # No agent and not terminal — the create/worker path is wedged.
+        # Cancel it (the runner's teardown takes over) and report.
         job.request_cancel()
         return {
             "success": False,
@@ -1081,7 +1100,7 @@ def _await_handle(job: "_jobs.CursorJob") -> Dict[str, Any]:
 
 
 def _settle_job(job: "_jobs.CursorJob", wait_s: float = _INTERRUPT_WAIT_S) -> bool:
-    """Cancel ``job`` (native run.cancel()) and wait for it to settle.
+    """Cancel ``job`` (REST cancel on the run) and wait for it to settle.
 
     Delivery is suppressed first (mark_handled) because the caller reports
     the outcome in its own tool result. Returns True when the job reached a
@@ -1106,6 +1125,17 @@ def _send_to_session(
     error shapes) with ``interrupted_previous_prompt`` set when a live
     prompt was cancelled first.
     """
+    runtime = _handles.runtime_of(entry)
+    if runtime == "legacy":
+        return {
+            "success": False,
+            "status": "failed",
+            "error": (
+                f"session '{name}' is a legacy bridge-era session — its "
+                "agent id cannot be continued over the cloud transport. "
+                f"Create a fresh session with {CREATE_TOOL_NAME}."
+            ),
+        }
     repo = str(entry.get("repo") or "")
     if not repo:
         return {
@@ -1113,7 +1143,9 @@ def _send_to_session(
             "status": "failed",
             "error": f"session '{name}' has no repo recorded",
         }
-    if not os.path.isdir(repo):
+    # runtime=cloud sessions may record a github URL as their repo — no
+    # local checkout to verify. Local paths must still exist.
+    if _cloud.normalize_github_url(repo) is None and not os.path.isdir(repo):
         return {
             "success": False,
             "status": "failed",
@@ -1173,12 +1205,13 @@ def _send_to_session(
         model=_resolve_model(entry.get("model")),
         inactivity_timeout_s=_resolve_inactivity_timeout(inactivity_timeout_s),
         max_wall_s=_resolve_max_wall(max_wall_s),
+        runtime=runtime,
     )
     result.setdefault("session", name)
     # Model validation is deferred to this first send (create is lazy by
     # design) — so when the agent-create failure hits and this session
     # carries an explicit model, attribute the failure to the param chosen
-    # at create instead of leaving a generic sdk error (issue #12).
+    # at create instead of leaving a generic api error (issue #12).
     explicit_model = str(entry.get("model") or "")
     if explicit_model and "agent create failed" in str(result.get("error") or ""):
         result["error"] = (
@@ -1210,6 +1243,7 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
     for entry in _handles.entries(scope=scope, session_key=_resolve_session_key()):
         name = str(entry.get("session") or "")
         job = _live_job(name, entry)
+        runtime = _handles.runtime_of(entry)
         if job is not None and job.status == "running":
             with job._lock:
                 files = len(job.files)
@@ -1217,6 +1251,9 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
             rows.append({
                 "session": name,
                 "repo": job.repo,
+                "runtime": (
+                    f"{runtime}:{job.worker}" if job.worker else runtime
+                ),
                 "status": "running",
                 "elapsed": _render.secs(now - job.created_at),
                 "files": str(files),
@@ -1230,9 +1267,11 @@ def _list_rows(scope: str = "session") -> List[Dict[str, str]]:
         status_note = str(entry.get("status_note") or "")
         duration = entry.get("duration_s")
         files_count = entry.get("files_changed_count")
+        worker = str(entry.get("worker") or "")
         rows.append({
             "session": name,
             "repo": str(entry.get("repo") or "—"),
+            "runtime": f"{runtime}:{worker}" if worker else runtime,
             "status": f"{status} ({status_note})" if status_note else status,
             "elapsed": _render.secs(duration) if duration is not None else "—",
             "files": str(files_count) if files_count is not None else "—",
@@ -1252,28 +1291,53 @@ def _unknown_session_text(identifier: str) -> str:
 def cursor_create_session(
     repo: Optional[str] = None,
     model: Optional[str] = None,
+    runtime: Optional[str] = None,
     **_kwargs: Any,
 ) -> str:
     """Mint a named session handle. LAZY — no cursor agent is created;
-    the agent starts on the first cursor_send_message."""
+    the agent starts on the first cursor_send_message.
+
+    ``runtime="local"`` (default) needs a GitHub-backed local checkout
+    (validated here — clear error adjacent to the param, no network
+    contact); ``runtime="cloud"`` also accepts a github.com URL directly.
+    """
+    chosen_runtime = (str(runtime).strip() or "local") if runtime else "local"
+    if chosen_runtime not in _cloud.VALID_RUNTIMES:
+        return (
+            f"cannot create session: unknown runtime {chosen_runtime!r} — "
+            f"valid: {', '.join(_cloud.VALID_RUNTIMES)}"
+        )
+
     target_repo = (repo or "").strip() or _default_repo()
     if not target_repo:
         return (
             "no workspace repo resolvable — pass `repo` or set "
             f"{REPO_ENV_VAR}."
         )
-    try:
-        workdir = _runner.resolve_repo(target_repo)
-    except _runner.HarnessError as exc:
-        return f"cannot create session: {exc}"
+    if chosen_runtime == "cloud" and _cloud.normalize_github_url(target_repo):
+        # A github URL directly — no local checkout involved.
+        workdir_str = _cloud.normalize_github_url(target_repo)
+    else:
+        try:
+            workdir = _runner.resolve_repo(target_repo)
+        except _runner.HarnessError as exc:
+            return f"cannot create session: {exc}"
+        workdir_str = str(workdir)
+        try:
+            # Eager git introspection (local checkouts): a repo without a
+            # github origin (or on a detached HEAD) can never dispatch, so
+            # fail HERE, adjacent to the params — pure `git -C`, no network.
+            _cloud.derive_repo_ref(workdir_str)
+        except _cloud.CloudRunnerError as exc:
+            return f"cannot create session: {exc}"
 
     explicit_model = (str(model).strip() or None) if model else None
     if explicit_model:
-        # Shape-only check (issue #12) — create stays lazy (no sdk
+        # Shape-only check (issue #12) — create stays lazy (no API
         # contact), so obviously-malformed strings fail HERE, adjacent to
         # the param; whether a well-formed id actually exists in the
         # catalog is still validated on the first send.
-        reason = _sdk.invalid_model_reason(explicit_model)
+        reason = _cloud.invalid_model_reason(explicit_model)
         if reason:
             return (
                 f"cannot create session: {reason}. Pass a base model id "
@@ -1286,13 +1350,14 @@ def cursor_create_session(
     )
     _handles.record(
         name,
-        repo=str(workdir),
+        repo=workdir_str,
         status="created",
         model=explicit_model,
+        runtime=chosen_runtime,
         session_key=_resolve_session_key(),
     )
     return _render.create_session_ack(
-        name, str(workdir), _resolve_model(explicit_model)
+        name, workdir_str, _resolve_model(explicit_model), chosen_runtime
     )
 
 
@@ -1414,6 +1479,13 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             summary=str(snap.get("summary_so_far") or "") if terminal else "",
             error=str(result.get("error") or ""),
             last_prompt_seq=_handles.last_prompt_seq(entry),
+            runtime=str(snap.get("runtime") or _handles.runtime_of(entry)),
+            worker=str(snap.get("worker") or ""),
+            agents_ui_url=str(
+                snap.get("agents_ui_url")
+                or (entry or {}).get("agents_ui_url")
+                or ""
+            ),
         )
 
     if entry is not None:
@@ -1441,6 +1513,9 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
                 "record. cursor_send_message continues the session."
             ),
             last_prompt_seq=_handles.last_prompt_seq(entry),
+            runtime=_handles.runtime_of(entry),
+            worker=str(entry.get("worker") or ""),
+            agents_ui_url=str(entry.get("agents_ui_url") or ""),
         )
 
     return _render.unknown_session(ident, _list_rows(scope))
@@ -1449,9 +1524,9 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
 def cursor_stop(session: str, **_kwargs: Any) -> str:
     """Stop a session's run gracefully; report final status + partial work.
 
-    Graceful path: the SDK's native ``run.cancel()`` (the run resolves
-    with status "cancelled" ~immediately); the bridge owns the run, so
-    there is no process to kill on our side. Idempotent on finished runs.
+    Graceful path: the REST ``cancel`` on the run (it resolves with status
+    "cancelled" ~immediately); the run lives server-side, so there is no
+    process to kill on our side. Idempotent on finished runs.
     """
     ident = str(session or "").strip()
     if not ident:
@@ -1488,12 +1563,12 @@ def cursor_stop(session: str, **_kwargs: Any) -> str:
     settled = _settle_job(job, wait_s=_STOP_WAIT_S)
     if not settled and job.arm_delivery():
         # No terminal state was OBSERVED inside the window — the cancel
-        # signal may have been lost (issue #22: the bridge owns the run;
-        # our native run.cancel() is best-effort and there is no local
-        # process to kill). Never claim "stopped" or persist a terminal
-        # status on faith: the job stays running, the cancel event stays
-        # signalled, and delivery is re-armed so the real outcome still
-        # reaches the conversation whenever the run does settle.
+        # signal may have been lost (issue #22: the run lives server-side;
+        # our REST cancel is best-effort and there is no local process to
+        # kill). Never claim "stopped" or persist a terminal status on
+        # faith: the job stays running, the cancel event stays signalled,
+        # and delivery is re-armed so the real outcome still reaches the
+        # conversation whenever the run does settle.
         return (
             f"cancel signalled, but the run in session '{name}' has not "
             f"stopped within {int(_STOP_WAIT_S)}s — it is still executing. "
@@ -1588,6 +1663,7 @@ def _handle_cursor_create_session(args: Dict[str, Any], **kwargs: Any) -> str:
     return cursor_create_session(
         repo=args.get("repo"),
         model=args.get("model"),
+        runtime=args.get("runtime"),
     )
 
 
@@ -1635,11 +1711,9 @@ def _handle_cursor_subscribe(args: Dict[str, Any], **kwargs: Any) -> str:
 def register(ctx) -> None:
     """Register the 7 cursor tools. Called once by the plugin loader.
 
-    Also arranges clean bridge shutdown: the plugin loader has no unload
-    hook, so the per-workspace cursor-sdk bridge sidecars are closed at
-    process exit.
+    Nothing to arrange at process exit: workers are DETACHED by design
+    (they survive restarts and are reused), and runs live server-side.
     """
-    atexit.register(_sdk.shutdown_bridges)
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),

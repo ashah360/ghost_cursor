@@ -16,7 +16,6 @@ Requires (skips cleanly otherwise):
   - HERMES_API_BASE   (e.g. http://127.0.0.1:8650) — a running api_server
   - HERMES_API_KEY    (its bearer key)
   - CURSOR_API_KEY, OPENAI_API_KEY set on that server's env
-  - cursor-sdk installed on that server
 
 Model pinned cheap via GHOST_CURSOR_AGENT_MODEL (informational; the server's
 configured model is what actually runs).

@@ -1,0 +1,719 @@
+event: status
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"CREATING"}
+
+event: heartbeat
+data: {}
+
+event: heartbeat
+data: {}
+
+event: status
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"RUNNING"}
+
+id: 1783535928567-0
+event: interaction_update
+data: {"type":"step-started","stepId":0}
+
+id: 1783535928768-0
+event: interaction_update
+data: {"type":"user-message-appended","userMessage":{"type":"user_message","session_id":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","text":"Do these steps one at a time using terminal and file tools: 1) run `hostname`; 2) run `ls -la`; 3) read README.md if it exists; 4) search the repo for the string 'smoke'; 5) run `git status`; 6) reply with a one-line summary. Do NOT commit, push, or open a PR."}}
+
+id: 1783535931366-0
+event: thinking
+data: {"text":"Beginning the six-step"}
+
+id: 1783535931366-0
+event: interaction_update
+data: {"type":"thinking-delta","text":"Beginning the six-step"}
+
+id: 1783535931369-0
+event: interaction_update
+data: {"type":"token-delta","tokens":5}
+
+id: 1783535931372-0
+event: thinking
+data: {"text":" terminal and file operations."}
+
+id: 1783535931372-0
+event: interaction_update
+data: {"type":"thinking-delta","text":" terminal and file operations."}
+
+id: 1783535931375-0
+event: interaction_update
+data: {"type":"token-delta","tokens":8}
+
+id: 1783535931380-0
+event: interaction_update
+data: {"type":"thinking-completed","thinkingDurationMs":16}
+
+id: 1783535931384-0
+event: assistant
+data: {"text":"Running"}
+
+id: 1783535931384-0
+event: interaction_update
+data: {"type":"text-delta","text":"Running"}
+
+id: 1783535931386-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931389-0
+event: assistant
+data: {"text":" the"}
+
+id: 1783535931389-0
+event: interaction_update
+data: {"type":"text-delta","text":" the"}
+
+id: 1783535931392-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931396-0
+event: assistant
+data: {"text":" steps"}
+
+id: 1783535931396-0
+event: interaction_update
+data: {"type":"text-delta","text":" steps"}
+
+id: 1783535931399-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535931470-0
+event: assistant
+data: {"text":" one"}
+
+id: 1783535931470-0
+event: interaction_update
+data: {"type":"text-delta","text":" one"}
+
+id: 1783535931473-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931476-0
+event: assistant
+data: {"text":" at"}
+
+id: 1783535931476-0
+event: interaction_update
+data: {"type":"text-delta","text":" at"}
+
+id: 1783535931479-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931482-0
+event: assistant
+data: {"text":" a"}
+
+id: 1783535931482-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1783535931486-0
+event: assistant
+data: {"text":" time"}
+
+id: 1783535931486-0
+event: interaction_update
+data: {"type":"text-delta","text":" time"}
+
+id: 1783535931489-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931492-0
+event: assistant
+data: {"text":","}
+
+id: 1783535931492-0
+event: interaction_update
+data: {"type":"text-delta","text":","}
+
+id: 1783535931496-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931500-0
+event: assistant
+data: {"text":" starting"}
+
+id: 1783535931500-0
+event: interaction_update
+data: {"type":"text-delta","text":" starting"}
+
+id: 1783535931502-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535931505-0
+event: assistant
+data: {"text":" with"}
+
+id: 1783535931505-0
+event: interaction_update
+data: {"type":"text-delta","text":" with"}
+
+id: 1783535931509-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931512-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535931512-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535931515-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535931522-0
+event: assistant
+data: {"text":"hostname"}
+
+id: 1783535931522-0
+event: interaction_update
+data: {"type":"text-delta","text":"hostname"}
+
+id: 1783535931525-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535931529-0
+event: assistant
+data: {"text":"`.\n"}
+
+id: 1783535931529-0
+event: interaction_update
+data: {"type":"text-delta","text":"`.\n"}
+
+id: 1783535931550-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1783535931577-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535931580-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1783535931600-0
+event: interaction_update
+data: {"type":"token-delta","tokens":6}
+
+id: 1783535931978-0
+event: tool_call
+data: {"callId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","name":"run_terminal_cmd","status":"running","args":{"command":"hostname","timeout":600000,"toolCallId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","simpleCommands":["hostname"],"parsingResult":{"executableCommands":[{"name":"hostname","fullText":"hostname"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Run hostname command","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"}}
+
+id: 1783535931978-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","toolCall":{"type":"shell","args":{"command":"hostname","timeout":600000}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-1-av77"}
+
+id: 1783535932428-0
+event: tool_call
+data: {"callId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","name":"run_terminal_cmd","status":"completed","args":{"command":"hostname","timeout":600000,"toolCallId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","simpleCommands":["hostname"],"parsingResult":{"executableCommands":[{"name":"hostname","fullText":"hostname"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Run hostname command","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"},"result":{"success":{"command":"hostname","stdout":"mac\n","executionTime":450,"interleavedOutput":"mac\n","localExecutionTimeMs":258},"isBackground":false}}
+
+id: 1783535932428-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_76a8e5d4-bd6b-47d0-9163-5b619c5d151","toolCall":{"type":"shell","args":{"command":"hostname","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"mac\n","stderr":"","executionTime":450}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-1-av77"}
+
+id: 1783535932433-0
+event: interaction_update
+data: {"type":"token-delta","tokens":33}
+
+id: 1783535932714-0
+event: interaction_update
+data: {"type":"step-completed","stepId":0,"stepDurationMs":4147}
+
+id: 1783535936704-0
+event: interaction_update
+data: {"type":"step-started","stepId":40}
+
+id: 1783535937958-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1783535937963-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535937975-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1783535937995-0
+event: interaction_update
+data: {"type":"token-delta","tokens":10}
+
+id: 1783535938456-0
+event: tool_call
+data: {"callId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","name":"run_terminal_cmd","status":"running","args":{"command":"ls -la","timeout":600000,"toolCallId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","simpleCommands":["ls"],"parsingResult":{"executableCommands":[{"name":"ls","args":[{"type":"word","value":"-la"}],"fullText":"ls -la"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"List directory contents with details","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"}}
+
+id: 1783535938456-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","toolCall":{"type":"shell","args":{"command":"ls -la","timeout":600000}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-3-dxdk"}
+
+id: 1783535939297-0
+event: tool_call
+data: {"callId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","name":"run_terminal_cmd","status":"completed","args":{"command":"ls -la","timeout":600000,"toolCallId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","simpleCommands":["ls"],"parsingResult":{"executableCommands":[{"name":"ls","args":[{"type":"word","value":"-la"}],"fullText":"ls -la"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"List directory contents with details","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"},"result":{"success":{"command":"ls -la","stdout":"total 8\ndrwxr-xr-x    4 mocha  wheel    128 Jul  8 11:09 .\ndrwxrwxrwt  892 root   wheel  28544 Jul  8 11:38 ..\ndrwxr-xr-x   13 mocha  wheel    416 Jul  8 11:28 .git\n-rw-r--r--    1 mocha  wheel      8 Jul  8 10:52 README.md\n","executionTime":840,"interleavedOutput":"total 8\ndrwxr-xr-x    4 mocha  wheel    128 Jul  8 11:09 .\ndrwxrwxrwt  892 root   wheel  28544 Jul  8 11:38 ..\ndrwxr-xr-x   13 mocha  wheel    416 Jul  8 11:28 .git\n-rw-r--r--    1 mocha  wheel      8 Jul  8 10:52 README.md\n","localExecutionTimeMs":313},"isBackground":false}}
+
+id: 1783535939297-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_5105b378-0299-4dc3-9859-1eeb3ff009d","toolCall":{"type":"shell","args":{"command":"ls -la","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"total 8\ndrwxr-xr-x    4 mocha  wheel    128 Jul  8 11:09 .\ndrwxrwxrwt  892 root   wheel  28544 Jul  8 11:38 ..\ndrwxr-xr-x   13 mocha  wheel    416 Jul  8 11:28 .git\n-rw-r--r--    1 mocha  wheel      8 Jul  8 10:52 README.md\n","stderr":"","executionTime":840}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-3-dxdk"}
+
+id: 1783535939303-0
+event: interaction_update
+data: {"type":"token-delta","tokens":88}
+
+id: 1783535939600-0
+event: interaction_update
+data: {"type":"step-completed","stepId":40,"stepDurationMs":2895}
+
+id: 1783535945435-0
+event: interaction_update
+data: {"type":"step-started","stepId":50}
+
+id: 1783535947917-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535947957-0
+event: interaction_update
+data: {"type":"token-delta","tokens":11}
+
+id: 1783535948262-0
+event: tool_call
+data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"running"}
+
+id: 1783535948263-0
+event: tool_call
+data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"running","args":{"path":"/private/tmp/machine-smoke-test/README.md"}}
+
+id: 1783535948263-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/private/tmp/machine-smoke-test/README.md"}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
+
+id: 1783535948358-0
+event: tool_call
+data: {"callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","name":"read_file","status":"completed","args":{"path":"/private/tmp/machine-smoke-test/README.md"},"result":{"success":{"content":"# smoke\n","totalLines":2,"fileSize":8,"path":"/private/tmp/machine-smoke-test/README.md","readRange":{"startLine":1,"endLine":2}}}}
+
+id: 1783535948358-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_d6d64e65-49d4-4133-b634-24ee66be364","toolCall":{"type":"read","args":{"path":"/private/tmp/machine-smoke-test/README.md"},"result":{"status":"success","value":{"content":"# smoke\n","totalLines":2,"fileSize":8}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-7-4hei"}
+
+id: 1783535948363-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535948659-0
+event: interaction_update
+data: {"type":"step-completed","stepId":50,"stepDurationMs":3225}
+
+id: 1783535954367-0
+event: interaction_update
+data: {"type":"step-started","stepId":58}
+
+id: 1783535956423-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1783535956427-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535956725-0
+event: tool_call
+data: {"callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","name":"grep_search","status":"running"}
+
+id: 1783535956726-0
+event: tool_call
+data: {"callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","name":"grep_search","status":"running","args":{"pattern":"smoke","caseInsensitive":false,"multiline":false,"toolCallId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","offset":0}}
+
+id: 1783535956726-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","toolCall":{"type":"grep","args":{"pattern":"smoke","offset":0}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-11-xi84"}
+
+id: 1783535956877-0
+event: tool_call
+data: {"callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","name":"grep_search","status":"completed","args":{"pattern":"smoke","caseInsensitive":false,"multiline":false,"toolCallId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","offset":0},"result":{"success":{"pattern":"smoke","outputMode":"content","workspaceResults":{"/private/tmp/machine-smoke-test":{"content":{"matches":[{"file":"./README.md","matches":[{"lineNumber":1,"content":"# smoke"}]}],"totalLines":1,"totalMatchedLines":1}}}}}}
+
+id: 1783535956877-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_8a6d8606-4511-403b-b846-c00f7d13212","toolCall":{"type":"grep","args":{"pattern":"smoke","offset":0},"result":{"status":"success","value":{"workspaceResults":{"/private/tmp/machine-smoke-test":{"type":"content","output":{"matches":[{"file":"./README.md"}],"totalMatches":0}}}}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-11-xi84"}
+
+id: 1783535956881-0
+event: interaction_update
+data: {"type":"token-delta","tokens":27}
+
+id: 1783535957100-0
+event: interaction_update
+data: {"type":"step-completed","stepId":58,"stepDurationMs":2733}
+
+id: 1783535960279-0
+event: interaction_update
+data: {"type":"step-started","stepId":66}
+
+id: 1783535963446-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1783535963467-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1783535963471-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1783535963494-0
+event: interaction_update
+data: {"type":"token-delta","tokens":8}
+
+id: 1783535963848-0
+event: tool_call
+data: {"callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","name":"run_terminal_cmd","status":"running","args":{"command":"git status","timeout":600000,"toolCallId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","simpleCommands":["git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"status"}],"fullText":"git status"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show git working tree status","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"}}
+
+id: 1783535963848-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","toolCall":{"type":"shell","args":{"command":"git status","timeout":600000}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-15-uyf0"}
+
+id: 1783535964335-0
+event: tool_call
+data: {"callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","name":"run_terminal_cmd","status":"completed","args":{"command":"git status","timeout":600000,"toolCallId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","simpleCommands":["git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"status"}],"fullText":"git status"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show git working tree status","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"},"result":{"success":{"command":"git status","stdout":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","executionTime":487,"interleavedOutput":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","localExecutionTimeMs":314},"isBackground":false}}
+
+id: 1783535964335-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","toolCall":{"type":"shell","args":{"command":"git status","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","stderr":"","executionTime":487}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-15-uyf0"}
+
+id: 1783535964339-0
+event: interaction_update
+data: {"type":"token-delta","tokens":57}
+
+id: 1783535964615-0
+event: interaction_update
+data: {"type":"step-completed","stepId":66,"stepDurationMs":4335}
+
+id: 1783535967038-0
+event: interaction_update
+data: {"type":"step-started","stepId":76}
+
+id: 1783535970223-0
+event: assistant
+data: {"text":"Minimal"}
+
+id: 1783535970223-0
+event: interaction_update
+data: {"type":"text-delta","text":"Minimal"}
+
+id: 1783535970226-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970230-0
+event: assistant
+data: {"text":" smoke"}
+
+id: 1783535970230-0
+event: interaction_update
+data: {"type":"text-delta","text":" smoke"}
+
+id: 1783535970233-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970236-0
+event: assistant
+data: {"text":"-test"}
+
+id: 1783535970236-0
+event: interaction_update
+data: {"type":"text-delta","text":"-test"}
+
+id: 1783535970239-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970242-0
+event: assistant
+data: {"text":" repo"}
+
+id: 1783535970242-0
+event: interaction_update
+data: {"type":"text-delta","text":" repo"}
+
+id: 1783535970245-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970248-0
+event: assistant
+data: {"text":" on"}
+
+id: 1783535970248-0
+event: interaction_update
+data: {"type":"text-delta","text":" on"}
+
+id: 1783535970250-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970253-0
+event: assistant
+data: {"text":" host"}
+
+id: 1783535970253-0
+event: interaction_update
+data: {"type":"text-delta","text":" host"}
+
+id: 1783535970256-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970259-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970259-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970262-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970265-0
+event: assistant
+data: {"text":"mac"}
+
+id: 1783535970265-0
+event: interaction_update
+data: {"type":"text-delta","text":"mac"}
+
+id: 1783535970267-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970270-0
+event: assistant
+data: {"text":"`"}
+
+id: 1783535970270-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1783535970274-0
+event: assistant
+data: {"text":" with"}
+
+id: 1783535970274-0
+event: interaction_update
+data: {"type":"text-delta","text":" with"}
+
+id: 1783535970277-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970280-0
+event: assistant
+data: {"text":" a"}
+
+id: 1783535970280-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1783535970284-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970286-0
+event: assistant
+data: {"text":" clean"}
+
+id: 1783535970286-0
+event: interaction_update
+data: {"type":"text-delta","text":" clean"}
+
+id: 1783535970289-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970295-0
+event: assistant
+data: {"text":" git"}
+
+id: 1783535970295-0
+event: interaction_update
+data: {"type":"text-delta","text":" git"}
+
+id: 1783535970298-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970301-0
+event: assistant
+data: {"text":" state"}
+
+id: 1783535970301-0
+event: interaction_update
+data: {"type":"text-delta","text":" state"}
+
+id: 1783535970304-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970307-0
+event: assistant
+data: {"text":" and"}
+
+id: 1783535970307-0
+event: interaction_update
+data: {"type":"text-delta","text":" and"}
+
+id: 1783535970310-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970314-0
+event: assistant
+data: {"text":" one"}
+
+id: 1783535970314-0
+event: interaction_update
+data: {"type":"text-delta","text":" one"}
+
+id: 1783535970317-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970320-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970320-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970323-0
+event: assistant
+data: {"text":"sm"}
+
+id: 1783535970323-0
+event: interaction_update
+data: {"type":"text-delta","text":"sm"}
+
+id: 1783535970326-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970331-0
+event: assistant
+data: {"text":"oke"}
+
+id: 1783535970331-0
+event: interaction_update
+data: {"type":"text-delta","text":"oke"}
+
+id: 1783535970334-0
+event: assistant
+data: {"text":"`"}
+
+id: 1783535970334-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1783535970337-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970340-0
+event: assistant
+data: {"text":" match"}
+
+id: 1783535970340-0
+event: interaction_update
+data: {"type":"text-delta","text":" match"}
+
+id: 1783535970343-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970347-0
+event: assistant
+data: {"text":" in"}
+
+id: 1783535970347-0
+event: interaction_update
+data: {"type":"text-delta","text":" in"}
+
+id: 1783535970349-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970353-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970353-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970356-0
+event: assistant
+data: {"text":"README"}
+
+id: 1783535970356-0
+event: interaction_update
+data: {"type":"text-delta","text":"README"}
+
+id: 1783535970359-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970362-0
+event: assistant
+data: {"text":".md"}
+
+id: 1783535970362-0
+event: interaction_update
+data: {"type":"text-delta","text":".md"}
+
+id: 1783535970365-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970368-0
+event: assistant
+data: {"text":"`."}
+
+id: 1783535970368-0
+event: interaction_update
+data: {"type":"text-delta","text":"`."}
+
+id: 1783535970611-0
+event: interaction_update
+data: {"type":"turn-ended"}
+
+id: 1783535970615-0
+event: interaction_update
+data: {"type":"step-completed","stepId":76,"stepDurationMs":3576}
+
+event: status
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED"}
+
+id: 1783535980837-0
+event: result
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/waseemshahwan/machine-smoke-test"}]}}
+
+id: 1783535980837-0
+event: done
+data: {}
+

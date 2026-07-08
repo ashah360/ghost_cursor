@@ -1,5 +1,5 @@
 # Reproduce the ghost_cursor e2e environment locally — real Hermes + real
-# cursor-sdk, no mocks. Mirrors what the GitHub Actions e2e job does.
+# REST API (httpx), no mocks. Mirrors what the GitHub Actions e2e job does.
 #
 #   docker build -t ghost-cursor-e2e -f Dockerfile.e2e .
 #   docker run --rm -e CURSOR_API_KEY=sk-... ghost-cursor-e2e
@@ -19,8 +19,12 @@ RUN git clone --depth 1 https://github.com/NousResearch/hermes-agent /opt/hermes
 WORKDIR /opt/hermes-agent
 RUN uv sync --frozen || uv sync || pip install -e .
 
-# Official cursor-sdk (the transport; brings the local bridge with it)
-RUN uv add cursor-sdk || uv pip install cursor-sdk
+# httpx (the REST+SSE transport layer; usually already a hermes dep)
+RUN uv add httpx || uv pip install httpx
+
+# The cursor agent CLI — runtime=local spawns `agent worker start` from it
+RUN curl https://cursor.com/install -fsS | bash
+ENV PATH="/root/.local/bin:${PATH}"
 
 # pytest into the uv project env (it's not a Hermes dep)
 RUN uv add --dev pytest || uv pip install pytest
@@ -38,9 +42,11 @@ RUN rm -f /opt/hermes-agent/plugins/ghost_cursor/test_ghost_cursor_plugin.py \
           /opt/hermes-agent/plugins/ghost_cursor/conftest.py
 
 ENV GHOST_CURSOR_E2E=1 \
-    GHOST_CURSOR_TEST_MODEL=gpt-5.4-nano-low \
+    GHOST_CURSOR_TEST_MODEL=gpt-5.4-nano \
     GHOST_CURSOR_PLUGIN_INIT=/opt/hermes-agent/plugins/ghost_cursor/__init__.py \
     PYTHONPATH=/opt/hermes-agent
 
-# Unit tests always; e2e only if CURSOR_API_KEY is provided at runtime.
+# Unit tests always; e2e only if CURSOR_API_KEY and GHOST_CURSOR_E2E_REPO
+# (a GitHub https URL for the session repo's origin remote) are provided
+# at runtime.
 CMD ["bash", "-lc", "uv run --with pytest pytest tests/plugins/test_ghost_cursor_plugin.py -q && uv run --with pytest pytest tests/plugins/e2e/test_e2e.py -q -v"]
