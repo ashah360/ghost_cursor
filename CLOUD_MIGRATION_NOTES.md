@@ -154,7 +154,7 @@ Shapes observed:
   `RUN_LIFECYCLE_STATUS_ERROR`) preserved at
   `/tmp/gc-probe/raw_events_errored*.jsonl`.
 
-## Options for the human (with the evidence each now has)
+## Options for the human (with the evidence each now has) — DECIDED: option 2 (REST), see below
 
 1. **Newer python sdk** — not available; 0.1.9 is PyPI latest.
 2. **REST API client** — machine routing proven live; open question is
@@ -164,3 +164,92 @@ Shapes observed:
    dependency but shed the state-loss failure modes that motivated the
    migration. The old bridge-lifecycle complexity (max-age, health probes,
    recycle-on-retry) could shrink to "restart on error, resume, re-observe".
+
+---
+
+# REST+SSE migration — Phase 1 live-probe findings (2026-07-08, after the REST decision)
+
+All verified live against api.cursor.com (Bearer CURSOR_API_KEY, worker
+mocha-smoke). OpenAPI spec read in full
+(https://cursor.com/docs-static/cloud-agents-openapi.yaml). Raw captures:
+`fixtures/rest_v1/*.sse` (verbatim SSE bytes) + `models_v1_trimmed.json`.
+Probe script: `/tmp/gc-probe/rest_probe.py`, full log `rest_probe.log`.
+
+## Endpoints verified live
+
+- `POST /v1/agents` → 201 `{agent: {...}, run: {id, agentId, status: "CREATING", ...}}`.
+  Machine-routed, tool-heavy run FINISHED on the local worker.
+  NOTE: create latency can exceed 30s (first attempt timed out at 30s read;
+  succeeded with a longer timeout) — client must use a generous read timeout
+  on this POST, and it is NOT safe to blind-retry (agent may have been
+  created; use the optional client-supplied `agentId` idempotency field —
+  `409 agent_id_conflict` on re-POST — if retry is ever needed).
+- `POST /v1/agents/{id}/runs` (follow-up) → 201 `{run: {...}}`. Verified
+  twice. "Only one run can be active per agent at a time" (409 otherwise).
+- `GET /v1/agents/{id}/runs/{runId}` → Run with terminal `status`,
+  `durationMs`, `result` (final text), `git.branches[]`. Authority for
+  settle.
+- `POST /v1/agents/{id}/runs/{runId}/cancel` → 200 `{id}`; run transitions
+  to CANCELLED. Cancel of a terminal run → `409 run_not_cancellable`
+  ("Run is already finished"). Verified live both ways.
+- `GET /v1/models` → 30 ids incl. `claude-fable-5` (our DEFAULT_MODEL —
+  valid here, unlike the bare v1 create probe of phase 0 which rejected
+  `composer-2`; `composer-2` is indeed absent from v1 models, `composer-2.5`
+  is present, and `default` is a valid pseudo-id). Items carry `aliases`,
+  `parameters`, `variants` for validation/translation.
+- `GET /v1/me` → `{apiKeyName, userId, userEmail, ...}` (cheap auth check).
+- `GET /v1/agents/{id}` → Agent detail; repos echoed WITHOUT scheme
+  (`github.com/...`) even though create sent `https://github.com/...` —
+  normalize before comparing.
+
+## SSE stream (`GET /v1/agents/{id}/runs/{runId}/stream`, Accept: text/event-stream)
+
+- Verified real-time (181 events live during run A) and full replay of
+  finished runs. `X-Cursor-Stream-Retention-Seconds: 345600` (4 days) —
+  after that, `410 stream_expired` per spec.
+- Event types captured: `status`, `heartbeat` (`data: {}`), `thinking`,
+  `assistant` (text deltas), `tool_call`, `interaction_update`, `result`,
+  `error`, `done`. OpenAPI documents exactly this set.
+- `status` events carry NO `id:` line and are replayed at the top of every
+  reconnect (documented + observed). All other events carry
+  `id: <millis>-<seq>`.
+- Duplication by design: `assistant`/`thinking`/`tool_call` simplified
+  events share their event id with a parallel `interaction_update` carrying
+  the SDK shape (`text-delta`, `thinking-delta`, `thinking-completed`,
+  `token-delta`, `step-started`, `user-message-appended`, ...). Consume the
+  simplified events; ignore `interaction_update` duplicates (per OpenAPI
+  guidance) or the normalizer double-counts every delta.
+- `tool_call` data = camelCase `{callId, name, status: running|completed,
+  args?, result?, truncated?}` (RunStreamToolCallData) — note this differs
+  from the python-sdk fixture shape (snake_case `call_id`, nested
+  `message.tool_call`). Same tool names as phase 0 (`run_terminal_cmd`,
+  `read_file`, `edit_file` with `diffString`/`afterFullFileContent`,
+  `delete_file`, `grep_search`). Args stream incrementally across repeated
+  `running` updates for the same callId.
+- `result` event: `{runId, status, text?, durationMs?, git?}`; `done`:
+  `data: {}` closes every stream.
+- **Last-Event-ID resume verified**: reconnect with the header mid-history
+  returned only events after that id (87 of 176) — prefixed by the id-less
+  `status` replay. Invalid/foreign ids → `400 invalid_last_event_id` (per
+  spec, not exercised).
+- **Two live gotchas captured in fixtures**:
+  - `run_c_precancel.sse`: an active stream can emit
+    `event: error` `{"code":"stream_unavailable","message":"Run stream is no
+    longer available"}` then `done` — the normalizer/reattach loop must
+    treat this as a reconnect signal, not a run failure.
+  - `run_c_postcancel.sse`: the replay of a cancelled run emits a
+    simplified `status: FINISHED` event while the `result` event and
+    `GET runs/{id}` both say `CANCELLED`. The simplified `status` stream is
+    NOT authoritative for the terminal state — settle from `result` +
+    the final GET (as the build spec already mandates).
+
+## Design notes fed into phases 2–4
+
+- httpx 0.28.1 is already in the hermes venv → use it in rest_client.py.
+- Create/followup POSTs: long read timeout (≥120s), no blind retries;
+  GETs (incl. stream reconnects) retry with backoff on 429/5xx.
+- Model validation: against `GET /v1/models` ids + aliases; `claude-fable-5`
+  stays a valid default. `composer-2` must translate (alias check) or error
+  listing valid ids.
+- Repo echo comes back scheme-less; keep `repo_url` in handles as the
+  canonical `https://github.com/...` form and normalize on compare.

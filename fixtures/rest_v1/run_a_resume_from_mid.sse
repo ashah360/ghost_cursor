@@ -1,0 +1,354 @@
+event: status
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED"}
+
+id: 1783535963467-0
+event: interaction_update
+data: {"type":"token-delta","tokens":3}
+
+id: 1783535963471-0
+event: interaction_update
+data: {"type":"token-delta","tokens":4}
+
+id: 1783535963494-0
+event: interaction_update
+data: {"type":"token-delta","tokens":8}
+
+id: 1783535963848-0
+event: tool_call
+data: {"callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","name":"run_terminal_cmd","status":"running","args":{"command":"git status","timeout":600000,"toolCallId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","simpleCommands":["git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"status"}],"fullText":"git status"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show git working tree status","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"}}
+
+id: 1783535963848-0
+event: interaction_update
+data: {"type":"tool-call-started","callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","toolCall":{"type":"shell","args":{"command":"git status","timeout":600000}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-15-uyf0"}
+
+id: 1783535964335-0
+event: tool_call
+data: {"callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","name":"run_terminal_cmd","status":"completed","args":{"command":"git status","timeout":600000,"toolCallId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","simpleCommands":["git"],"parsingResult":{"executableCommands":[{"name":"git","args":[{"type":"word","value":"status"}],"fullText":"git status"}]},"fileOutputThresholdBytes":"40000","timeoutBehavior":"TIMEOUT_BEHAVIOR_BACKGROUND","hardTimeout":86400000,"description":"Show git working tree status","conversationId":"bc-4e27abf6-c42c-4492-8429-342ff9b222b0"},"result":{"success":{"command":"git status","stdout":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","executionTime":487,"interleavedOutput":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","localExecutionTimeMs":314},"isBackground":false}}
+
+id: 1783535964335-0
+event: interaction_update
+data: {"type":"tool-call-completed","callId":"tool_731b123f-36da-4caa-90d1-13b63adf3d2","toolCall":{"type":"shell","args":{"command":"git status","timeout":600000},"result":{"status":"success","value":{"exitCode":0,"signal":"","stdout":"On branch main\nYour branch is up to date with 'origin/main'.\n\nnothing to commit, working tree clean\n","stderr":"","executionTime":487}}},"modelCallId":"serverGenReqId_58ff73bb-ce80-4d23-90fc-d085145d27c3-15-uyf0"}
+
+id: 1783535964339-0
+event: interaction_update
+data: {"type":"token-delta","tokens":57}
+
+id: 1783535964615-0
+event: interaction_update
+data: {"type":"step-completed","stepId":66,"stepDurationMs":4335}
+
+id: 1783535967038-0
+event: interaction_update
+data: {"type":"step-started","stepId":76}
+
+id: 1783535970223-0
+event: assistant
+data: {"text":"Minimal"}
+
+id: 1783535970223-0
+event: interaction_update
+data: {"type":"text-delta","text":"Minimal"}
+
+id: 1783535970226-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970230-0
+event: assistant
+data: {"text":" smoke"}
+
+id: 1783535970230-0
+event: interaction_update
+data: {"type":"text-delta","text":" smoke"}
+
+id: 1783535970233-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970236-0
+event: assistant
+data: {"text":"-test"}
+
+id: 1783535970236-0
+event: interaction_update
+data: {"type":"text-delta","text":"-test"}
+
+id: 1783535970239-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970242-0
+event: assistant
+data: {"text":" repo"}
+
+id: 1783535970242-0
+event: interaction_update
+data: {"type":"text-delta","text":" repo"}
+
+id: 1783535970245-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970248-0
+event: assistant
+data: {"text":" on"}
+
+id: 1783535970248-0
+event: interaction_update
+data: {"type":"text-delta","text":" on"}
+
+id: 1783535970250-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970253-0
+event: assistant
+data: {"text":" host"}
+
+id: 1783535970253-0
+event: interaction_update
+data: {"type":"text-delta","text":" host"}
+
+id: 1783535970256-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970259-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970259-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970262-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970265-0
+event: assistant
+data: {"text":"mac"}
+
+id: 1783535970265-0
+event: interaction_update
+data: {"type":"text-delta","text":"mac"}
+
+id: 1783535970267-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970270-0
+event: assistant
+data: {"text":"`"}
+
+id: 1783535970270-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1783535970274-0
+event: assistant
+data: {"text":" with"}
+
+id: 1783535970274-0
+event: interaction_update
+data: {"type":"text-delta","text":" with"}
+
+id: 1783535970277-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970280-0
+event: assistant
+data: {"text":" a"}
+
+id: 1783535970280-0
+event: interaction_update
+data: {"type":"text-delta","text":" a"}
+
+id: 1783535970284-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970286-0
+event: assistant
+data: {"text":" clean"}
+
+id: 1783535970286-0
+event: interaction_update
+data: {"type":"text-delta","text":" clean"}
+
+id: 1783535970289-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970295-0
+event: assistant
+data: {"text":" git"}
+
+id: 1783535970295-0
+event: interaction_update
+data: {"type":"text-delta","text":" git"}
+
+id: 1783535970298-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970301-0
+event: assistant
+data: {"text":" state"}
+
+id: 1783535970301-0
+event: interaction_update
+data: {"type":"text-delta","text":" state"}
+
+id: 1783535970304-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970307-0
+event: assistant
+data: {"text":" and"}
+
+id: 1783535970307-0
+event: interaction_update
+data: {"type":"text-delta","text":" and"}
+
+id: 1783535970310-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970314-0
+event: assistant
+data: {"text":" one"}
+
+id: 1783535970314-0
+event: interaction_update
+data: {"type":"text-delta","text":" one"}
+
+id: 1783535970317-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970320-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970320-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970323-0
+event: assistant
+data: {"text":"sm"}
+
+id: 1783535970323-0
+event: interaction_update
+data: {"type":"text-delta","text":"sm"}
+
+id: 1783535970326-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970331-0
+event: assistant
+data: {"text":"oke"}
+
+id: 1783535970331-0
+event: interaction_update
+data: {"type":"text-delta","text":"oke"}
+
+id: 1783535970334-0
+event: assistant
+data: {"text":"`"}
+
+id: 1783535970334-0
+event: interaction_update
+data: {"type":"text-delta","text":"`"}
+
+id: 1783535970337-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970340-0
+event: assistant
+data: {"text":" match"}
+
+id: 1783535970340-0
+event: interaction_update
+data: {"type":"text-delta","text":" match"}
+
+id: 1783535970343-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970347-0
+event: assistant
+data: {"text":" in"}
+
+id: 1783535970347-0
+event: interaction_update
+data: {"type":"text-delta","text":" in"}
+
+id: 1783535970349-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970353-0
+event: assistant
+data: {"text":" `"}
+
+id: 1783535970353-0
+event: interaction_update
+data: {"type":"text-delta","text":" `"}
+
+id: 1783535970356-0
+event: assistant
+data: {"text":"README"}
+
+id: 1783535970356-0
+event: interaction_update
+data: {"type":"text-delta","text":"README"}
+
+id: 1783535970359-0
+event: interaction_update
+data: {"type":"token-delta","tokens":2}
+
+id: 1783535970362-0
+event: assistant
+data: {"text":".md"}
+
+id: 1783535970362-0
+event: interaction_update
+data: {"type":"text-delta","text":".md"}
+
+id: 1783535970365-0
+event: interaction_update
+data: {"type":"token-delta","tokens":1}
+
+id: 1783535970368-0
+event: assistant
+data: {"text":"`."}
+
+id: 1783535970368-0
+event: interaction_update
+data: {"type":"text-delta","text":"`."}
+
+id: 1783535970611-0
+event: interaction_update
+data: {"type":"turn-ended"}
+
+id: 1783535970615-0
+event: interaction_update
+data: {"type":"step-completed","stepId":76,"stepDurationMs":3576}
+
+event: status
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED"}
+
+id: 1783535980837-0
+event: result
+data: {"runId":"run-311a0ff6-b668-4063-99ad-35e2399b5ba6","status":"FINISHED","text":"Minimal smoke-test repo on host `mac` with a clean git state and one `smoke` match in `README.md`.","durationMs":53257,"git":{"branches":[{"repoUrl":"github.com/waseemshahwan/machine-smoke-test"}]}}
+
+id: 1783535980837-0
+event: done
+data: {}
+
