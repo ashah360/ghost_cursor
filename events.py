@@ -4,10 +4,12 @@ Two normalizers share the same envelope builders:
 
 * :func:`normalize_harness` — the legacy ``--print --output-format
   stream-json`` stdout events (kept for the fallback/reference runner).
-* :class:`SdkNormalizer` — SDKMessage dicts from the official ``cursor-sdk``
-  stream (the current runner). Stateful, because ``tool_call`` completion
-  messages inherit the kind/title resolved when the call started, and
-  because durations are measured client-side.
+* :class:`SdkNormalizer` — SDKMessage-shaped dicts from the cloud runner
+  (``cloud_runner.py`` converts the REST SSE events into these; the
+  shapes originate with the cursor-sdk stream, hence the name). Stateful,
+  because ``tool_call`` completion messages inherit the kind/title
+  resolved when the call started, and because durations are measured
+  client-side.
 
 Adapted from the Threshold bridge (``app/bridge/events.py`` — the
 ``normalize_harness`` block), so the envelopes ``cursor_edit`` emits as tool
@@ -317,14 +319,15 @@ def normalize_harness(event_key: str, data: Dict[str, Any]) -> List[Dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# cursor-sdk normalization — sdk_runner.run_sdk event tuples
+# cloud normalization — cloud_runner.run_cloud event tuples
 # ---------------------------------------------------------------------------
-# SDKMessage shapes follow the official cursor-sdk docs (type discriminator:
+# Message shapes follow the SDKMessage convention (type discriminator:
 # system / user / assistant / thinking / tool_call / status / task / request
-# / usage). The envelope fields (type, call_id, name, status) are stable;
-# tool_call ``args`` and ``result`` payloads are EXPLICITLY UNSTABLE upstream
-# — everything below parses them defensively and never raises on an
-# unexpected shape.
+# / usage) — cloud_runner._message_from_sse converts the REST SSE events
+# into the same shapes. The envelope fields (type, call_id, name, status)
+# are stable; tool_call ``args`` and ``result`` payloads are EXPLICITLY
+# UNSTABLE upstream — everything below parses them defensively and never
+# raises on an unexpected shape.
 
 # Message types that never produce envelopes: the task echo, handshake
 # metadata, and transient status pings.
@@ -465,7 +468,7 @@ def _sdk_diff_entries(
     path from the call's args / running message — the REAL edit tool's
     result carries no path at all. Runs whose edits slip through entirely
     still land in files_changed via the git fallback
-    (sdk_runner.git_fallback_diffs).
+    (cloud_runner.git_fallback_diffs).
     """
     entries: List[Dict[str, Any]] = []
     seen: set = set()
@@ -553,7 +556,13 @@ def _sdk_exit_code(result: Any) -> int | None:
 
 
 class SdkNormalizer:
-    """Stateful sdk_runner event → canonical-envelope mapper (one per run).
+    """Stateful cloud_runner event → canonical-envelope mapper (one per run).
+
+    The name survives from the cursor-sdk era because the MESSAGE SHAPES
+    it parses do: ``cloud_runner`` converts the REST SSE events into the
+    same SDKMessage-style dicts (type discriminator, snake_case call_id)
+    the sdk streamed, so the mapping — and the replay fixtures captured
+    from both transports — stay valid.
 
     Stateful because tool_call completion messages must inherit the
     kind/title resolved when the call started, and because durations are
@@ -577,31 +586,35 @@ class SdkNormalizer:
     # -- event entry point ---------------------------------------------------
 
     def normalize(self, event_key: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Translate one sdk_runner event into canonical envelopes.
+        """Translate one cloud_runner event into canonical envelopes.
 
         Args:
-            event_key: ``"sdk.session" | "sdk.message" | "sdk.reattached" |
-                "sdk.bridge_died" | "sdk.model_warning" | "sdk.result" |
-                "sdk.error"`` as yielded by :func:`sdk_runner.run_sdk`.
-            data: For ``sdk.message``, the SDKMessage as a plain dict.
+            event_key: ``"cloud.session" | "cloud.message" |
+                "sse.reattached" | "cloud.model_warning" | "cloud.result" |
+                "cloud.error"`` as yielded by :func:`cloud_runner.run_cloud`.
+            data: For ``cloud.message``, the message as a plain dict.
         """
         data = data if isinstance(data, dict) else {}
 
-        if event_key == "sdk.session":
+        if event_key == "cloud.session":
             return [
                 lifecycle(
                     "run.started",
                     model=data.get("model"),
                     cwd=data.get("cwd"),
                     harness_session_id=data.get("agentId"),
+                    runtime=data.get("runtime"),
+                    worker=data.get("worker"),
+                    agents_ui_url=data.get("agents_ui_url"),
+                    run_id=data.get("run_id"),
                 )
             ]
 
-        if event_key == "sdk.model_warning":
+        if event_key == "cloud.model_warning":
             # A legacy/unparseable model string was substituted (see
-            # sdk_runner.translate_model). Log-signal lifecycle event: the
-            # fold ignores unknown lifecycle events, so this lands in the
-            # progress buffer and JSONL log without touching the run.
+            # cloud_runner.translate_model). Log-signal lifecycle event:
+            # the fold ignores unknown lifecycle events, so this lands in
+            # the progress buffer and JSONL log without touching the run.
             return [
                 lifecycle(
                     "model.warning",
@@ -611,32 +624,20 @@ class SdkNormalizer:
                 )
             ]
 
-        if event_key == "sdk.reattached":
-            # Transparent stream recovery: JSONL-log signal only. The fold
-            # ignores unknown lifecycle events, so nothing user-visible
-            # changes — no synthetic messages, no re-prompt.
+        if event_key == "sse.reattached":
+            # Transparent stream recovery (Last-Event-ID reconnect):
+            # JSONL-log signal only. The fold ignores unknown lifecycle
+            # events, so nothing user-visible changes — no synthetic
+            # messages, no re-prompt.
             return [
                 lifecycle(
-                    "stream.reattached",
-                    offset=data.get("offset"),
+                    "sse.reattached",
+                    last_event_id=data.get("last_event_id"),
                     attempt=data.get("attempt"),
                 )
             ]
 
-        if event_key == "sdk.bridge_died":
-            # Bridge sidecar death detected mid-run (issue #11): lands in
-            # the JSONL log the instant it is detected, so status "recent"
-            # lines never show a plain healthy "running" while the runner
-            # is dealing with a dead bridge. The typed run.failed follows.
-            return [
-                lifecycle(
-                    "bridge.died",
-                    workspace=data.get("workspace"),
-                    detail=data.get("detail"),
-                )
-            ]
-
-        if event_key == "sdk.result":
+        if event_key == "cloud.result":
             status = str(data.get("status") or "")
             if status == "finished":
                 transport_error = _transport_error_line(self._final_content_tail)
@@ -684,27 +685,29 @@ class SdkNormalizer:
                 )
             ]
 
-        if event_key == "sdk.error":
-            # Terminal-error payloads carry typed detail (retryable /
-            # retry_after / run_status — see sdk_runner); mid-run failures
+        if event_key == "cloud.error":
+            # Terminal-error payloads carry typed detail (run_status /
+            # unroutable_worker — see cloud_runner); mid-run failures
             # don't. Pass through whichever keys are present so the fold
             # and the completion summary can render them.
             extras = {
                 key: data.get(key)
-                for key in ("retryable", "retry_after", "run_status", "bridge_died")
+                for key in (
+                    "retryable", "retry_after", "run_status", "unroutable_worker"
+                )
                 if key in data
             }
             return [
                 lifecycle(
                     "run.failed",
                     status="failed",
-                    error=data.get("error") or "cursor-sdk error",
+                    error=data.get("error") or "cursor cloud error",
                     timeout=bool(data.get("timeout")),
                     **extras,
                 )
             ]
 
-        if event_key == "sdk.message":
+        if event_key == "cloud.message":
             return self._message(data)
 
         # Unknown runner event: opaque passthrough so nothing is dropped.

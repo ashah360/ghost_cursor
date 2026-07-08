@@ -126,12 +126,12 @@ def _sdk_fixture_messages():
 def _sdk_replay_events():
     """A full run's worth of sdk_runner events built from the fixture."""
     events = [(
-        "sdk.session",
+        "cloud.session",
         {"agentId": "agent-fixture", "cwd": "/tmp/sdk_probe/repo",
          "model": "fake-model", "resumed": False},
     )]
-    events.extend(("sdk.message", msg) for msg in _sdk_fixture_messages())
-    events.append(("sdk.result", {"status": "finished"}))
+    events.extend(("cloud.message", msg) for msg in _sdk_fixture_messages())
+    events.append(("cloud.result", {"status": "finished"}))
     return events
 
 
@@ -172,7 +172,16 @@ def clean_state(monkeypatch):
     Also drops the tool-boundary interval minimum (issue #14 clamps
     sub-15s requests UP) — the timing-based tests here rely on
     sub-second digest cadences. Validation-contract tests patch their
-    own minimum back in."""
+    own minimum back in.
+
+    cursor_create_session eagerly validates that a local checkout has a
+    GitHub origin (pure `git -C`, no network) — tmp_path repos have none,
+    so the introspection is stubbed here; TestCloudRunner covers the real
+    derive_repo_ref failure modes."""
+    monkeypatch.setattr(
+        gc_cloud, "derive_repo_ref",
+        lambda path: ("https://github.com/example/repo", "main"),
+    )
     monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 0.0)
     gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
@@ -208,17 +217,17 @@ def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=T
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                cancel_check=None, agent_id=None, model=None,
-               first_event_timeout_s=None):
-        yield ("sdk.session", {
+               first_event_timeout_s=None, **_kw):
+        yield ("cloud.session", {
             "agentId": sid, "cwd": str(workdir),
             "model": model or "fake-model", "resumed": bool(agent_id),
         })
         if early_edit:
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "running", "args": {"path": f"{workdir}/f1.py"},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "completed",
                 "result": {"path": f"{workdir}/f1.py",
@@ -226,25 +235,25 @@ def _gated_replay_factory(release, sid="agent-run", early_edit=True, late_edit=T
             })
         while not release.is_set():
             if cancel_check and cancel_check():
-                yield ("sdk.result", {"status": "cancelled"})
+                yield ("cloud.result", {"status": "cancelled"})
                 return
             time.sleep(0.01)
         if late_edit:
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t2", "name": "edit_file",
                 "status": "running", "args": {"path": f"{workdir}/f2.py"},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t2", "name": "edit_file",
                 "status": "completed",
                 "result": {"path": f"{workdir}/f2.py",
                            "oldText": "", "newText": "new\n"},
             })
-        yield ("sdk.message", {
+        yield ("cloud.message", {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "all done"}]},
         })
-        yield ("sdk.result", {"status": "finished"})
+        yield ("cloud.result", {"status": "finished"})
 
     return replay
 
@@ -260,16 +269,16 @@ def _cancel_deaf_replay_factory(release, sid="agent-deaf"):
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                cancel_check=None, agent_id=None, model=None,
-               first_event_timeout_s=None):
-        yield ("sdk.session", {
+               first_event_timeout_s=None, **_kw):
+        yield ("cloud.session", {
             "agentId": sid, "cwd": str(workdir),
             "model": model or "fake-model", "resumed": bool(agent_id),
         })
-        yield ("sdk.message", {
+        yield ("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "edit_file",
             "status": "running", "args": {"path": f"{workdir}/f1.py"},
         })
-        yield ("sdk.message", {
+        yield ("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "edit_file",
             "status": "completed",
             "result": {"path": f"{workdir}/f1.py",
@@ -277,17 +286,17 @@ def _cancel_deaf_replay_factory(release, sid="agent-deaf"):
         })
         while not release.is_set():
             time.sleep(0.01)  # deaf: never checks cancel_check
-        yield ("sdk.message", {
+        yield ("cloud.message", {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "kept going"}]},
         })
-        yield ("sdk.result", {"status": "finished"})
+        yield ("cloud.result", {"status": "finished"})
 
     return replay
 
 
 class _SdkSequence:
-    """Route successive run_sdk calls to successive replay factories,
+    """Route successive run_cloud calls to successive replay factories,
     recording each call's kwargs for assertion."""
 
     def __init__(self, *factories):
@@ -296,10 +305,12 @@ class _SdkSequence:
 
     def __call__(self, task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                  cancel_check=None, agent_id=None, model=None,
-                 first_event_timeout_s=None):
+                 runtime="local", session_title=None,
+                 first_event_timeout_s=None, **_kw):
         self.calls.append({
             "task": task, "workdir": str(workdir),
             "agent_id": agent_id, "model": model,
+            "runtime": runtime,
             "inactivity_timeout_s": inactivity_timeout_s,
             "max_wall_s": max_wall_s,
             "first_event_timeout_s": first_event_timeout_s,
@@ -358,7 +369,7 @@ class TestFirstSendRun:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-new"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-new"))
 
         ack = _start_run("add multiply", repo=str(tmp_path))
         try:
@@ -388,7 +399,7 @@ class TestFirstSendRun:
     ):
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:test:1")
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-done"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-done"))
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-done")
@@ -427,7 +438,7 @@ class TestFirstSendRun:
         edits land in files_changed with diffs, and the summary is the
         FINAL content block of the turn (the wrap-up message), not every
         interstitial fragment fused together."""
-        monkeypatch.setattr(gc_sdk, "run_sdk", _replay_sdk)
+        monkeypatch.setattr(gc_cloud, "run_cloud", _replay_sdk)
         _start_run("add multiply", repo=str(tmp_path))
 
         job = _job_for("agent-fixture")
@@ -456,14 +467,14 @@ class TestFirstSendRun:
         self, clean_state, monkeypatch, tmp_path
     ):
         def failing(*_a, **_k):
-            raise gc_sdk.SdkRunnerError(
-                "failed to create cursor agent via cursor-sdk (boom)"
+            raise gc_cloud.CloudRunnerError(
+                "cursor agent create failed (boom)"
             )
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", failing)
+        monkeypatch.setattr(gc_cloud, "run_cloud", failing)
         out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
-        assert "failed to create cursor agent" in out
+        assert "agent create failed" in out
         # Errors are prose sentences with a next step, not codes.
         assert "send another message" in out
         # Exactly-once: the tool result IS the report; nothing enqueued.
@@ -477,13 +488,13 @@ class TestFirstSendRun:
         monkeypatch.setattr(gc, "_HANDLE_WAIT_S", 0.3)
 
         def never_session(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                          cancel_check=None, agent_id=None, model=None):
+                          cancel_check=None, agent_id=None, model=None, **_kw):
             while not (cancel_check and cancel_check()):
                 time.sleep(0.01)
             return
             yield  # pragma: no cover — make it a generator
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", never_session)
+        monkeypatch.setattr(gc_cloud, "run_cloud", never_session)
         out = _start_run("t", repo=str(tmp_path))
         assert "status: failed" in out
         assert "did not establish" in out
@@ -505,7 +516,7 @@ def _preset_event():
 # ---------------------------------------------------------------------------
 
 def _narration_chunk(text):
-    return ("sdk.message", {
+    return ("cloud.message", {
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": text}]},
     })
@@ -513,11 +524,11 @@ def _narration_chunk(text):
 
 def _tool_round(call_id):
     return [
-        ("sdk.message", {
+        ("cloud.message", {
             "type": "tool_call", "call_id": call_id, "name": "read_file",
             "status": "running", "args": {"path": "/tmp/x"},
         }),
-        ("sdk.message", {
+        ("cloud.message", {
             "type": "tool_call", "call_id": call_id, "name": "read_file",
             "status": "completed", "result": {},
         }),
@@ -531,12 +542,12 @@ class TestCompletionSummary:
 
     def _run_replay(self, monkeypatch, tmp_path, sid, events):
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, agent_id=None, model=None):
-            yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None, **_kw):
+            yield ("cloud.session", {"agentId": sid, "cwd": str(workdir),
                                    "model": "m"})
             yield from events
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         _start_run("t", repo=str(tmp_path))
         job = _job_for(sid)
         assert job.done_event.wait(10)
@@ -558,7 +569,7 @@ class TestCompletionSummary:
             # those must join raw, not with injected separators.
             _narration_chunk("Implemented the retry wrapper in servi"),
             _narration_chunk("ces/http.py and added regression tests."),
-            ("sdk.result", {"status": "finished"}),
+            ("cloud.result", {"status": "finished"}),
         ]
         job = self._run_replay(monkeypatch, tmp_path, "s-sum", events)
 
@@ -592,7 +603,7 @@ class TestCompletionSummary:
             *_tool_round("t1"),
             _narration_chunk("Exploring the services."),
             *_tool_round("t2"),  # turn ends right after tool activity
-            ("sdk.result", {"status": "finished"}),
+            ("cloud.result", {"status": "finished"}),
         ]
         job = self._run_replay(monkeypatch, tmp_path, "s-fall", events)
 
@@ -606,71 +617,83 @@ class TestCompletionSummary:
 # ---------------------------------------------------------------------------
 
 class TestSendMessageResume:
-    def test_pre_v04_handle_threads_the_resume_id_to_run_sdk(
+    def test_legacy_bridge_era_handle_is_rejected_with_actionable_prose(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """A pre-v0.4 handle (keyed by the raw cursor sid, no alias field)
-        resumes by its own key via Agent.resume."""
+        """A pre-migration handle (no ``runtime`` field — a bridge-era
+        session whose agent id is not a cloud agent) cannot be continued
+        over the cloud transport: the send is REFUSED with a pointer to
+        cursor_create_session, and nothing is dispatched."""
         gc_handles.record("s-prior", repo=_resolved(tmp_path), status="completed")
-        release = threading.Event()
-        seq = _SdkSequence(_gated_replay_factory(release, sid="s-prior"))
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud",
+            lambda *a, **k: pytest.fail("legacy handle must not dispatch"),
+        )
 
-        ack = cursor_send_message("s-prior", "continue it")
-        try:
-            _assert_running_ack(ack)
-            assert "sent to s-prior" in ack
-            # The resume id reached the SDK layer (Agent.resume path).
-            assert seq.calls[0]["agent_id"] == "s-prior"
-        finally:
-            release.set()
-        assert _job_for("s-prior").done_event.wait(10)
+        out = cursor_send_message("s-prior", "continue it")
+        assert "legacy bridge-era session" in out
+        assert CREATE_TOOL_NAME in out
+        assert gc_jobs.registry.list_jobs() == []
+        assert _drain_completion_queue() == []
 
-    def test_legacy_acp_model_record_is_sanitized_on_resume(
+    def test_legacy_bracket_model_record_is_sanitized_before_the_api(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """A pre-swap handle recorded the ACP-era bracket model string
-        verbatim; re-sending must translate it to base id + params before
-        Agent.resume (passing it straight through was a live
-        BadRequestError). End-to-end through cursor_send_message with the
-        REAL run_sdk against the fake bridge client."""
+        """A handle can carry the bracket model string verbatim (still an
+        accepted create-time form); a send whose follow-up falls back to a
+        fresh create must translate it to base id + params before the API
+        (passing it straight through was a live BadRequestError).
+        End-to-end through cursor_send_message with the REAL run_cloud
+        against the fake REST client."""
         legacy = "claude-fable-5[thinking=true,context=300k,effort=high]"
         gc_handles.record(
             "s-legacy", repo=_resolved(tmp_path), status="completed",
-            model=legacy,
+            model=legacy, runtime="local", cursor_session_id="bc-old",
         )
-        agent = _FakeAgent(agent_id="s-legacy",
-                           runs=[_FakeRun(_happy_script())])
-        client = _FakeClient(agent)
-        _install_fake_sdk(monkeypatch, client)
+        client = _FakeRestClient(
+            agent_id="bc-legacy",
+            followup_error=gc_rest.RestApiError(
+                "cursor api POST .../runs -> 404 not_found: unknown agent",
+                status_code=404, code="not_found",
+            ),
+        )
+        _install_fake_rest(monkeypatch, client)
 
         cursor_send_message("s-legacy", "continue the work")
-        job = _job_for("s-legacy")
+        # The fallback minted a fresh agent, so the job is addressable by
+        # the NEW agent id once cloud.session lands.
+        assert _wait_until(
+            lambda: gc_jobs.registry.get_by_session("bc-legacy") is not None
+        )
+        job = _job_for("bc-legacy")
         assert job.done_event.wait(10)
 
-        assert client.agents.resume_calls[0]["options"] == {
-            "model": _FABLE_BRACKET_SELECTION
-        }
-        # The handle heals: sdk.session reports the base id, which is what
-        # gets recorded for the next resume.
+        # The fallback create carried the TRANSLATED model, never the
+        # bracket string.
+        call = client.create_calls[0]
+        assert call["model_id"] == _FABLE_BRACKET_SELECTION["id"]
+        assert call["model_params"] == _FABLE_BRACKET_SELECTION["params"]
+        # The handle heals: cloud.session reports the base id, which is
+        # what gets recorded for the next follow-up.
         assert gc_handles.get("s-legacy")["model"] == "claude-fable-5"
 
     def test_expired_handle_falls_back_to_fresh_session(
         self, clean_state, monkeypatch, tmp_path
     ):
-        """The SDK layer falls back to a fresh agent for an expired id; the
+        """The runner falls back to a fresh agent for an expired id; the
         session's alias is updated to the fresh sid — no crash, no hard
         failure."""
 
         def fallback_replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                            cancel_check=None, agent_id=None, model=None):
-            # Simulates sdk_runner's resume → fresh-agent fallback.
-            yield ("sdk.session", {"agentId": "s-fresh", "cwd": str(workdir),
+                            cancel_check=None, agent_id=None, model=None, **_kw):
+            # Simulates cloud_runner's follow-up → fresh-agent fallback.
+            yield ("cloud.session", {"agentId": "s-fresh", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        gc_handles.record("s-expired", repo=_resolved(tmp_path), status="completed")
-        monkeypatch.setattr(gc_sdk, "run_sdk", fallback_replay)
+        gc_handles.record("s-expired", repo=_resolved(tmp_path),
+                          status="completed", runtime="local")
+        monkeypatch.setattr(gc_cloud, "run_cloud", fallback_replay)
         cursor_send_message("s-expired", "t")
         job = _job_for("s-fresh")
         assert job.done_event.wait(10)
@@ -688,7 +711,7 @@ class TestSendMessageResume:
 class TestModelParam:
     def _run_and_capture(self, monkeypatch, tmp_path, sid, **start_kwargs):
         seq = _SdkSequence(_gated_replay_factory(_preset_event(), sid=sid))
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
         _start_run("t", repo=str(tmp_path), **start_kwargs)
         _job_for(sid).done_event.wait(10)
         return seq.calls[0]
@@ -720,7 +743,7 @@ class TestModelParam:
     ):
         release = threading.Event()
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-m5"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-m5"))
         ack = _start_run("t", repo=str(tmp_path), model="composer-x")
         try:
             _assert_running_ack(ack)
@@ -746,7 +769,7 @@ class TestCursorSendMessage:
             _gated_replay_factory(release1, sid="s-send"),
             _gated_replay_factory(release2, sid="s-send", early_edit=False),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
         first_job = _job_for("s-send")
@@ -791,7 +814,7 @@ class TestCursorSendMessage:
             _gated_replay_factory(_preset_event(), sid="s-f"),
             _gated_replay_factory(release2, sid="s-f", early_edit=False),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _start_run("task A", repo=str(tmp_path))
         first_job = _job_for("s-f")
@@ -815,7 +838,7 @@ class TestCursorSendMessage:
         """cursor_create_session dispatches NOTHING; the first send creates
         the cursor agent with the message as the task."""
         seq = _SdkSequence(_gated_replay_factory(_preset_event(), sid="s-lazy"))
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         ack = cursor_create_session(repo=str(tmp_path))
         name = ack.splitlines()[0].split("session: ")[1]
@@ -837,12 +860,12 @@ class TestCursorSendMessage:
         """No live job (process restart) but the handle table knows the repo:
         send re-prompts the session instead of erroring."""
         gc_handles.record("s-old", repo=_resolved(tmp_path), status="cancelled",
-                          model="recorded-model")
+                          model="recorded-model", runtime="local")
         release = threading.Event()
         seq = _SdkSequence(_gated_replay_factory(release, sid="s-old",
                                                  early_edit=False))
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         ack = cursor_send_message("s-old", "pick it back up")
         try:
@@ -876,7 +899,8 @@ class TestCursorSendMessage:
 
     def test_recorded_repo_gone_is_a_graceful_error(self, clean_state, tmp_path):
         gone = tmp_path / "was-here"
-        gc_handles.record("s-gone", repo=str(gone), status="cancelled")
+        gc_handles.record("s-gone", repo=str(gone), status="cancelled",
+                          runtime="local")
         out = cursor_send_message("s-gone", "hello")
         assert "no longer exists" in out
 
@@ -898,7 +922,7 @@ class TestCursorStatusReadOnly:
         """THE critical property: asking "how's it going?" must not kill the
         run — no cancel, no mutation, and the run still completes normally."""
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-ro"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-ro"))
 
         _assert_running_ack(_start_run("long task", repo=str(tmp_path)))
         job = _job_for("s-ro")
@@ -935,7 +959,7 @@ class TestCursorStatusReadOnly:
     def test_finished_job_status_shows_summary_peek_without_diffs(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(),
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(_preset_event(),
                                                                      sid="s-fin"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-fin")
@@ -955,7 +979,7 @@ class TestCursorStatusReadOnly:
         event — so a caller can spot a silent run without touching it.
         Fresh while events stream; frozen at finished_at once terminal."""
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk",
+        monkeypatch.setattr(gc_cloud, "run_cloud",
                             _gated_replay_factory(release, sid="s-act"))
 
         _start_run("t", repo=str(tmp_path))
@@ -1042,11 +1066,12 @@ class TestCursorStatusReadOnly:
 class TestOrphanedHandleReconciliation:
     def _seed_orphan(self, tmp_path, name="s-orphan"):
         """Exactly the post-restart world: a persisted running handle
-        (written by the dead process at sdk.session) and an empty job
+        (written by the dead process at cloud.session) and an empty job
         registry — clean_state guarantees the latter."""
         gc_handles.record(
             name, repo=_resolved(tmp_path), status="running",
             task="long task", cursor_session_id="agent-orphan",
+            runtime="local",
         )
         return name
 
@@ -1088,7 +1113,7 @@ class TestOrphanedHandleReconciliation:
         seq = _SdkSequence(_gated_replay_factory(release, sid="agent-orphan",
                                                  early_edit=False))
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         ack = cursor_send_message("s-orphan", "pick it back up")
         try:
@@ -1102,7 +1127,7 @@ class TestOrphanedHandleReconciliation:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk",
+        monkeypatch.setattr(gc_cloud, "run_cloud",
                             _gated_replay_factory(release, sid="s-live"))
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-live")
@@ -1129,7 +1154,7 @@ class TestCursorStop:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()  # never set: only the cancel ends the run
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-stop"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-stop"))
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-stop")
@@ -1161,7 +1186,7 @@ class TestCursorStop:
         job is live."""
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _cancel_deaf_replay_factory(release, sid="s-deaf")
+            gc_cloud, "run_cloud", _cancel_deaf_replay_factory(release, sid="s-deaf")
         )
         monkeypatch.setattr(gc, "_STOP_WAIT_S", 0.3)
 
@@ -1194,7 +1219,7 @@ class TestCursorStop:
     def test_stop_on_finished_run_is_graceful_and_idempotent(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(),
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(_preset_event(),
                                                                      sid="s-idem"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-idem")
@@ -1251,20 +1276,20 @@ class TestTerminalStatusRepairInvariant:
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                    cancel_check=None, agent_id=None, model=None,
-                   first_event_timeout_s=None):
-            yield ("sdk.session", {"agentId": "s-repair", "cwd": str(workdir),
+                   first_event_timeout_s=None, **_kw):
+            yield ("cloud.session", {"agentId": "s-repair", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
             while not gate_event.is_set():
                 time.sleep(0.01)
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "assistant",
                 "message": {"content": [{"type": "text", "text": "still here"}]},
             })
             while not gate_end.is_set():
                 time.sleep(0.01)
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-repair")
         name = job.session_name
@@ -1308,7 +1333,7 @@ class TestSameRepoConcurrency:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-a"))
+        monkeypatch.setattr(gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-a"))
         first = _start_run("task A", repo=str(tmp_path))
         try:
             _assert_running_ack(first)
@@ -1339,7 +1364,7 @@ class TestSameRepoConcurrency:
             _gated_replay_factory(release, sid="s-ra", early_edit=False),
             _gated_replay_factory(release, sid="s-rb", early_edit=False),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         res_a = _start_run("a", repo=str(repo_a))
         res_b = _start_run("b", repo=str(repo_b))
@@ -1357,7 +1382,7 @@ class TestSameRepoConcurrency:
             _gated_replay_factory(_preset_event(), sid="s-one"),
             _gated_replay_factory(_preset_event(), sid="s-two"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
         _start_run("t", repo=str(tmp_path))
         assert _job_for("s-one").done_event.wait(10)
 
@@ -1488,14 +1513,14 @@ class TestGitFallback:
         (git_repo / "pre.txt").write_text("pre dirty before run\n")
 
         def shell_edit_replay(*_a, **_k):
-            yield ("sdk.session", {"agentId": "s-git", "cwd": str(git_repo), "model": "m"})
+            yield ("cloud.session", {"agentId": "s-git", "cwd": str(git_repo), "model": "m"})
             # Simulates cursor editing through a shell command: no diff
             # content ever appears on the SDK stream.
             (git_repo / "tool.txt").write_text("orig\nedited by shell\n")
             (git_repo / "new.txt").write_text("brand new\n")
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", shell_edit_replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", shell_edit_replay)
         _start_run("edit via shell", repo=str(git_repo))
         job = _job_for("s-git")
         assert job.done_event.wait(10)
@@ -1512,13 +1537,13 @@ class TestGitFallback:
         """A file already captured from the SDK stream is not re-added."""
 
         def stream_and_shell(*_a, **_k):
-            yield ("sdk.session", {"agentId": "s-win", "cwd": str(git_repo), "model": "m"})
+            yield ("cloud.session", {"agentId": "s-win", "cwd": str(git_repo), "model": "m"})
             (git_repo / "tool.txt").write_text("orig\nedited\n")
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "running", "args": {"path": str(git_repo / "tool.txt")},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "edit_file",
                 "status": "completed",
                 "result": {
@@ -1526,9 +1551,9 @@ class TestGitFallback:
                     "oldText": "orig\n", "newText": "orig\nedited\n",
                 },
             })
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", stream_and_shell)
+        monkeypatch.setattr(gc_cloud, "run_cloud", stream_and_shell)
         _start_run("t", repo=str(git_repo))
         job = _job_for("s-win")
         assert job.done_event.wait(10)
@@ -1555,13 +1580,13 @@ class TestAllTerminalStatesDeliver:
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, agent_id=None, model=None):
-            yield ("sdk.session", {"agentId": sid, "cwd": str(workdir), "model": "m"})
+                   cancel_check=None, agent_id=None, model=None, **_kw):
+            yield ("cloud.session", {"agentId": sid, "cwd": str(workdir), "model": "m"})
             release.wait(10)
             yield from pre_events
             yield terminal_event
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         res = _start_run("t", repo=str(tmp_path))
         assert "running in background" in res, f"run never armed: {res}"
         job = _job_for(sid)
@@ -1574,7 +1599,7 @@ class TestAllTerminalStatesDeliver:
     def test_completed_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-ok",
-            ("sdk.result", {"status": "finished"}),
+            ("cloud.result", {"status": "finished"}),
         )
         assert job.status == "completed"
         assert evt["status"] == "completed"
@@ -1583,7 +1608,7 @@ class TestAllTerminalStatesDeliver:
     def test_cancelled_run_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-c",
-            ("sdk.result", {"status": "cancelled"}),
+            ("cloud.result", {"status": "cancelled"}),
         )
         # The JOB status names the real terminal state...
         assert job.status == "cancelled"
@@ -1596,7 +1621,7 @@ class TestAllTerminalStatesDeliver:
     def test_timeout_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-t",
-            ("sdk.error", {"error": "cursor run timed out: no activity for 5s", "timeout": True}),
+            ("cloud.error", {"error": "cursor run timed out: no activity for 5s", "timeout": True}),
         )
         assert job.status == "timeout"
         assert evt["status"] == "timeout"
@@ -1606,7 +1631,7 @@ class TestAllTerminalStatesDeliver:
     def test_midrun_failure_delivers(self, clean_state, monkeypatch, tmp_path):
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-x",
-            ("sdk.error", {"error": "cursor-sdk stream failed mid-run: boom"}),
+            ("cloud.error", {"error": "cursor-sdk stream failed mid-run: boom"}),
         )
         assert job.status == "failed"
         assert evt["status"] == "failed"
@@ -1622,7 +1647,7 @@ class TestAllTerminalStatesDeliver:
         stays out of the way.)"""
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-err-detail",
-            ("sdk.error", {
+            ("cloud.error", {
                 "error": "ServerError: upstream 502 from the agent backend",
                 "retryable": True,
                 "retry_after": "30",
@@ -1648,7 +1673,7 @@ class TestAllTerminalStatesDeliver:
         rendered as 'not retryable')."""
         job, evt = self._run_armed(
             monkeypatch, tmp_path, "s-err-bare",
-            ("sdk.error", {
+            ("cloud.error", {
                 "error": "cursor run ended with status: error",
                 "retryable": None,
                 "retry_after": None,
@@ -1674,18 +1699,18 @@ class TestAllTerminalStatesDeliver:
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, agent_id=None, model=None):
-            yield ("sdk.session", {"agentId": "s-drop", "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None, **_kw):
+            yield ("cloud.session", {"agentId": "s-drop", "cwd": str(workdir),
                                    "model": "m"})
             release.wait(10)
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "assistant",
                 "message": {"content": [{
                     "type": "text",
                     "text": "Now let me explore the relevant code\n",
                 }]},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "assistant",
                 "message": {"content": [{
                     "type": "text",
@@ -1693,9 +1718,9 @@ class TestAllTerminalStatesDeliver:
                             "closed with error code CANCEL (0x8)",
                 }]},
             })
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         res = _start_run("t", repo=str(tmp_path))
         assert "running in background" in res, f"run never armed: {res}"
         job = _job_for("s-drop")
@@ -1762,7 +1787,7 @@ class TestProgressSubscriptions:
         create + send so subscription plumbing runs end-to-end."""
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid=sid)
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_send_message(name, "task", **send_kw)
@@ -1972,7 +1997,7 @@ class TestProgressSubscriptions:
 
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-persist")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="agent-persist")
         )
         collected = []
         _assert_running_ack(cursor_send_message(name, "task"))
@@ -2043,7 +2068,7 @@ class TestProgressSubscriptions:
             _gated_replay_factory(release1, sid="agent-ir"),
             _gated_replay_factory(release2, sid="agent-ir"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         _assert_running_ack(cursor_send_message(name, "task", update_interval_s=0.05))
         collected = []
@@ -2082,7 +2107,7 @@ class TestProgressSubscriptions:
             _gated_replay_factory(release_a, sid="agent-a"),
             _gated_replay_factory(release_b, sid="agent-b"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         name_a = _created_name(cursor_create_session(repo=str(repo_a)))
         name_b = _created_name(cursor_create_session(repo=str(repo_b)))
@@ -2181,22 +2206,22 @@ class TestProgressSubscriptions:
         release = threading.Event()
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, agent_id=None, model=None):
-            yield ("sdk.session", {"agentId": "agent-pending",
+                   cancel_check=None, agent_id=None, model=None, **_kw):
+            yield ("cloud.session", {"agentId": "agent-pending",
                                    "cwd": str(workdir), "model": "m"})
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t9", "name": "shell",
                 "status": "running",
                 "args": {"command": "sleep 999"},
             })
             while not release.is_set():
                 if cancel_check and cancel_check():
-                    yield ("sdk.result", {"status": "cancelled"})
+                    yield ("cloud.result", {"status": "cancelled"})
                     return
                 time.sleep(0.01)
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         _assert_running_ack(
             cursor_send_message(name, "task", update_interval_s=0.05)
@@ -2250,7 +2275,7 @@ class TestIntervalValidation:
     def test_send_negative_rejected_before_dispatch(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_sdk, "run_sdk", _reject_dispatch)
+        monkeypatch.setattr(gc_cloud, "run_cloud", _reject_dispatch)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         out = cursor_send_message(name, "task", update_interval_s=-5)
         assert "update_interval_s must be >= 0" in out
@@ -2268,7 +2293,7 @@ class TestIntervalValidation:
     def test_send_non_numeric_rejected_before_dispatch(
         self, clean_state, monkeypatch, tmp_path
     ):
-        monkeypatch.setattr(gc_sdk, "run_sdk", _reject_dispatch)
+        monkeypatch.setattr(gc_cloud, "run_cloud", _reject_dispatch)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         out = cursor_send_message(name, "task", update_interval_s="fast")
         assert "update_interval_s must be a number" in out
@@ -2312,7 +2337,7 @@ class TestIntervalValidation:
         monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 20.0)
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-clamp")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="agent-clamp")
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_send_message(name, "task", update_interval_s=2)
@@ -2331,7 +2356,7 @@ class TestIntervalValidation:
     ):
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-max")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="agent-max")
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_send_message(name, "task", update_interval_s=999_999_999)
@@ -2365,7 +2390,7 @@ class TestIntervalValidation:
         monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 15.0)
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="agent-ok")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="agent-ok")
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         ack = cursor_send_message(name, "task", update_interval_s=45)
@@ -2395,7 +2420,7 @@ class TestDigestFloodGuards:
     def _held_run(self, monkeypatch, tmp_path, sid="agent-flood", **send_kw):
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid=sid)
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         _assert_running_ack(cursor_send_message(name, "task", **send_kw))
@@ -2449,7 +2474,7 @@ class TestDigestFloodGuards:
             _gated_replay_factory(release1, sid="agent-fl-ir"),
             _gated_replay_factory(release2, sid="agent-fl-ir"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         _assert_running_ack(
             cursor_send_message(name, "task", update_interval_s=30)
@@ -2485,7 +2510,7 @@ class TestDigestFloodGuards:
             _gated_replay_factory(release1, sid="agent-fl-stack"),
             _gated_replay_factory(release2, sid="agent-fl-stack"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         _assert_running_ack(
             cursor_send_message(name, "task", update_interval_s=30)
@@ -2542,7 +2567,7 @@ class TestMultiSubscriberDelivery:
         """A held-open run dispatched by hermes session ``key``."""
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid=sid)
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid=sid)
         )
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: key)
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
@@ -2834,7 +2859,7 @@ class TestMultiSubscriberDelivery:
         interval), exactly like a persisted map subscription."""
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk",
+            gc_cloud, "run_cloud",
             _gated_replay_factory(release, sid="agent-legacy"),
         )
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:old")
@@ -2870,39 +2895,39 @@ def _terminal_error_replay(sid="agent-zp", retryable=True, retry_after=None,
 
     def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
                cancel_check=None, agent_id=None, model=None,
-               first_event_timeout_s=None):
-        yield ("sdk.session", {"agentId": sid, "cwd": str(workdir),
+               first_event_timeout_s=None, **_kw):
+        yield ("cloud.session", {"agentId": sid, "cwd": str(workdir),
                                "model": "m", "resumed": bool(agent_id)})
         if release is not None:
             while not release.is_set():
                 if cancel_check and cancel_check():
-                    yield ("sdk.result", {"status": "cancelled"})
+                    yield ("cloud.result", {"status": "cancelled"})
                     return
                 time.sleep(0.01)
         for i in range(content_chunks):
             yield _narration_chunk(f"narration {i} ")
         if edit:
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "e1", "name": "edit_file",
                 "status": "running", "args": {"path": f"{workdir}/f1.py"},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "e1", "name": "edit_file",
                 "status": "completed",
                 "result": {"path": f"{workdir}/f1.py",
                            "oldText": "a\n", "newText": "a\nb\n"},
             })
         if meaningful:
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "shell",
                 "status": "running", "args": {"command": "ls"},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "shell",
                 "status": "completed",
                 "result": {"exitCode": 0, "stdout": "ok"},
             })
-        yield ("sdk.error", {
+        yield ("cloud.error", {
             "error": "ServerError: bridge went stale",
             "retryable": retryable,
             "retry_after": retry_after,
@@ -2924,34 +2949,27 @@ def _lifecycle_trail(name):
 
 
 class TestZeroProgressAutoRetry:
-    """A terminal-error run with ZERO meaningful events (the stale-bridge
-    signature, live incident 2026-07-04) is transparently re-sent on the
-    same agent — bridge recycled before the first retry, jsonl-only
+    """A terminal-error run with ZERO meaningful events (born from the
+    stale-bridge live incident 2026-07-04; the signature is transport-
+    agnostic) is transparently re-sent on the same agent — jsonl-only
     lifecycle signal, no user-facing failure. Meaningful progress, a
     non-retryable error, or an exhausted budget surfaces the detailed
     failure from the error-observability path instead."""
 
     def _fast_retries(self, monkeypatch):
-        """Zero the backoff ladder and stub the bridge recycle, returning
-        the recorded recycle calls."""
+        """Zero the backoff ladder so retries fire immediately."""
         monkeypatch.setattr(gc, "_AUTO_RETRY_BACKOFF_S", (0.0, 0.0))
-        recycles = []
-        monkeypatch.setattr(
-            gc_sdk, "recycle_bridge",
-            lambda workspace: recycles.append(workspace) or True,
-        )
-        return recycles
 
-    def test_zero_progress_error_recycles_bridge_and_retry_succeeds(
+    def test_zero_progress_error_is_retried_and_retry_succeeds(
         self, clean_state, monkeypatch, tmp_path
     ):
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release = threading.Event()
         seq = _SdkSequence(
             _terminal_error_replay(sid="agent-zp"),
             _gated_replay_factory(release, sid="agent-zp"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-zp")
@@ -2967,7 +2985,6 @@ class TestZeroProgressAutoRetry:
         assert "error" not in job.result
         assert len(seq.calls) == 2
         assert seq.calls[1]["agent_id"] == "agent-zp"  # SAME agent resumed
-        assert recycles == [job.repo]
 
         events = _drain_completion_queue()
         completions = _completion_events(events)
@@ -2976,29 +2993,28 @@ class TestZeroProgressAutoRetry:
         assert completions[0]["error"] is None
 
         # The jsonl log shows the transparent recovery, in order: failed
-        # first run → autoretry marker (bridge recycled) → clean second run.
+        # first run → autoretry marker → clean second run.
         trail = _lifecycle_trail(job.session_name)
         marks = [n for n, _ in trail
-                 if n in ("run.started", "run.failed", "sdk.autoretry",
+                 if n in ("run.started", "run.failed", "cloud.autoretry",
                           "run.completed")]
-        assert marks == ["run.started", "run.failed", "sdk.autoretry",
+        assert marks == ["run.started", "run.failed", "cloud.autoretry",
                          "run.started", "run.completed"]
-        autoretry = next(e for n, e in trail if n == "sdk.autoretry")
+        autoretry = next(e for n, e in trail if n == "cloud.autoretry")
         assert autoretry["attempt"] == 1
-        assert autoretry["bridge_recycled"] is True
         assert "zero-progress" in autoretry["reason"]
         assert "ServerError: bridge went stale" in autoretry["reason"]
 
     def test_error_after_meaningful_progress_does_not_auto_retry(
         self, clean_state, monkeypatch, tmp_path
     ):
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release = threading.Event()
         seq = _SdkSequence(
             _terminal_error_replay(sid="agent-mp", meaningful=True,
                                    release=release),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-mp")
@@ -3006,10 +3022,9 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 1  # no re-send
-        assert recycles == []
         assert job.status == "failed"
         assert not [n for n, _ in _lifecycle_trail(job.session_name)
-                    if n == "sdk.autoretry"]
+                    if n == "cloud.autoretry"]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         evt = completions[0]
@@ -3022,7 +3037,7 @@ class TestZeroProgressAutoRetry:
     def test_retries_exhausted_surface_the_detailed_failure(
         self, clean_state, monkeypatch, tmp_path
     ):
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release = threading.Event()
         seq = _SdkSequence(
             _terminal_error_replay(sid="agent-ex", release=release,
@@ -3030,7 +3045,7 @@ class TestZeroProgressAutoRetry:
             _terminal_error_replay(sid="agent-ex"),
             _terminal_error_replay(sid="agent-ex"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-ex")
@@ -3038,12 +3053,10 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 3  # the send + both retries
-        assert recycles == [job.repo, job.repo]  # recycled before EVERY retry
         assert job.status == "failed"
         trail = [e for n, e in _lifecycle_trail(job.session_name)
-                 if n == "sdk.autoretry"]
+                 if n == "cloud.autoretry"]
         assert [e["attempt"] for e in trail] == [1, 2]
-        assert [e["bridge_recycled"] for e in trail] == [True, True]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         evt = completions[0]
@@ -3059,13 +3072,13 @@ class TestZeroProgressAutoRetry:
         signature of committed/pushed work) and then died with terminal
         status "error" must NOT be re-prompted; the failure is delivered
         immediately through the normal path."""
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release = threading.Event()
         seq = _SdkSequence(
             _terminal_error_replay(sid="agent-fd", edit=True,
                                    release=release),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-fd")
@@ -3073,10 +3086,9 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 1  # no re-send
-        assert recycles == []
         assert job.status == "failed"
         assert not [n for n, _ in _lifecycle_trail(job.session_name)
-                    if n == "sdk.autoretry"]
+                    if n == "cloud.autoretry"]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         evt = completions[0]
@@ -3093,7 +3105,7 @@ class TestZeroProgressAutoRetry:
         of content deltas, no diffs, no completed tools) is still the
         zero-progress signature — the transparent retry must fire and its
         sdk.autoretry marker must land in the session jsonl."""
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release, release2 = threading.Event(), threading.Event()
         release2.set()  # the retry run flows straight through
         seq = _SdkSequence(
@@ -3101,7 +3113,7 @@ class TestZeroProgressAutoRetry:
                                    release=release),
             _gated_replay_factory(release2, sid="agent-tc"),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-tc")
@@ -3109,10 +3121,9 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 2  # retried once, in place
-        assert recycles == [job.repo]
         assert job.status == "completed"
         trail = [e for n, e in _lifecycle_trail(job.session_name)
-                 if n == "sdk.autoretry"]
+                 if n == "cloud.autoretry"]
         assert [e["attempt"] for e in trail] == [1]
         assert "zero-progress" in trail[0]["reason"]
         completions = _completion_events(_drain_completion_queue())
@@ -3127,20 +3138,20 @@ class TestZeroProgressAutoRetry:
         a retry that streams nothing settles the job FAILED — not a
         multi-minute silent "running" zombie — and the failure is
         delivered."""
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         monkeypatch.setattr(gc, "_AUTO_RETRY_FIRST_EVENT_S", 0.2)
         release = threading.Event()
 
         def silent_retry(task, workdir, inactivity_timeout_s=0.0,
                          max_wall_s=0.0, cancel_check=None, agent_id=None,
-                         model=None, first_event_timeout_s=None):
-            yield ("sdk.session", {"agentId": "agent-wd", "cwd": str(workdir),
+                         model=None, first_event_timeout_s=None, **_kw):
+            yield ("cloud.session", {"agentId": "agent-wd", "cwd": str(workdir),
                                    "model": "m", "resumed": bool(agent_id)})
             if not first_event_timeout_s:
                 # Unfixed plumbing (no watchdog handed to the retry):
                 # finish clean so the assertions below fail fast instead
                 # of hanging on a watchdog that never fires.
-                yield ("sdk.result", {"status": "finished"})
+                yield ("cloud.result", {"status": "finished"})
                 return
             # Emulate the real run_sdk contract (unit-tested separately in
             # TestSdkRunner): total silence until the first-event window
@@ -3148,10 +3159,10 @@ class TestZeroProgressAutoRetry:
             deadline = time.monotonic() + float(first_event_timeout_s)
             while time.monotonic() < deadline:
                 if cancel_check and cancel_check():
-                    yield ("sdk.result", {"status": "cancelled"})
+                    yield ("cloud.result", {"status": "cancelled"})
                     return
                 time.sleep(0.01)
-            yield ("sdk.error", {"error": (
+            yield ("cloud.error", {"error": (
                 "cursor run aborted: produced no stream events within "
                 f"{first_event_timeout_s}s of dispatch"
             )})
@@ -3160,7 +3171,7 @@ class TestZeroProgressAutoRetry:
             _terminal_error_replay(sid="agent-wd", release=release),
             silent_retry,
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(
             cursor_send_message(
@@ -3178,14 +3189,13 @@ class TestZeroProgressAutoRetry:
         assert seq.calls[0]["first_event_timeout_s"] is None
         assert seq.calls[1]["first_event_timeout_s"] == 0.2
         assert seq.calls[1]["inactivity_timeout_s"] == 1800.0
-        assert recycles == [job.repo]
 
         # Settled FAILED (not timeout/cancelled), no further retries, and
         # the failure delivered with the autoretry marker in the log.
         assert job.status == "failed"
         assert "no stream events" in (job.run_error or "")
         trail = [e for n, e in _lifecycle_trail(job.session_name)
-                 if n == "sdk.autoretry"]
+                 if n == "cloud.autoretry"]
         assert [e["attempt"] for e in trail] == [1]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
@@ -3195,13 +3205,13 @@ class TestZeroProgressAutoRetry:
     def test_non_retryable_zero_progress_error_does_not_retry(
         self, clean_state, monkeypatch, tmp_path
     ):
-        recycles = self._fast_retries(monkeypatch)
+        self._fast_retries(monkeypatch)
         release = threading.Event()
         seq = _SdkSequence(
             _terminal_error_replay(sid="agent-nr", retryable=False,
                                    release=release),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("agent-nr")
@@ -3209,10 +3219,9 @@ class TestZeroProgressAutoRetry:
         assert job.done_event.wait(10)
 
         assert len(seq.calls) == 1
-        assert recycles == []
         assert job.status == "failed"
         assert not [n for n, _ in _lifecycle_trail(job.session_name)
-                    if n == "sdk.autoretry"]
+                    if n == "cloud.autoretry"]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         assert ("run failed: ServerError: bridge went stale (not retryable)"
@@ -3277,17 +3286,17 @@ class TestRegistration:
         assert "interrupt" in desc
         assert "re-prompt" in desc
 
-    def test_check_fn_false_without_sdk_package(self, monkeypatch):
-        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: False)
+    def test_check_fn_false_without_http_layer(self, monkeypatch):
+        monkeypatch.setattr(gc_cloud, "rest_available", lambda: False)
         assert check_cursor_available() is False
 
     def test_check_fn_false_without_resolvable_repo(self, monkeypatch):
-        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+        monkeypatch.setattr(gc_cloud, "rest_available", lambda: True)
         monkeypatch.setattr(gc, "_default_repo", lambda: None)
         assert check_cursor_available() is False
 
-    def test_check_fn_true_with_sdk_and_repo(self, monkeypatch):
-        monkeypatch.setattr(gc_sdk, "sdk_available", lambda: True)
+    def test_check_fn_true_with_http_layer_and_repo(self, monkeypatch):
+        monkeypatch.setattr(gc_cloud, "rest_available", lambda: True)
         # _default_repo falls back to os.getcwd(), which always exists.
         assert check_cursor_available() is True
 
@@ -3295,7 +3304,7 @@ class TestRegistration:
         def boom():
             raise RuntimeError("probe failed")
 
-        monkeypatch.setattr(gc_sdk, "sdk_available", boom)
+        monkeypatch.setattr(gc_cloud, "rest_available", boom)
         assert check_cursor_available() is False
 
 
@@ -3622,7 +3631,7 @@ class TestEventLog:
 class TestEventLogIntegration:
     def _run_to_completion(self, monkeypatch, tmp_path, sid="s-spill"):
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(), sid=sid)
+            gc_cloud, "run_cloud", _gated_replay_factory(_preset_event(), sid=sid)
         )
         _start_run("t", repo=str(tmp_path))
         job = _job_for(sid)
@@ -3695,20 +3704,20 @@ class TestEventLogIntegration:
         big = "y" * 50_000
 
         def replay(task, workdir, inactivity_timeout_s=0.0, max_wall_s=0.0,
-                   cancel_check=None, agent_id=None, model=None):
-            yield ("sdk.session", {"agentId": "s-bigout", "cwd": str(workdir),
+                   cancel_check=None, agent_id=None, model=None, **_kw):
+            yield ("cloud.session", {"agentId": "s-bigout", "cwd": str(workdir),
                                    "model": "m", "resumed": False})
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "shell",
                 "status": "running", "args": {"command": "generate"},
             })
-            yield ("sdk.message", {
+            yield ("cloud.message", {
                 "type": "tool_call", "call_id": "t1", "name": "shell",
                 "status": "completed", "result": {"exitCode": 0, "stdout": big},
             })
-            yield ("sdk.result", {"status": "finished"})
+            yield ("cloud.result", {"status": "finished"})
 
-        monkeypatch.setattr(gc_sdk, "run_sdk", replay)
+        monkeypatch.setattr(gc_cloud, "run_cloud", replay)
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-bigout")
         assert job.done_event.wait(10)
@@ -3767,7 +3776,7 @@ class TestHandleScoping:
     ):
         monkeypatch.setattr(gc, "_resolve_session_key", lambda: "gw:alice")
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(_preset_event(), sid="s-mine")
+            gc_cloud, "run_cloud", _gated_replay_factory(_preset_event(), sid="s-mine")
         )
         _start_run("t", repo=str(tmp_path))
         assert _job_for("s-mine").done_event.wait(10)
@@ -3925,14 +3934,15 @@ class TestCursorCreateSession:
         self, clean_state, monkeypatch, tmp_path
     ):
         boom = lambda *a, **k: pytest.fail("create must not start a run")
-        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
+        monkeypatch.setattr(gc_cloud, "run_cloud", boom)
 
         ack = cursor_create_session(repo=str(tmp_path))
         name = _created_name(ack)
         # The exact ack format from the spec: 2 headers + instruction.
         assert ack == (
             f"session: {name}\n"
-            f"repo: {_resolved(tmp_path)} · model: {gc._resolve_model(None) or 'default'}\n"
+            f"repo: {_resolved(tmp_path)} · model: "
+            f"{gc._resolve_model(None) or 'default'} · runtime: local\n"
             "created. send work with cursor_send_message."
         )
         # Named like playful-space-bunny, from the embedded word lists.
@@ -3983,7 +3993,7 @@ class TestCursorCreateSession:
         """After the first send binds the cursor UUID, name and UUID are
         interchangeable across status/stop/events/send."""
         monkeypatch.setattr(
-            gc_sdk, "run_sdk",
+            gc_cloud, "run_cloud",
             _gated_replay_factory(_preset_event(), sid="11111111-2222-3333"),
         )
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
@@ -4016,10 +4026,10 @@ class TestCreateModelValidation:
     def test_malformed_model_is_rejected_at_create(
         self, clean_state, monkeypatch, tmp_path, bad
     ):
-        # The rejection must stay lazy: no run, no bridge.
-        boom = lambda *a, **k: pytest.fail("create must not touch the sdk")
-        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
-        monkeypatch.setattr(gc_sdk, "get_bridge", boom)
+        # The rejection must stay lazy: no run, no API contact.
+        boom = lambda *a, **k: pytest.fail("create must not touch the API")
+        monkeypatch.setattr(gc_cloud, "run_cloud", boom)
+        monkeypatch.setattr(gc_cloud, "make_client", boom)
 
         out = cursor_create_session(repo=str(tmp_path), model=bad)
         assert "cannot create session" in out
@@ -4035,7 +4045,7 @@ class TestCreateModelValidation:
         (the documented deferred-validation contract) and the first send
         owns the failure."""
         boom = lambda *a, **k: pytest.fail("create must not start a run")
-        monkeypatch.setattr(gc_sdk, "run_sdk", boom)
+        monkeypatch.setattr(gc_cloud, "run_cloud", boom)
 
         ack = cursor_create_session(
             repo=str(tmp_path), model="totally-fake-model-9000"
@@ -4058,15 +4068,13 @@ class TestCreateModelValidation:
     ):
         """The deferred (catalog) failure at first send must attribute the
         error to the model param chosen at create, not read like a generic
-        sdk failure on the send."""
-        client = _FakeClient(
-            _FakeAgent(),
-            create_error=_sdk_error(
-                'model "totally-fake-model-9000" not found',
-                is_retryable=False,
-            ),
-        )
-        _install_fake_sdk(monkeypatch, client)
+        API failure on the send."""
+        client = _FakeRestClient(create_error=gc_rest.RestApiError(
+            'cursor api POST /v1/agents -> 400 invalid_model: model '
+            '"totally-fake-model-9000" not found',
+            status_code=400, code="invalid_model",
+        ))
+        _install_fake_rest(monkeypatch, client)
 
         name = _created_name(cursor_create_session(
             repo=str(tmp_path), model="totally-fake-model-9000"
@@ -4082,10 +4090,10 @@ class TestCreateModelValidation:
         """No explicit model at create → the same failure stays generic
         (the default/configured-model path is untouched)."""
         monkeypatch.setattr(gc, "_configured_model", lambda: None)
-        client = _FakeClient(
-            _FakeAgent(), create_error=_sdk_error("boom", is_retryable=False)
-        )
-        _install_fake_sdk(monkeypatch, client)
+        client = _FakeRestClient(create_error=gc_rest.RestApiError(
+            "cursor api POST /v1/agents -> 500: boom", status_code=500,
+        ))
+        _install_fake_rest(monkeypatch, client)
 
         name = _created_name(cursor_create_session(repo=str(tmp_path)))
         out = cursor_send_message(name, "hi")
@@ -4221,7 +4229,7 @@ class TestEventsSincePrompt:
             _gated_replay_factory(_preset_event(), sid="s-mark"),
             _gated_replay_factory(release2, sid="s-mark", early_edit=False),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _start_run("task A", repo=str(tmp_path))
         job = _job_for("s-mark")
@@ -4255,7 +4263,7 @@ class TestEventsSincePrompt:
             _gated_replay_factory(release1, sid="s-remark"),
             _gated_replay_factory(release2, sid="s-remark", early_edit=False),
         )
-        monkeypatch.setattr(gc_sdk, "run_sdk", seq)
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
         _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
         first_job = _job_for("s-remark")
@@ -4280,7 +4288,7 @@ class TestEventsSincePrompt:
     ):
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-busy2")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-busy2")
         )
         _assert_running_ack(_start_run("task A", repo=str(tmp_path)))
         job = _job_for("s-busy2")
@@ -4321,7 +4329,7 @@ class TestEventsSincePrompt:
     ):
         release = threading.Event()
         monkeypatch.setattr(
-            gc_sdk, "run_sdk", _gated_replay_factory(release, sid="s-cmark")
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="s-cmark")
         )
         _assert_running_ack(_start_run("t", repo=str(tmp_path)))
         job = _job_for("s-cmark")
@@ -4397,14 +4405,16 @@ class TestCursorList:
         gc_handles.record(
             "brave-jade-owl", repo="/r/a", status="completed",
             session_key="gw:me", files_changed_count=3, duration_s=61.2,
+            runtime="local",
         )
         out = cursor_list()
         lines = out.splitlines()
         header = [c.strip() for c in lines[0].split("\t")]
-        assert header == ["session", "repo", "status", "elapsed",
+        assert header == ["session", "repo", "runtime", "status", "elapsed",
                           "files", "last_activity"]
         row = [c.strip() for c in lines[1].split("\t")]
-        assert row == ["brave-jade-owl", "/r/a", "completed", "61s", "3", "—"]
+        assert row == ["brave-jade-owl", "/r/a", "local", "completed",
+                       "61s", "3", "—"]
 
     def test_default_scope_is_the_current_hermes_session(
         self, clean_state, monkeypatch
@@ -4423,7 +4433,7 @@ class TestCursorList:
         self, clean_state, monkeypatch, tmp_path
     ):
         release = threading.Event()
-        monkeypatch.setattr(gc_sdk, "run_sdk",
+        monkeypatch.setattr(gc_cloud, "run_cloud",
                             _gated_replay_factory(release, sid="s-live-list"))
         _start_run("t", repo=str(tmp_path))
         job = _job_for("s-live-list")
@@ -4434,8 +4444,8 @@ class TestCursorList:
                 if job.session_name in l
             ][0]
             cells = [c.strip() for c in row.split("\t")]
-            assert cells[2] == "running"
-            assert cells[4] == "1"  # live files count, not the stale record
+            assert cells[3] == "running"
+            assert cells[5] == "1"  # live files count, not the stale record
         finally:
             release.set()
         assert job.done_event.wait(10)
@@ -5208,19 +5218,19 @@ class TestModelTranslation:
         assert "-thinking" not in gc_runner.DEFAULT_MODEL
 
     def test_plain_base_id_passes_through(self):
-        assert gc_sdk.translate_model("gpt-5.3-codex") == ("gpt-5.3-codex", None)
+        assert gc_cloud.translate_model("gpt-5.3-codex") == ("gpt-5.3-codex", None)
 
     def test_none_and_blank_pass_through(self):
-        assert gc_sdk.translate_model(None) == (None, None)
-        assert gc_sdk.translate_model("   ") == (None, None)
+        assert gc_cloud.translate_model(None) == (None, None)
+        assert gc_cloud.translate_model("   ") == (None, None)
 
     def test_thinking_level_suffix_becomes_params(self):
-        value, warning = gc_sdk.translate_model("claude-fable-5-thinking-high")
+        value, warning = gc_cloud.translate_model("claude-fable-5-thinking-high")
         assert warning is None
         assert value == _FABLE_THINKING_HIGH_SELECTION
 
     def test_bare_thinking_suffix_becomes_thinking_param(self):
-        value, warning = gc_sdk.translate_model("claude-sonnet-5-thinking")
+        value, warning = gc_cloud.translate_model("claude-sonnet-5-thinking")
         assert warning is None
         assert value == {
             "id": "claude-sonnet-5",
@@ -5228,121 +5238,70 @@ class TestModelTranslation:
         }
 
     def test_extra_high_level_maps_to_catalog_xhigh(self):
-        value, warning = gc_sdk.translate_model(
+        value, warning = gc_cloud.translate_model(
             "claude-fable-5-thinking-extra-high"
         )
         assert warning is None
         assert {"id": "effort", "value": "xhigh"} in value["params"]
 
     def test_bracket_suffix_becomes_params(self):
-        value, warning = gc_sdk.translate_model(
+        value, warning = gc_cloud.translate_model(
             "claude-fable-5[thinking=true,context=300k,effort=high]"
         )
         assert warning is None
         assert value == _FABLE_BRACKET_SELECTION
 
     def test_empty_bracket_reduces_to_base_id(self):
-        assert gc_sdk.translate_model("claude-fable-5[]") == (
+        assert gc_cloud.translate_model("claude-fable-5[]") == (
             "claude-fable-5", None,
         )
 
     def test_unparseable_bracket_falls_back_to_default_with_warning(self):
-        value, warning = gc_sdk.translate_model("claude-fable-5[thinking")
+        value, warning = gc_cloud.translate_model("claude-fable-5[thinking")
         assert value == gc_runner.DEFAULT_MODEL
         assert warning and "claude-fable-5[thinking" in warning
         assert gc_runner.DEFAULT_MODEL in warning
 
     def test_malformed_bracket_pair_falls_back_with_warning(self):
-        value, warning = gc_sdk.translate_model("m[thinking=]")
+        value, warning = gc_cloud.translate_model("m[thinking=]")
         assert value == gc_runner.DEFAULT_MODEL
         assert warning
 
     def test_unknown_thinking_level_falls_back_with_warning(self):
-        value, warning = gc_sdk.translate_model("m-thinking-banana")
+        value, warning = gc_cloud.translate_model("m-thinking-banana")
         assert value == gc_runner.DEFAULT_MODEL
         assert warning
 
     def test_dash_suffix_threads_params_into_create(self, tmp_path, monkeypatch):
-        agent = _FakeAgent(model_id="claude-fable-5",
-                           runs=[_FakeRun(_happy_script())])
-        client = _FakeClient(agent)
-        _install_fake_sdk(monkeypatch, client)
-        events = list(gc_sdk.run_sdk(
-            "t", str(tmp_path),
-            inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            model="claude-fable-5-thinking-high",
-        ))
-        assert client.agents.create_calls[0]["model"] == (
-            _FABLE_THINKING_HIGH_SELECTION
-        )
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        events = _run_cloud_events(tmp_path,
+                                   model="claude-fable-5-thinking-high")
+        call = client.create_calls[0]
+        assert call["model_id"] == _FABLE_THINKING_HIGH_SELECTION["id"]
+        assert call["model_params"] == _FABLE_THINKING_HIGH_SELECTION["params"]
         assert events[0][1]["model"] == "claude-fable-5"
-        assert not [o for k, o in events if k == "sdk.model_warning"]
-        assert events[-1] == ("sdk.result", {"status": "finished"})
+        assert not [o for k, o in events if k == "cloud.model_warning"]
+        assert events[-1] == ("cloud.result", {"status": "finished"})
 
-    def test_legacy_bracket_record_threads_params_into_resume(
+    def test_legacy_bracket_record_threads_params_into_create(
         self, tmp_path, monkeypatch
     ):
         """The exact model string a pre-swap handle recorded must never
-        reach Agent.resume verbatim (BadRequestError live)."""
-        agent = _FakeAgent(agent_id="agent-prior",
-                           runs=[_FakeRun(_happy_script())])
-        client = _FakeClient(agent)
-        _install_fake_sdk(monkeypatch, client)
-        events = list(gc_sdk.run_sdk(
-            "follow up", str(tmp_path),
-            inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            agent_id="agent-prior",
+        reach the create body verbatim (BadRequestError live under the
+        bridge; the REST ModelRef wants base id + params)."""
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+        events = _run_cloud_events(
+            tmp_path,
             model="claude-fable-5[thinking=true,context=300k,effort=high]",
-        ))
-        assert client.agents.resume_calls[0]["options"] == {
-            "model": _FABLE_BRACKET_SELECTION
-        }
+        )
+        call = client.create_calls[0]
+        assert call["model_id"] == _FABLE_BRACKET_SELECTION["id"]
+        assert call["model_params"] == _FABLE_BRACKET_SELECTION["params"]
         assert events[0][1]["model"] == "claude-fable-5"
-        assert not [o for k, o in events if k == "sdk.model_warning"]
-        assert events[-1] == ("sdk.result", {"status": "finished"})
-
-    def test_unparseable_model_warns_and_uses_default(self, tmp_path, monkeypatch):
-        agent = _FakeAgent(model_id=gc_runner.DEFAULT_MODEL,
-                           runs=[_FakeRun(_happy_script())])
-        client = _FakeClient(agent)
-        _install_fake_sdk(monkeypatch, client)
-        events = list(gc_sdk.run_sdk(
-            "t", str(tmp_path),
-            inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            model="claude-fable-5[borked",
-        ))
-        # The warning is the FIRST event, so the substitution lands in the
-        # event log before any run activity.
-        key, obj = events[0]
-        assert key == "sdk.model_warning"
-        assert obj["requested"] == "claude-fable-5[borked"
-        assert obj["using"] == gc_runner.DEFAULT_MODEL
-        assert client.agents.create_calls[0]["model"] == gc_runner.DEFAULT_MODEL
-        assert events[-1] == ("sdk.result", {"status": "finished"})
-
-    def test_same_base_id_with_params_reuses_the_live_handle(
-        self, tmp_path, monkeypatch
-    ):
-        """A params-only difference must not force a resume of an agent
-        still registered on the live bridge (the disposal-crash path) —
-        base-id comparison decides handle reuse."""
-        agent = _FakeAgent(agent_id="agent-live", model_id="claude-fable-5",
-                           runs=[_FakeRun(_happy_script()),
-                                 _FakeRun(_happy_script())])
-        client = _FakeClient(agent)
-        _install_fake_sdk(monkeypatch, client)
-        list(gc_sdk.run_sdk(
-            "task one", str(tmp_path),
-            inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            model="claude-fable-5",
-        ))
-        second = list(gc_sdk.run_sdk(
-            "task two", str(tmp_path),
-            inactivity_timeout_s=30.0, cancel_check=lambda: False,
-            agent_id="agent-live", model="claude-fable-5-thinking-high",
-        ))
-        assert client.agents.resume_calls == []
-        assert second[-1] == ("sdk.result", {"status": "finished"})
+        assert not [o for k, o in events if k == "cloud.model_warning"]
+        assert events[-1] == ("cloud.result", {"status": "finished"})
 
 
 class TestInvalidModelReason:
@@ -5360,11 +5319,11 @@ class TestInvalidModelReason:
             "claude-fable-5[thinking=true,context=300k,effort=high]",
             "claude-fable-5[]",
         ):
-            assert gc_sdk.invalid_model_reason(ok) is None, ok
+            assert gc_cloud.invalid_model_reason(ok) is None, ok
 
     def test_forms_that_would_silently_fall_back_are_rejected(self):
         for bad in ("claude-fable-5[thinking", "m[thinking=]", "m-thinking-banana"):
-            reason = gc_sdk.invalid_model_reason(bad)
+            reason = gc_cloud.invalid_model_reason(bad)
             assert reason and bad in reason, bad
             # A create-time caller REJECTS — the reason must not read like
             # the send-time DEFAULT_MODEL substitution.
@@ -5376,7 +5335,7 @@ class TestInvalidModelReason:
             "model with spaces[thinking=true]",
             '"quoted-model"',
         ):
-            assert gc_sdk.invalid_model_reason(junk), junk
+            assert gc_cloud.invalid_model_reason(junk), junk
 
 
 # ---------------------------------------------------------------------------
@@ -5389,52 +5348,56 @@ class TestSdkNormalizer:
 
     def test_session_event_maps_to_run_started(self):
         envs = self._norm().normalize(
-            "sdk.session",
-            {"agentId": "agent-1", "cwd": "/w", "model": "m", "resumed": False},
+            "cloud.session",
+            {"agentId": "agent-1", "cwd": "/w", "model": "m", "resumed": False,
+             "runtime": "local", "worker": "w-1", "run_id": "run-1",
+             "agents_ui_url": "https://cursor.com/agents/agent-1"},
         )
         assert envs == [{
             "source": "ghost", "kind": "lifecycle", "event": "run.started",
             "model": "m", "cwd": "/w", "harness_session_id": "agent-1",
+            "runtime": "local", "worker": "w-1", "run_id": "run-1",
+            "agents_ui_url": "https://cursor.com/agents/agent-1",
         }]
 
     def test_reattached_maps_to_log_only_lifecycle(self):
         envs = self._norm().normalize(
-            "sdk.reattached", {"offset": "41", "attempt": 1}
+            "sse.reattached", {"last_event_id": "41", "attempt": 1}
         )
-        assert envs[0]["event"] == "stream.reattached"
-        assert envs[0]["offset"] == "41"
+        assert envs[0]["event"] == "sse.reattached"
+        assert envs[0]["last_event_id"] == "41"
 
     def test_finished_maps_to_run_completed(self):
-        envs = self._norm().normalize("sdk.result", {"status": "finished"})
+        envs = self._norm().normalize("cloud.result", {"status": "finished"})
         assert envs[0]["event"] == "run.completed"
         assert envs[0]["status"] == "completed"
 
     def test_cancelled_maps_to_run_failed_cancelled(self):
-        envs = self._norm().normalize("sdk.result", {"status": "cancelled"})
+        envs = self._norm().normalize("cloud.result", {"status": "cancelled"})
         assert envs[0]["event"] == "run.failed"
         assert envs[0]["cancelled"] is True
         assert "cancel" in envs[0]["error"]
 
     def test_expired_maps_to_run_failed_timeout(self):
-        envs = self._norm().normalize("sdk.result", {"status": "expired"})
+        envs = self._norm().normalize("cloud.result", {"status": "expired"})
         assert envs[0]["event"] == "run.failed"
         assert envs[0]["timeout"] is True
 
     def test_error_status_maps_to_run_failed(self):
-        envs = self._norm().normalize("sdk.result", {"status": "error"})
+        envs = self._norm().normalize("cloud.result", {"status": "error"})
         assert envs[0]["event"] == "run.failed"
         assert "error" in envs[0]["error"]
 
     def test_sdk_error_maps_to_run_failed(self):
         envs = self._norm().normalize(
-            "sdk.error", {"error": "cursor run timed out: no activity for 600s",
+            "cloud.error", {"error": "cursor run timed out: no activity for 600s",
                           "timeout": True}
         )
         assert envs[0]["event"] == "run.failed"
         assert envs[0]["timeout"] is True
 
     def test_assistant_message_maps_to_content(self):
-        envs = self._norm().normalize("sdk.message", {
+        envs = self._norm().normalize("cloud.message", {
             "type": "assistant",
             "message": {"content": [{"type": "text", "text": "hello "},
                                     {"type": "text", "text": "world"}]},
@@ -5445,7 +5408,7 @@ class TestSdkNormalizer:
         }]
 
     def test_thinking_maps_to_reasoning(self):
-        envs = self._norm().normalize("sdk.message", {
+        envs = self._norm().normalize("cloud.message", {
             "type": "thinking", "text": "pondering notes.txt",
         })
         assert envs[0]["event"] == "reasoning"
@@ -5454,11 +5417,11 @@ class TestSdkNormalizer:
     def test_noise_types_produce_no_envelopes(self):
         norm = self._norm()
         for mtype in ("system", "user", "request", "status"):
-            assert norm.normalize("sdk.message", {"type": mtype}) == []
+            assert norm.normalize("cloud.message", {"type": mtype}) == []
 
     def test_shell_tool_call_round_trip(self):
         norm = self._norm()
-        started = norm.normalize("sdk.message", {
+        started = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
             "status": "running", "args": {"command": "ls -la"},
         })
@@ -5467,7 +5430,7 @@ class TestSdkNormalizer:
             "tool": "shell", "status": "running", "title": "ls -la",
             "command": "ls -la",
         }]
-        done = norm.normalize("sdk.message", {
+        done = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
             "status": "completed",
             "result": {"exitCode": 0, "stdout": "calc.py"},
@@ -5479,12 +5442,12 @@ class TestSdkNormalizer:
 
     def test_repeated_running_messages_are_deduped(self):
         norm = self._norm()
-        first = norm.normalize("sdk.message", {
+        first = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
             "status": "running", "args": {},
         })
         assert len(first) == 1
-        again = norm.normalize("sdk.message", {
+        again = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
             "status": "running", "args": {"command": "ls"},
         })
@@ -5492,11 +5455,11 @@ class TestSdkNormalizer:
 
     def test_nonzero_exit_code_marks_result_error(self):
         norm = self._norm()
-        norm.normalize("sdk.message", {
+        norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t8", "name": "shell",
             "status": "running", "args": {"command": "false"},
         })
-        envs = norm.normalize("sdk.message", {
+        envs = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t8", "name": "shell",
             "status": "completed",
             "result": {"exitCode": 1, "stdout": "", "stderr": "nope"},
@@ -5506,11 +5469,11 @@ class TestSdkNormalizer:
 
     def test_error_status_tool_call_maps_to_error_result(self):
         norm = self._norm()
-        norm.normalize("sdk.message", {
+        norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t9", "name": "shell",
             "status": "running", "args": {"command": "boom"},
         })
-        envs = norm.normalize("sdk.message", {
+        envs = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t9", "name": "shell",
             "status": "error", "result": "command not found: boom",
         })
@@ -5520,11 +5483,11 @@ class TestSdkNormalizer:
 
     def test_edit_tool_full_content_yields_file_diff(self):
         norm = self._norm()
-        norm.normalize("sdk.message", {
+        norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "e1", "name": "edit_file",
             "status": "running", "args": {"path": "/w/calc.py"},
         })
-        envs = norm.normalize("sdk.message", {
+        envs = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "e1", "name": "edit_file",
             "status": "completed",
             "result": {"path": "/w/calc.py",
@@ -5541,11 +5504,11 @@ class TestSdkNormalizer:
 
     def test_edit_tool_old_new_text_blocks_yield_file_diff(self):
         norm = self._norm()
-        norm.normalize("sdk.message", {
+        norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "e2", "name": "write",
             "status": "running", "args": {"path": "/w/notes.txt"},
         })
-        envs = norm.normalize("sdk.message", {
+        envs = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "e2", "name": "write",
             "status": "completed",
             "result": {"content": [{"path": "/w/notes.txt",
@@ -5572,7 +5535,7 @@ class TestSdkNormalizer:
         norm = self._norm()
         envs = []
         for msg in msgs:
-            envs.extend(norm.normalize("sdk.message", msg))
+            envs.extend(norm.normalize("cloud.message", msg))
 
         diffs = [e for e in envs if e["kind"] == "file_diff"]
         assert len(diffs) == 1
@@ -5595,7 +5558,7 @@ class TestSdkNormalizer:
         assert "not a git repository" in shell_result["output"]
 
     def test_model_warning_maps_to_lifecycle(self):
-        envs = self._norm().normalize("sdk.model_warning", {
+        envs = self._norm().normalize("cloud.model_warning", {
             "warning": "requested model 'x[y' has an unparseable bracket "
                        "suffix — falling back to 'claude-fable-5'",
             "requested": "x[y", "using": "claude-fable-5",
@@ -5606,7 +5569,7 @@ class TestSdkNormalizer:
         assert envs[0]["using"] == "claude-fable-5"
 
     def test_terminal_tool_call_without_start_synthesizes_tool_use(self):
-        envs = self._norm().normalize("sdk.message", {
+        envs = self._norm().normalize("cloud.message", {
             "type": "tool_call", "call_id": "fast", "name": "shell",
             "status": "completed", "args": {"command": "true"},
             "result": {"exitCode": 0, "stdout": ""},
@@ -5618,7 +5581,7 @@ class TestSdkNormalizer:
     def test_unstable_tool_payload_shapes_never_crash(self):
         norm = self._norm()
         for weird in (None, 42, "text", ["a", 1], {"nested": {"deep": object()}}):
-            envs = norm.normalize("sdk.message", {
+            envs = norm.normalize("cloud.message", {
                 "type": "tool_call", "call_id": f"w-{id(weird)}",
                 "name": "mystery", "status": "completed", "result": weird,
             })
@@ -5626,14 +5589,14 @@ class TestSdkNormalizer:
             assert envs[-1]["kind"] == "tool_result"
 
     def test_usage_maps_to_log_only_lifecycle(self):
-        envs = self._norm().normalize("sdk.message", {
+        envs = self._norm().normalize("cloud.message", {
             "type": "usage", "usage": {"total_tokens": 1234},
         })
         assert envs[0]["event"] == "usage"
         assert envs[0]["usage"]["total_tokens"] == 1234
 
     def test_unknown_message_type_passes_through(self):
-        envs = self._norm().normalize("sdk.message", {"type": "mystery", "x": 1})
+        envs = self._norm().normalize("cloud.message", {"type": "mystery", "x": 1})
         assert envs[0]["event"] == "passthrough"
         assert envs[0]["name"] == "sdk.mystery"
 

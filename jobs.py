@@ -5,7 +5,7 @@ v0.4 named-session model
 Every cursor run executes as a background :class:`CursorJob` on a worker
 thread. The SINGLE public handle for a run is the session NAME minted by
 ``cursor_create_session`` (``job.session_name``); the cursor ``session_id``
-(the cursor-sdk agent id) rides along as an alias. ``cursor_send_message``
+(the cloud agent id, ``bc-...``) rides along as an alias. ``cursor_send_message``
 dispatches into it, and ``cursor_status`` / ``cursor_stop`` /
 ``cursor_events`` take it back. This registry is the in-process job table
 behind that handle — rolling progress buffer, status, files-changed
@@ -129,11 +129,14 @@ class CursorJob:
     job_id: str  # internal dispatch id; the PUBLIC handle is session_name
     task: str
     repo: str
-    # Watchdog knobs (see sdk_runner): abort after this much SILENCE (no
+    # Watchdog knobs (see cloud_runner): abort after this much SILENCE (no
     # stream events) — activity resets the clock — plus an optional ceiling on
     # total run time (0 = disabled).
     inactivity_timeout_s: float
     max_wall_s: float = 0.0
+    # Where the agent executes: "local" (machine-routed worker on this box)
+    # or "cloud" (cursor-hosted VM). Set at dispatch from the session entry.
+    runtime: str = "local"
     # v0.4 handle: the human slug minted by cursor_create_session (e.g.
     # "playful-space-bunny"). The cursor agent id (cursor_session_id below)
     # stays a resolvable alias. Empty only for direct registry use in tests.
@@ -145,13 +148,15 @@ class CursorJob:
     status: str = "running"
     created_at: float = field(default_factory=time.time)
     finished_at: Optional[float] = None
-    cursor_session_id: str = ""       # the agent-id alias, set at sdk.session
+    cursor_session_id: str = ""       # the agent-id alias, set at cloud.session
     resumed: bool = False
-    model: str = ""                   # actual model reported by sdk.session
+    model: str = ""                   # actual model reported by cloud.session
+    worker: str = ""                  # the "My Machines" worker (runtime=local)
+    agents_ui_url: str = ""           # cursor.com/agents url for the agent
     # Wall-clock time of the last stream event received for this run (None
     # until the first event). Advisory only — feeds the last_activity_s
     # field of status snapshots so callers can flag silent runs; the
-    # actual inactivity watchdog lives in sdk_runner.
+    # actual inactivity watchdog lives in cloud_runner.
     last_event_at: Optional[float] = None
     # --- aggregation state (guarded by _lock) ---
     files: Dict[str, Dict[str, Any]] = field(default_factory=dict)
@@ -183,8 +188,8 @@ class CursorJob:
     nonlifecycle_events: int = 0
     completed_tool_ids: Set[str] = field(default_factory=set)
     run_error: Optional[str] = None
-    # Typed detail riding a terminal-error run.failed (see sdk_runner's
-    # sdk.error payload): None = unknown, not "no".
+    # Typed detail riding a terminal-error run.failed (see cloud_runner's
+    # cloud.error payload): None = unknown, not "no".
     error_retryable: Optional[bool] = None
     error_retry_after: Optional[str] = None
     timed_out: bool = False
@@ -203,7 +208,7 @@ class CursorJob:
     # -- control -------------------------------------------------------------
 
     def request_cancel(self) -> None:
-        """Ask the run to stop via the SDK's native run.cancel() path."""
+        """Ask the run to stop via the REST cancel path."""
         self.cancel_event.set()
 
     def arm_delivery(self) -> bool:
@@ -349,6 +354,9 @@ class CursorJob:
                 "cursor_session_id": self.cursor_session_id,
                 "resumed": self.resumed,
                 "model": self.model or (self.requested_model or ""),
+                "runtime": self.runtime,
+                "worker": self.worker,
+                "agents_ui_url": self.agents_ui_url,
                 "summary_so_far": _clip(self.summary_text(), _PAYLOAD_SUMMARY_CHARS),
                 "files_changed_so_far": files,
                 "files_changed_count": len(files),
@@ -388,6 +396,7 @@ class CursorJobRegistry:
         session_key: str = "",
         requested_session_id: Optional[str] = None,
         requested_model: Optional[str] = None,
+        runtime: str = "local",
     ) -> Tuple[Optional[CursorJob], Optional[CursorJob]]:
         """Start a cursor run on a worker thread.
 
@@ -407,6 +416,7 @@ class CursorJobRegistry:
             session_key=session_key or "",
             requested_session_id=requested_session_id,
             requested_model=requested_model,
+            runtime=runtime or "local",
         )
         with self._lock:
             existing = self._find_active_for_repo_locked(repo)
@@ -505,7 +515,7 @@ class CursorJobRegistry:
             self._push_completion_event(job, result)
         job.done_event.set()
         # Unblock anyone still waiting for a session that will never come
-        # (e.g. bridge/create failure before sdk.session).
+        # (e.g. worker/create failure before cloud.session).
         job.session_event.set()
 
     def _push_completion_event(self, job: CursorJob, result: Dict[str, Any]) -> None:
@@ -638,7 +648,7 @@ class CursorJobRegistry:
 
         Matches the ESTABLISHED handle first; falls back to the REQUESTED
         resume handle so a just-dispatched continuation (``cursor_send`` /
-        resume) is addressable in the window before its ``sdk.session``
+        follow-up) is addressable in the window before its ``cloud.session``
         event fires.
         """
         sid = str(session_id or "").strip()

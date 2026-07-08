@@ -282,6 +282,20 @@ def get(session_id: Optional[str]) -> Optional[Dict[str, Any]]:
         return None
 
 
+def runtime_of(entry: Optional[Dict[str, Any]]) -> str:
+    """The entry's runtime: "local" | "cloud" | "legacy". Never raises.
+
+    Entries written since the cloud migration always carry ``runtime``
+    (recorded at create). An entry WITHOUT one predates the migration —
+    a bridge-era session whose agent id is not a cloud agent — and reads
+    as "legacy" so sends can refuse it with an actionable message.
+    """
+    try:
+        return str((entry or {}).get("runtime") or "legacy")
+    except Exception:
+        return "legacy"
+
+
 def last_prompt_seq(entry: Optional[Dict[str, Any]]) -> int:
     """The event-log position recorded when the session was last prompted.
 
