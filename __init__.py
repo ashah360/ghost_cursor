@@ -884,8 +884,14 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
             break
         attempt += 1
         # The stale-bridge lever (see the incident note above): recycle the
-        # workspace bridge once, before the FIRST retry.
-        bridge_recycled = attempt == 1 and _sdk.recycle_bridge(workdir)
+        # workspace bridge before EVERY retry, not just the first. The
+        # @cursor/sdk bridge exchanges the API key for a ~1h access token
+        # exactly once per process and caches it in a closure with no
+        # refresh and no re-exchange on 401 — and a FAILED exchange is
+        # cached too, permanently poisoning the process (read from vendored
+        # sdk 1.0.23 source, 2026-07-08). A fresh bridge process is the
+        # only reliable way to force a fresh token exchange.
+        bridge_recycled = _sdk.recycle_bridge(workdir)
         with job._lock:
             reason = (
                 "zero-progress terminal error: "

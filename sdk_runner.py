@@ -328,10 +328,19 @@ _BRIDGE_SURVIVE_ENV = "CURSOR_SDK_BRIDGE_SURVIVE_UNCAUGHT"
 # get_bridge. The probe is cheap and short-fused; the max age bounds how
 # long any one bridge process lives (live incident 2026-07-04: hours-old
 # bridges silently failed every run while fresh ones worked — see
-# recycle_bridge). Configurable via plugins.ghost_cursor.bridge_max_age_s
-# in config.yaml; 0 disables age-based recycling.
+# recycle_bridge). ROOT CAUSE (read from vendored @cursor/sdk 1.0.23
+# source, 2026-07-08): the bridge exchanges CURSOR_API_KEY for a ~1h
+# access token exactly ONCE per process (POST /auth/exchange_user_api_key)
+# and caches it in a closure — no expiry tracking, no refresh, no
+# re-exchange on 401, and a failed exchange is cached as a permanently
+# rethrown error. Every bridge process therefore has a hard ~1h auth
+# lifetime. Log forensics (2026-07-07, 293 runs): 20/20 session resumes
+# after >19min idle on an aged bridge died instantly with the bare
+# "status: error"; none ever recovered on the same bridge. Configurable
+# via plugins.ghost_cursor.bridge_max_age_s in config.yaml; 0 disables
+# age-based recycling. Keep it comfortably under 3600.
 _BRIDGE_PROBE_TIMEOUT_S = 5.0
-DEFAULT_BRIDGE_MAX_AGE_S = 4 * 3600.0
+DEFAULT_BRIDGE_MAX_AGE_S = 50 * 60.0
 
 
 def _bridge_max_age_s() -> float:
