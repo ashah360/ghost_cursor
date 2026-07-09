@@ -259,8 +259,10 @@ def supervision_of(entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The entry's supervision record, normalized with defaults. Never raises.
 
     An entry that predates the supervisor (or was never dispatched through
-    it) reads as phase "" — neither live nor terminal — so the reconciler
-    skips it and legacy handles keep working untouched.
+    it) reads as phase "" — neither live nor terminal. A RUNNING entry in
+    that state is adopted by the reconciler (supervisor._adopt_legacy_handle
+    seeds a live record and re-attaches); settled/never-run entries keep
+    working untouched.
     """
     try:
         raw = (entry or {}).get("supervision")
