@@ -279,6 +279,11 @@ class SessionSupervisor:
         self._files: Dict[str, Dict[str, Any]] = {}
         self._prose_blocks: List[str] = []
         self._prose_open = False
+        # In-flight tool calls (call id -> {tool, title, since}) + the
+        # latest cursor plan snapshot — same digest context the live
+        # runner's fold keeps (see __init__._fold_envelope).
+        self._pending_tools: Dict[str, Dict[str, Any]] = {}
+        self._plan_items: List[Dict[str, str]] = []
         # Digest state: subscriber key -> monotonic next-due timestamp.
         self._digest_due: Dict[str, float] = {}
         self._digest_n: Dict[str, int] = {}
@@ -567,6 +572,22 @@ class SessionSupervisor:
                     self._prose_open = True
         elif kind in ("tool_use", "tool_result"):
             self._prose_open = False
+            call_id = str(envelope.get("id") or "tool")
+            if kind == "tool_use":
+                tool = str(envelope.get("tool") or "tool")
+                detail = str(
+                    envelope.get("title") or envelope.get("command") or ""
+                ).strip()
+                prior = self._pending_tools.get(call_id)
+                self._pending_tools[call_id] = {
+                    "tool": tool,
+                    "title": f"{tool} — {detail}" if detail else tool,
+                    "since": (prior or {}).get("since") or time.time(),
+                }
+                if tool == _events.TOOL_PLAN and envelope.get("plan_items"):
+                    self._plan_items = list(envelope.get("plan_items") or [])
+            else:
+                self._pending_tools.pop(call_id, None)
         if not self._durable_emitted and is_durable_evidence(envelope):
             self._durable_emitted = True
             self._ingest_lifecycle("durable_progress", evidence=kind)
@@ -614,6 +635,21 @@ class SessionSupervisor:
             ]
 
         n = self._digest_n.get(sub_key, 0) + 1
+        now_wall = time.time()
+        pending = [
+            {
+                "call_id": cid,
+                "tool": str(p.get("tool") or ""),
+                "title": str(p.get("title") or ""),
+                "pending_s": (
+                    round(now_wall - p["since"], 1)
+                    if p.get("since") is not None
+                    else None
+                ),
+            }
+            for cid, p in self._pending_tools.items()
+        ]
+        pending.sort(key=lambda p: -(p["pending_s"] or 0))
         text = _render.digest_text(
             name=name,
             n=n,
@@ -621,6 +657,8 @@ class SessionSupervisor:
             elapsed_s=None,
             last_activity_s=None,
             files=sorted(self._files.values(), key=lambda f: f["path"]),
+            pending_tools=pending,
+            plan=list(self._plan_items),
             events=events,
             new_count=new_count,
             next_update_s=interval_s,

@@ -374,6 +374,8 @@ class _Ticker:
             files=snap.get("files_changed_so_far") or [],
             pending_tool=str(snap.get("pending_tool") or ""),
             pending_tool_s=snap.get("pending_tool_s"),
+            pending_tools=snap.get("pending_tools") or [],
+            plan=snap.get("plan") or [],
             events=events,
             new_count=new_count,
             # The CURRENT interval at tick time (not the dispatch-time

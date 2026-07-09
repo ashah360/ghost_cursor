@@ -171,11 +171,18 @@ class CursorJob:
     # last folded envelope was content, nothing interrupted it since.
     segment_open: bool = False
     reasoning_tail: str = ""
-    # The currently in-flight tool call ("shell `pytest -q`"), set on
-    # tool_use and cleared by its tool_result — feeds the progress-digest
-    # header so a long quiet tool call reads differently from a stall.
-    pending_tool: str = ""
-    pending_tool_since: Optional[float] = None
+    # In-flight tool calls keyed by call id — set on tool_use, removed by
+    # the matching tool_result — feeding the progress-digest header so a
+    # long quiet call reads as busy, not stalled. A dict (not a single
+    # string): cursor runs calls CONCURRENTLY (two parallel `task`
+    # sub-agents captured live 2026-07-09), and a scalar field made the
+    # second call overwrite the first, then the first result blank the
+    # header while the other call was still running. Values:
+    # {"tool", "title", "since"}.
+    pending_tools: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    # Latest cursor-authored plan snapshot (todo_write): list of
+    # {"content", "status"} — the digest's "plan: 2/5 done" line.
+    plan_items: List[Dict[str, str]] = field(default_factory=list)
     progress_buffer: str = ""
     progress_events: int = 0
     # --- auto-retry progress evidence (guarded by _lock; issue #17) ---
@@ -312,6 +319,27 @@ class CursorJob:
 
     # -- summary derivation -------------------------------------------------------
 
+    def _pending_snapshot(self, now: float) -> List[Dict[str, Any]]:
+        """Read-only copies of the in-flight calls, oldest first, with a
+        computed per-call elapsed. Caller holds the lock."""
+        out = []
+        for call_id, entry in self.pending_tools.items():
+            since = entry.get("since")
+            out.append(
+                {
+                    "call_id": call_id,
+                    "tool": str(entry.get("tool") or ""),
+                    "title": str(entry.get("title") or ""),
+                    "pending_s": (
+                        round((self.finished_at or now) - since, 1)
+                        if since is not None
+                        else None
+                    ),
+                }
+            )
+        out.sort(key=lambda p: -(p["pending_s"] or 0))
+        return out
+
     def summary_text(self) -> str:
         """The prose summary for status peeks and the final result.
 
@@ -376,15 +404,24 @@ class CursorJob:
                 "files_changed_so_far": files,
                 "files_changed_count": len(files),
                 "latest_reasoning": self.reasoning_tail[-1500:],
-                "pending_tool": self.pending_tool,
-                "pending_tool_s": (
-                    round((self.finished_at or now) - self.pending_tool_since, 1)
-                    if self.pending_tool and self.pending_tool_since is not None
-                    else None
-                ),
+                "pending_tools": self._pending_snapshot(now),
+                "plan": [dict(i) for i in self.plan_items],
                 "progress_tail": self.progress_buffer[-4000:],
                 "progress_events": self.progress_events,
             }
+            # Back-compat scalar view: the OLDEST pending call (the one
+            # waited on longest). Consumers should prefer pending_tools.
+            oldest = min(
+                self.pending_tools.values(),
+                key=lambda p: p.get("since") or now,
+                default=None,
+            )
+            snap["pending_tool"] = str(oldest.get("title") or "") if oldest else ""
+            snap["pending_tool_s"] = (
+                round((self.finished_at or now) - oldest["since"], 1)
+                if oldest and oldest.get("since") is not None
+                else None
+            )
             if self.result is not None:
                 snap["result"] = trim_result(self.result)
         return snap

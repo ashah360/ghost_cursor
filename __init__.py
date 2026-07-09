@@ -688,15 +688,29 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
         elif kind == "tool_use":
             job.segment_open = False
             tool = str(envelope.get("tool") or "tool")
+            call_id = str(envelope.get("id") or "tool")
+            # Title first: the normalizer already prefers the model-written
+            # description ("Start focused rush install in tmux background")
+            # over raw command text.
             detail = str(
-                envelope.get("command") or envelope.get("title") or ""
+                envelope.get("title")
+                or envelope.get("command")
+                or envelope.get("description")
+                or ""
             ).strip()
-            job.pending_tool = f"{tool} `{detail}`" if detail else tool
-            job.pending_tool_since = time.time()
+            prior = job.pending_tools.get(call_id)
+            job.pending_tools[call_id] = {
+                "tool": tool,
+                "title": f"{tool} — {detail}" if detail else tool,
+                # An arg-upgrade re-emit (updated=True) refines the title
+                # but must not reset the call's waited-since clock.
+                "since": (prior or {}).get("since") or time.time(),
+            }
+            if tool == _events.TOOL_PLAN and envelope.get("plan_items"):
+                job.plan_items = list(envelope.get("plan_items") or [])
         elif kind == "tool_result":
             job.segment_open = False
-            job.pending_tool = ""
-            job.pending_tool_since = None
+            job.pending_tools.pop(str(envelope.get("id") or "tool"), None)
             if envelope.get("status") == _events.STATUS_DONE:
                 job.completed_tool_ids.add(str(envelope.get("id") or "tool"))
         elif kind == "lifecycle":
@@ -1589,6 +1603,8 @@ def cursor_status(session: str, scope: str = "session", **_kwargs: Any) -> str:
             # carries partial prose (and NEVER reasoning text).
             summary=str(snap.get("summary_so_far") or "") if terminal else "",
             error=str(result.get("error") or ""),
+            pending_tools=snap.get("pending_tools") or [],
+            plan=snap.get("plan") or [],
             last_prompt_seq=_handles.last_prompt_seq(entry),
             runtime=str(snap.get("runtime") or _handles.runtime_of(entry)),
             worker=str(snap.get("worker") or ""),
