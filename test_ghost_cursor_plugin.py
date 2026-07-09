@@ -5085,6 +5085,78 @@ class TestCloudRunner:
         assert key == "cloud.error"
         assert "stream failed mid-run" in obj["error"]
 
+    def test_409_on_stream_open_reattaches_instead_of_failing(
+        self, tmp_path, monkeypatch
+    ):
+        """A 409 (e.g. stream_unavailable) on the stream GET of a LIVE run
+        is 'not attachable right now', NOT a run failure — captured live:
+        stream died 4s in with a 409 while the worker kept executing. It
+        must ride the same reattach path as network drops."""
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.0)
+        client = _FakeRestClient(
+            streams=[
+                [
+                    _sse("thinking", {"text": "pre-409"}, id="1"),
+                    gc_rest.RestApiError(
+                        "cursor api GET stream -> 409 conflict: "
+                        "stream_unavailable",
+                        status_code=409,
+                    ),
+                ],
+                [
+                    _sse("thinking", {"text": "post-409"}, id="2"),
+                    _sse("result", {"status": "FINISHED"}, id="3"),
+                    _sse("done", {}),
+                ],
+            ],
+            statuses=("RUNNING", "FINISHED"),
+        )
+        _install_fake_rest(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        # Reattached with Last-Event-ID, run completed, zero cloud.error.
+        assert client.stream_calls == [None, "1"]
+        reattached = [o for k, o in events if k == "sse.reattached"]
+        assert len(reattached) == 1
+        assert not [k for k, _ in events if k == "cloud.error"]
+        assert events[-1] == ("cloud.result", {"status": "finished"})
+
+    def test_persistent_409_exhausts_budget_then_fails(
+        self, tmp_path, monkeypatch
+    ):
+        """409s stay within the reattach budget — a permanently unattachable
+        stream on a live run fails only after MAX_STREAM_REATTACHES."""
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.0)
+        client = _FakeRestClient(
+            streams=[[gc_rest.RestApiError(
+                "cursor api GET stream -> 409 conflict: stream_unavailable",
+                status_code=409,
+            )]],
+            statuses=("RUNNING",),  # forever live
+        )
+        _install_fake_rest(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert len(client.stream_calls) == gc_cloud.MAX_STREAM_REATTACHES + 1
+        key, obj = events[-1]
+        assert key == "cloud.error"
+
+    def test_404_on_stream_open_still_fails_immediately(
+        self, tmp_path, monkeypatch
+    ):
+        """Regression guard: genuinely non-reconnectable statuses (404/410)
+        on a live run must NOT enter the reattach loop."""
+        monkeypatch.setattr(gc_cloud, "_REATTACH_BACKOFF_S", 0.0)
+        client = _FakeRestClient(
+            streams=[[gc_rest.RestApiError(
+                "cursor api GET stream -> 404 not_found", status_code=404,
+            )]],
+            statuses=("RUNNING",),
+        )
+        _install_fake_rest(monkeypatch, client)
+        events = _run_cloud_events(tmp_path)
+        assert len(client.stream_calls) == 1  # no reattach attempts
+        key, obj = events[-1]
+        assert key == "cloud.error"
+
     def test_terminal_run_with_dead_stream_settles_from_get(
         self, tmp_path, monkeypatch
     ):
