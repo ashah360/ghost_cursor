@@ -96,6 +96,13 @@ MAX_AUTO_RETRIES = 3
 # events is ``mid_flight`` — the recovery playbook differs and the caller
 # shouldn't have to re-derive it from the log.
 FAST_FAIL_WINDOW_S = 120.0
+# False-settle repair (remote authority wins in BOTH directions): a handle
+# whose LOCAL status is terminal but whose remote run GETs as RUNNING was
+# falsely settled (e.g. a send-time preflight failure overwrote a healthy
+# run). The reconciler probes recently-settled terminal handles against the
+# GET authority and un-settles them. Bounded by this window so the pass
+# never polls the whole terminal backlog forever.
+FALSE_SETTLE_REPAIR_WINDOW_S = 15 * 60.0
 
 # Reconnect pacing for the re-attached stream (bounded per drop; the
 # supervisor itself never gives up — it degrades to the poll watchdog).
@@ -840,16 +847,152 @@ def ensure_supervisor(session_name: str) -> Optional[SessionSupervisor]:
     return sup
 
 
+def _adopt_legacy_handle(name: str, entry: Dict[str, Any]) -> bool:
+    """Adopt a pre-supervisor handle into supervision. True when adopted.
+
+    A handle whose top-level status is ``running`` but whose supervision
+    record is missing/null/empty-phase predates the supervisor deploy —
+    EXACTLY the handle the reconciler exists to re-attach; skipping it
+    (the incident: two healthy pre-supervisor cloud runs left orphaned
+    after a gateway restart) defeats the point. Seed a live supervision
+    record — fresh attempt identity, delivery cursors left empty, no
+    persisted Last-Event-ID (the adopted stream attaches from the live
+    tail) — and let the normal re-attach path own it: the supervisor's
+    GET authority streams a RUNNING run and settles a terminal one
+    exactly once with its real terminal status.
+    """
+    if str(entry.get("status") or "") != "running":
+        return False
+    if _handles.supervision_of(entry)["phase"]:
+        return False  # already supervised (live handled by the caller)
+    if _job_is_live(name):
+        return False  # the in-process job IS this session's supervision
+    _handles.record_supervision(
+        name,
+        phase=PHASE_STREAMING,
+        current_attempt_id=mint_attempt_id(),
+        attempt_n=1,
+    )
+    _eventlog.append(
+        name,
+        _events.lifecycle(
+            "supervision.adopted",
+            note=(
+                "pre-supervisor handle adopted by the reconciler — "
+                "supervision record seeded, re-attaching"
+            ),
+        ),
+    )
+    logger.info("ghost_cursor reconciler adopted legacy handle %s", name)
+    return True
+
+
+def _repair_false_settle(
+    name: str, entry: Dict[str, Any], client_factory: Any
+) -> bool:
+    """Un-settle a locally-terminal handle whose remote run is RUNNING.
+
+    Remote authority wins in both directions: a handle falsely settled
+    (e.g. a send-time preflight failure marked a healthy run failed) is
+    flipped back to running/streaming and re-attached. Only handles
+    settled within :data:`FALSE_SETTLE_REPAIR_WINDOW_S` are probed so a
+    reconciler pass never GETs the whole terminal backlog. True when the
+    handle was un-settled. Never raises.
+    """
+    was = str(entry.get("status") or "")
+    if was not in _handles.SUPERVISION_TERMINAL_PHASES:
+        return False
+    if time.time() - float(entry.get("updated_at") or 0.0) > (
+        FALSE_SETTLE_REPAIR_WINDOW_S
+    ):
+        return False
+    agent_id = str(entry.get("cursor_session_id") or "")
+    if not agent_id or _job_is_live(name):
+        return False
+    try:
+        client = client_factory()
+    except _cloud.CloudRunnerError as exc:
+        # No API key / client preflight — nothing to probe with this pass.
+        logger.debug(
+            "ghost_cursor false-settle probe skipped (no client): %s", exc
+        )
+        return False
+    try:
+        run_id = str(entry.get("latest_run_id") or "")
+        if not run_id:
+            runs = client.list_runs(agent_id).get("runs")
+            run_id = (
+                str((runs[0] or {}).get("id") or "")
+                if isinstance(runs, list) and runs
+                else ""
+            )
+        if not run_id:
+            return False
+        remote = str(client.get_run(agent_id, run_id).get("status") or "")
+    except Exception:
+        logger.debug(
+            "ghost_cursor false-settle probe failed for %s", name,
+            exc_info=True,
+        )
+        return False
+    if remote.upper() != "RUNNING":
+        return False
+    _handles.record(name, status="running", status_note="")
+    _handles.record_supervision(
+        name,
+        phase=PHASE_STREAMING,
+        current_attempt_id=mint_attempt_id(),
+        attempt_n=max(_handles.supervision_of(entry)["attempt_n"], 1),
+    )
+    _eventlog.append(
+        name,
+        _events.lifecycle(
+            "session.unsettled",
+            was=was,
+            remote_status=remote,
+            note=(
+                f"local terminal status '{was}' contradicted a RUNNING "
+                "remote run — remote authority wins; un-settled and "
+                "re-attaching"
+            ),
+        ),
+    )
+    logger.warning(
+        "ghost_cursor reconciler un-settled session %s (local %r, remote "
+        "RUNNING) and is re-attaching", name, was,
+    )
+    return True
+
+
 def reconcile_once() -> List[str]:
     """One reconciler pass: spawn a supervisor for every handle in a
     non-terminal supervision phase with no live supervision in this
-    process. Returns the session names attached this pass. Never raises."""
+    process. Also ADOPTS pre-supervisor handles (top-level status running,
+    supervision record missing/empty) and UN-SETTLES falsely-settled ones
+    (local terminal, remote GET RUNNING). Returns the session names
+    attached this pass. Never raises."""
     attached: List[str] = []
     try:
+        # One client per pass, built lazily (the repair probe needs the
+        # GET authority; no probe-worthy handle → no client, no preflight).
+        probe_client: Any = None
+
+        def _probe_client() -> Any:
+            nonlocal probe_client
+            if probe_client is None:
+                probe_client = _cloud.make_client()
+            return probe_client
+
         for entry in _handles.entries(scope="all", limit=_handles.MAX_ENTRIES):
             name = str(entry.get("session") or "")
-            if not name or not _handles.supervision_is_live(entry):
+            if not name:
                 continue
+            if not _handles.supervision_is_live(entry):
+                if not (
+                    _adopt_legacy_handle(name, entry)
+                    or _repair_false_settle(name, entry, _probe_client)
+                ):
+                    continue
             with _lock:
                 existing = _supervisors.get(name)
                 if existing is not None and existing.is_alive():

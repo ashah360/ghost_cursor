@@ -514,18 +514,39 @@ class CursorJobRegistry:
         # session NAME (v0.4 handle); name-less jobs fall back to the sid.
         # Supervision settle (RFC §3): the terminal phase write + the
         # supervisor-derived session.settled event (death-shape tagged).
-        _supervisor.settle_from_job(job, status)
+        #
+        # EXCEPT: a dispatch that never established a run
+        # (job.cursor_session_id empty — a follow-up bounced by 409
+        # agent_busy, or any other preflight/create-time rejection) says
+        # nothing about the RUN's health. When the persisted handle was
+        # already running, its remote run may be alive and well — never
+        # overwrite that status (a healthy remote run must not be falsely
+        # settled by a send-time failure).
         handle_key = job.session_name or job.cursor_session_id
-        if handle_key:
-            _handles.record(
-                handle_key,
-                status=status,
-                cursor_session_id=job.cursor_session_id or None,
-                files_changed_count=result.get("files_changed_count"),
-                duration_s=round(
-                    (job.finished_at or time.time()) - job.created_at, 1
-                ),
+        preflight_bounce = (
+            not job.cursor_session_id
+            and bool(handle_key)
+            and str((_handles.get(handle_key) or {}).get("status") or "")
+            == "running"
+        )
+        if preflight_bounce:
+            logger.warning(
+                "Cursor job %s failed before establishing a run; handle %s "
+                "stays running (remote run health unaffected by this "
+                "dispatch)", job.job_id, handle_key,
             )
+        else:
+            _supervisor.settle_from_job(job, status)
+            if handle_key:
+                _handles.record(
+                    handle_key,
+                    status=status,
+                    cursor_session_id=job.cursor_session_id or None,
+                    files_changed_count=result.get("files_changed_count"),
+                    duration_s=round(
+                        (job.finished_at or time.time()) - job.created_at, 1
+                    ),
+                )
         # Enqueue BEFORE signalling done: anyone who observes the job as
         # finished (waiters, tests, drains) must also find the completion
         # event already on the queue — no observe-then-miss window.

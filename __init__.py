@@ -1298,6 +1298,27 @@ def _send_to_session(
         runtime=runtime,
     )
     result.setdefault("session", name)
+    # A follow-up bounced off the agent's live run (409 agent_busy): the
+    # remote run is ACTIVE — a send-time rejection says nothing about the
+    # run's health (jobs._finalize already refused to settle the handle).
+    # Report the truth instead of a false failure.
+    if (
+        str(result.get("status") or "") == "failed"
+        and "agent_busy" in str(result.get("error") or "")
+        and str((_handles.get(name) or {}).get("status") or "") == "running"
+    ):
+        result = {
+            "success": False,
+            "status": "still_active",
+            "session": name,
+            "error": (
+                f"session '{name}' still has an active remote run — the "
+                "cloud API rejected this follow-up (409 agent_busy). The "
+                "session is NOT failed. Watch it with "
+                f"cursor_status('{name}'), or stop it first with "
+                f"cursor_stop('{name}') and re-send."
+            ),
+        }
     # Model validation is deferred to this first send (create is lazy by
     # design) — so when the agent-create failure hits and this session
     # carries an explicit model, attribute the failure to the param chosen
@@ -1310,7 +1331,7 @@ def _send_to_session(
             "create a new session with a valid model id (or omit model "
             "for the default)."
         )
-    if str(result.get("status") or "") != "rejected":
+    if str(result.get("status") or "") not in ("rejected", "still_active"):
         _handles.record(name, last_prompt_seq=prompt_seq)
     if interrupted:
         result["interrupted_previous_prompt"] = True
