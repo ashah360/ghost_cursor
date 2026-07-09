@@ -2166,7 +2166,8 @@ class TestProgressSubscriptions:
             "next update in 3m" in text
         )
         assert "files so far (1): calc.py +4 −0" in text
-        assert "pending tool call: shell `pytest -q` (41s)" in text
+        assert "waiting on:" in text
+        assert "shell `pytest -q` (41s)" in text
         assert "new events since last update (8):" in text
         # Body capped at DIGEST_MAX_EVENTS lines + an omission pointer.
         assert text.count("pytest test_") == gc_render.DIGEST_MAX_EVENTS
@@ -2237,7 +2238,45 @@ class TestProgressSubscriptions:
         finally:
             release.set()
             assert job.done_event.wait(10)
-        assert "pending tool call:" in _digest_events(collected)[0]["summary"]
+        assert "pending tool call:" in _digest_events(collected)[0]["summary"] or (
+            "waiting on:" in _digest_events(collected)[0]["summary"]
+            and "sleep 999" in _digest_events(collected)[0]["summary"]
+        )
+
+    def test_digest_lists_concurrent_pending_calls(self):
+        """Cursor runs tool calls CONCURRENTLY (two parallel sub-agents
+        captured live 2026-07-09) — the digest must list every in-flight
+        call, and a quiet window must read busy, not stalled."""
+        text = gc_render.digest_text(
+            name="parallel-swan",
+            n=3,
+            status="running",
+            elapsed_s=250,
+            last_activity_s=98,
+            files=[],
+            pending_tools=[
+                {"tool": "subagent",
+                 "title": "subagent — Explore blockchain test infrastructure",
+                 "pending_s": 98},
+                {"tool": "subagent",
+                 "title": "subagent — Survey FlowOfFunds rule families",
+                 "pending_s": 95},
+            ],
+            plan=[
+                {"content": "Bootstrap env", "status": "completed"},
+                {"content": "Wire nonce guard", "status": "in_progress"},
+                {"content": "Run tests", "status": "pending"},
+            ],
+            events=[],
+            new_count=0,
+        )
+        assert "waiting on:" in text
+        assert "Explore blockchain test infrastructure (98s)" in text
+        assert "Survey FlowOfFunds rule families (95s)" in text
+        assert "plan: 1/3 done — current: Wire nonce guard" in text
+        # A quiet window with pending calls is busy, not idle.
+        assert "cursor is busy inside the calls above" in text
+        assert "no new events since last update" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -5512,7 +5551,7 @@ class TestSdkNormalizer:
         assert started == [{
             "source": "ghost", "kind": "tool_use", "id": "t1",
             "tool": "shell", "status": "running", "title": "ls -la",
-            "command": "ls -la",
+            "name": "shell", "command": "ls -la",
         }]
         done = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
@@ -5528,14 +5567,201 @@ class TestSdkNormalizer:
         norm = self._norm()
         first = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
-            "status": "running", "args": {},
+            "status": "running", "args": {"command": "ls"},
         })
         assert len(first) == 1
+        # Args already captured — a re-emit adds nothing and is dropped.
         again = norm.normalize("cloud.message", {
             "type": "tool_call", "call_id": "t1", "name": "shell",
             "status": "running", "args": {"command": "ls"},
         })
         assert again == []
+
+    def test_argless_running_message_upgraded_when_args_arrive(self):
+        # Captured live 2026-07-09: the FIRST running message often has no
+        # args; the description/command arrives on a re-emit. The upgrade
+        # emits ONE refined tool_use under the same call id, then further
+        # re-emits are dropped.
+        norm = self._norm()
+        first = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running", "args": {},
+        })
+        assert len(first) == 1 and first[0]["title"] == "shell"
+        upgraded = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running",
+            "args": {"command": "ls", "description": "List repo root"},
+        })
+        assert len(upgraded) == 1
+        assert upgraded[0]["id"] == "t1"
+        assert upgraded[0]["updated"] is True
+        # Title prefers the model-written description; command survives.
+        assert upgraded[0]["title"] == "List repo root"
+        assert upgraded[0]["command"] == "ls"
+        # A third re-emit (args unchanged) is dropped.
+        assert norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t1", "name": "shell",
+            "status": "running",
+            "args": {"command": "ls", "description": "List repo root"},
+        }) == []
+
+    def test_subagent_task_tool_call_normalizes_typed(self):
+        # `task` args captured live 2026-07-09 (run-c99dd650).
+        norm = self._norm()
+        envs = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t2", "name": "task",
+            "status": "running",
+            "args": {
+                "description": "Explore blockchain test infrastructure",
+                "prompt": "In the repo at /workspace I need a thorough report…",
+                "subagentType": "explore",
+                "model": "composer-2.5-fast",
+            },
+        })
+        assert len(envs) == 1
+        env = envs[0]
+        assert env["tool"] == "subagent"
+        assert env["title"] == "Explore blockchain test infrastructure"
+        assert env["subagent_model"] == "composer-2.5-fast"
+        assert env["subagent_type"] == "explore"
+        # Snippet only — never the multi-KB prompt verbatim beyond the cap.
+        assert env["prompt_snippet"].startswith("In the repo at /workspace")
+
+    def test_subagent_argless_falls_back_generic(self):
+        # args are optional/truncatable upstream — the envelope must stay
+        # informative with nothing but the name.
+        envs = self._norm().normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t3", "name": "task",
+            "status": "running",
+        })
+        assert envs[0]["tool"] == "subagent"
+        assert envs[0]["title"] == "sub-agent"
+
+    def test_todo_write_normalizes_to_plan_items(self):
+        envs = self._norm().normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t4", "name": "todo_write",
+            "status": "running",
+            "args": {"todos": [
+                {"id": "env", "content": "Bootstrap env",
+                 "status": "TODO_STATUS_COMPLETED"},
+                {"id": "impl", "content": "Wire nonce guard",
+                 "status": "TODO_STATUS_IN_PROGRESS"},
+            ]},
+        })
+        env = envs[0]
+        assert env["tool"] == "plan"  # NOT file-edit despite the _write name
+        assert env["plan_items"] == [
+            {"content": "Bootstrap env", "status": "completed"},
+            {"content": "Wire nonce guard", "status": "in_progress"},
+        ]
+        assert "1/2 done" in env["title"]
+        assert "Wire nonce guard" in env["title"]
+
+    def test_todo_write_args_only_at_completion_still_fold(self):
+        # Captured live 2026-07-09 (fixture tool_vocabulary_live.jsonl):
+        # todo_write streams an ARGLESS running message and the todos only
+        # arrive on the completed message. The salvage upgrade must emit a
+        # refined tool_use (with plan_items) before the result.
+        norm = self._norm()
+        first = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t10", "name": "todo_write",
+            "status": "running",
+        })
+        assert first[0]["title"] == "plan updated"
+        assert "plan_items" not in first[0]
+        envs = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t10", "name": "todo_write",
+            "status": "completed",
+            "args": {"todos": [
+                {"id": "a", "content": "Bootstrap env",
+                 "status": "TODO_STATUS_IN_PROGRESS"},
+            ]},
+        })
+        kinds = [e["kind"] for e in envs]
+        assert kinds == ["tool_use", "tool_result"]
+        assert envs[0]["updated"] is True
+        assert envs[0]["plan_items"] == [
+            {"content": "Bootstrap env", "status": "in_progress"},
+        ]
+
+    def test_live_fixture_tool_vocabulary_replay(self):
+        """Replay the sanitized live capture (2026-07-09, run-c99dd650)
+        through the REAL sse→message→normalizer path and assert the
+        envelope/args relations hold — no snapshots, invariants only."""
+        fixture = (
+            Path(gc_events.__file__).parent
+            / "fixtures" / "rest_v1" / "tool_vocabulary_live.jsonl"
+        )
+        norm = self._norm()
+        by_call: dict = {}
+        for line in fixture.read_text().splitlines():
+            if not line.strip() or line.startswith("#"):
+                continue
+            rec = json.loads(line)
+            msg = gc_cloud._message_from_sse(
+                gc_rest.SseEvent(event=rec["event"], data=rec["data"],
+                                 id=None, raw_data="")
+            )
+            assert msg is not None
+            for env in norm.normalize("cloud.message", msg):
+                if env.get("kind") == "tool_use":
+                    by_call.setdefault(env["id"], []).append(env)
+
+        # Every described shell call surfaces the description as title and
+        # keeps the raw command on the envelope.
+        shell = [e for envs in by_call.values() for e in envs
+                 if e.get("name") == "run_terminal_cmd"]
+        assert shell, "fixture must contain a described shell call"
+        for env in shell:
+            assert env["title"] == env["description"]
+            assert env["command"]
+        # The task call is a typed subagent envelope with model + snippet.
+        tasks = [e for envs in by_call.values() for e in envs
+                 if e.get("tool") == "subagent"]
+        assert tasks and all(
+            e.get("subagent_model") and e.get("prompt_snippet")
+            for e in tasks
+        )
+        # The argless-running→args-at-completion pattern (todo_write) folds
+        # to plan items via the salvage upgrade.
+        plans = [e for envs in by_call.values() for e in envs
+                 if e.get("tool") == "plan" and e.get("plan_items")]
+        assert plans, "todo_write args at completion must still fold"
+        # await surfaced as its own kind, never a bare shell.
+        awaits = [e for envs in by_call.values() for e in envs
+                  if e.get("tool") == "await"]
+        assert awaits
+        # NOTHING in the fixture may normalize to an untitled envelope —
+        # the exact regression this change kills.
+        for envs in by_call.values():
+            assert str(envs[-1].get("title") or "").strip(), envs[-1]
+
+    def test_await_and_search_and_unknown_tools_stay_specific(self):
+        norm = self._norm()
+        awaited = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t5", "name": "await",
+            "status": "running", "args": {"taskId": "rush-install"},
+        })
+        assert awaited[0]["tool"] == "await"
+        assert awaited[0]["title"] == "awaiting `rush-install`"
+        assert awaited[0]["await_task_id"] == "rush-install"
+        search = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t6", "name": "grep_search",
+            "status": "running",
+            "args": {"pattern": "prepareCalls|nonce", "path": "/ws/src"},
+        })
+        assert search[0]["tool"] == "search"
+        assert search[0]["title"] == "searching 'prepareCalls|nonce' in /ws/src"
+        # Unknown tool name (vocabulary is undocumented upstream): generic
+        # fallback keeps the real name + salvaged description, never a
+        # bare unlabeled shell.
+        unknown = norm.normalize("cloud.message", {
+            "type": "tool_call", "call_id": "t7", "name": "future_tool",
+            "status": "running", "args": {"description": "Do a new thing"},
+        })
+        assert unknown[0]["name"] == "future_tool"
+        assert unknown[0]["title"] == "Do a new thing"
 
     def test_nonzero_exit_code_marks_result_error(self):
         norm = self._norm()

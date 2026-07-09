@@ -35,6 +35,17 @@ SOURCE = "ghost"
 
 TOOL_SHELL = "shell"
 TOOL_FILE_EDIT = "file-edit"
+# Capture-derived kinds (the REST tool vocabulary is UNDOCUMENTED upstream:
+# RunStreamToolCallData.name is a free-form string — "such as `read_file`,
+# `run_terminal_cmd`, or `mcp`" is the spec's entire guidance). Names are
+# matched by hint, never enum, and anything unrecognized falls back to
+# TOOL_SHELL with its real name + salvaged description as the title, so a
+# brand-new cursor tool degrades to something informative.
+TOOL_SUBAGENT = "subagent"   # `task` — spawns a sub-agent (captured live 2026-07-09)
+TOOL_AWAIT = "await"         # `await` — blocks on a background task/sub-agent
+TOOL_PLAN = "plan"           # `todo_write` — cursor's own plan/progress list
+TOOL_SEARCH = "search"       # `grep_search` / `codebase_search` / glob
+TOOL_MCP = "mcp"             # documented name for MCP tool calls
 
 STATUS_RUNNING = "running"
 STATUS_DONE = "done"
@@ -336,8 +347,23 @@ _SDK_NOISE_TYPES = {"system", "user", "request", "status"}
 # tool_call names that mean a file edit (vs shell/read). Names are unstable
 # upstream, so this is a substring match, not an enum.
 _SDK_EDIT_NAME_HINTS = ("edit", "write", "delete", "apply_patch", "applypatch")
+# Sub-agent spawn tools. Exact "task" observed live (2026-07-09,
+# run-c99dd650: args {description, prompt, subagentType, model}); the
+# other hints anticipate obvious renames.
+_SDK_SUBAGENT_NAMES = ("task", "subagent", "spawn_agent", "agent_task")
+# Search-shaped tools: grep_search / codebase_search / glob_file_search /
+# web_search (args carry pattern/query + path).
+_SDK_SEARCH_HINTS = ("grep", "search", "glob")
 
 _SDK_TERMINAL_TOOL_STATUSES = {"completed", "error", "failed", "cancelled"}
+
+# Cap for the sub-agent prompt snippet kept on the envelope. Full prompts
+# are multi-KB and already live in cursor's own transcript; the snippet is
+# digest/status context only.
+_SUBAGENT_PROMPT_SNIPPET_CHARS = 280
+# Cap for plan items retained per todo_write envelope (defensive: the list
+# is model-authored and unbounded upstream).
+_PLAN_MAX_ITEMS = 30
 
 
 def _first_str(data: Dict[str, Any], *keys: str) -> str:
@@ -351,15 +377,81 @@ def _first_str(data: Dict[str, Any], *keys: str) -> str:
 
 def _sdk_tool_kind(name: str) -> str:
     lowered = str(name or "").lower()
+    # Order matters: specific vocabulary before the broad edit hints
+    # ("todo_write" would otherwise match the "write" edit hint).
+    if lowered in _SDK_SUBAGENT_NAMES:
+        return TOOL_SUBAGENT
+    if lowered == "await":
+        return TOOL_AWAIT
+    if lowered in ("todo_write", "todo_read", "update_plan"):
+        return TOOL_PLAN
+    if lowered == "mcp" or lowered.startswith("mcp_"):
+        return TOOL_MCP
+    if any(hint in lowered for hint in _SDK_SEARCH_HINTS):
+        return TOOL_SEARCH
     if any(hint in lowered for hint in _SDK_EDIT_NAME_HINTS):
         return TOOL_FILE_EDIT
     return TOOL_SHELL
 
 
+def _plan_items(args: Dict[str, Any]) -> List[Dict[str, str]]:
+    """Parsed todo items from a todo_write call, shape-tolerant.
+
+    Observed live (2026-07-09): ``args.todos`` is a list of
+    ``{id, content, status}`` with statuses like TODO_STATUS_IN_PROGRESS /
+    TODO_STATUS_COMPLETED. Statuses are normalized to lowercase with the
+    TODO_STATUS_ prefix stripped; unknown shapes yield [].
+    """
+    todos = args.get("todos")
+    if not isinstance(todos, list):
+        return []
+    items: List[Dict[str, str]] = []
+    for raw in todos[:_PLAN_MAX_ITEMS]:
+        if not isinstance(raw, dict):
+            continue
+        content = str(raw.get("content") or raw.get("title") or "").strip()
+        if not content:
+            continue
+        status = str(raw.get("status") or "").strip()
+        if status.upper().startswith("TODO_STATUS_"):
+            status = status[len("TODO_STATUS_"):]
+        items.append({"content": content[:200], "status": status.lower()})
+    return items
+
+
 def _sdk_tool_title(name: str, kind: str, args: Dict[str, Any]) -> str:
+    # The model-written description is the most human string on the wire
+    # ("Start focused rush install in tmux background") — prefer it for
+    # every kind that carries one. args are unstable/optional upstream, so
+    # every probe degrades gracefully.
+    description = _first_str(args, "description").strip()
     path = _first_str(args, "path", "file_path", "filePath")
+    if kind == TOOL_SUBAGENT:
+        return description[:160] if description else "sub-agent"
+    if kind == TOOL_AWAIT:
+        task_id = _first_str(args, "taskId", "task_id")
+        return f"awaiting `{task_id}`" if task_id else "awaiting background task"
+    if kind == TOOL_PLAN:
+        items = _plan_items(args)
+        if items:
+            done = sum(1 for i in items if "complet" in i["status"])
+            current = next(
+                (i["content"] for i in items if "progress" in i["status"]), ""
+            )
+            head = f"plan updated ({done}/{len(items)} done)"
+            return f"{head} — current: {current}"[:160] if current else head
+        return "plan updated"
+    if kind == TOOL_SEARCH:
+        pattern = _first_str(args, "pattern", "query", "glob_pattern")
+        scope = _first_str(args, "path", "target_directories")
+        if pattern:
+            title = f"searching '{pattern}'" + (f" in {scope}" if scope else "")
+            return title[:160]
+        return description[:160] if description else "searching"
     if kind == TOOL_FILE_EDIT:
         return f"Editing {path}" if path else "File edit"
+    if description:
+        return description[:160]
     cmd = _first_str(args, "command", "cmd")
     if cmd:
         return cmd.strip().splitlines()[0][:120]
@@ -759,12 +851,29 @@ class SdkNormalizer:
         return self._tool_started(call_id, msg)
 
     def _tool_started(self, call_id: str, msg: Dict[str, Any]) -> List[Dict[str, Any]]:
-        if call_id in self._started:
-            return []  # re-emitted running message (args accumulating)
-        self._started.add(call_id)
-
         name = str(msg.get("name") or "")
-        args = msg.get("args") if isinstance(msg.get("args"), dict) else {}
+        raw_args = msg.get("args")
+        args: Dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+
+        if call_id in self._started:
+            # Re-emitted running message. Args accumulate across these
+            # (captured live 2026-07-09: the FIRST running message often
+            # has no args at all; the description/pattern/todos arrive on
+            # a re-emit). If the stored state was built argless and this
+            # message finally carries args, upgrade in place and emit ONE
+            # updated tool_use (same id — consumers keyed by call id treat
+            # it as a refinement). Further re-emits stay dropped.
+            state = self._calls.get(call_id)
+            if state is not None and not state.get("had_args") and args:
+                return self._tool_envelope(call_id, name, args, upgrade=True)
+            return []
+        self._started.add(call_id)
+        return self._tool_envelope(call_id, name, args)
+
+    def _tool_envelope(
+        self, call_id: str, name: str, args: Dict[str, Any], upgrade: bool = False
+    ) -> List[Dict[str, Any]]:
+        prior = self._calls.get(call_id) or {}
         kind = _sdk_tool_kind(name)
         title = _sdk_tool_title(name, kind, args)
         state = {
@@ -772,7 +881,9 @@ class SdkNormalizer:
             "title": title,
             "command": _first_str(args, "command", "cmd"),
             "path": _first_str(args, *_DIFF_PATH_KEYS),
-            "started": time.monotonic(),
+            "had_args": bool(args),
+            # An upgrade must not reset the duration clock.
+            "started": prior.get("started") or time.monotonic(),
         }
         self._calls[call_id] = state
 
@@ -783,10 +894,39 @@ class SdkNormalizer:
             status=STATUS_RUNNING,
             title=title,
         )
+        if name:
+            env["name"] = name
+        if upgrade:
+            env["updated"] = True
         if kind == TOOL_FILE_EDIT:
             env["path"] = _first_str(args, "path", "file_path", "filePath")
             env["additions"] = 0
             env["deletions"] = 0
+            return [env]
+
+        description = _first_str(args, "description").strip()
+        if description:
+            env["description"] = description[:300]
+        if kind == TOOL_SUBAGENT:
+            model = _first_str(args, "model")
+            if model:
+                env["subagent_model"] = model
+            subagent_type = _first_str(args, "subagentType", "subagent_type")
+            if subagent_type:
+                env["subagent_type"] = subagent_type
+            prompt = _first_str(args, "prompt")
+            if prompt:
+                env["prompt_snippet"] = _clip(
+                    prompt, _SUBAGENT_PROMPT_SNIPPET_CHARS
+                )
+        elif kind == TOOL_PLAN:
+            items = _plan_items(args)
+            if items:
+                env["plan_items"] = items
+        elif kind == TOOL_AWAIT:
+            task_id = _first_str(args, "taskId", "task_id")
+            if task_id:
+                env["await_task_id"] = task_id
         else:
             env["command"] = state["command"]
         return [env]
@@ -798,10 +938,25 @@ class SdkNormalizer:
         kind = state.get("kind") or _sdk_tool_kind(str(msg.get("name") or ""))
 
         envelopes: List[Dict[str, Any]] = []
+        raw_args = msg.get("args")
+        terminal_args: Dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
         if call_id not in self._started:
             # Terminal message with no prior running message (observed on
             # very fast calls): synthesize the tool_use so the pair renders.
             envelopes.extend(self._tool_started(call_id, msg))
+            state = self._calls.get(call_id) or state
+        elif not state.get("had_args") and terminal_args:
+            # Ran argless the whole way and the args only arrived on the
+            # terminal message (captured live 2026-07-09: todo_write's
+            # `todos` list appears at completion). Salvage them into one
+            # upgraded tool_use so the title/plan context isn't lost.
+            envelopes.extend(
+                self._tool_envelope(
+                    call_id, str(msg.get("name") or ""), terminal_args,
+                    upgrade=True,
+                )
+            )
+            state = self._calls.get(call_id) or state
 
         is_error = status in ("error", "failed", "cancelled")
         res_env: Dict[str, Any] = _envelope(

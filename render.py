@@ -48,8 +48,33 @@ EVENTS_TRUNCATION_NOTE = "page truncated at 20KB — narrow with limit/kind"
 # progress digest: events-since-last-tick body caps (~5 lines / ~1KB).
 DIGEST_MAX_EVENTS = 5
 DIGEST_BODY_CAP = 1024
+# digest/status 'waiting on' block: max in-flight calls listed.
+PENDING_MAX_ROWS = 4
 
 _STATUS_WORDS = {"A": "added", "M": "modified", "D": "deleted"}
+
+
+def _plan_line(plan: Any) -> str:
+    """'plan: 2/5 done — current: <item>' from cursor's todo snapshot, or
+    '' when no plan was streamed / the shape is unusable."""
+    if not isinstance(plan, list) or not plan:
+        return ""
+    items = [p for p in plan if isinstance(p, dict) and p.get("content")]
+    if not items:
+        return ""
+    done = sum(1 for p in items if "complet" in str(p.get("status") or ""))
+    current = next(
+        (
+            str(p.get("content"))
+            for p in items
+            if "progress" in str(p.get("status") or "")
+        ),
+        "",
+    )
+    line = f"plan: {done}/{len(items)} done"
+    if current:
+        line += f" — current: {clip(current, 120)}"
+    return line
 
 
 # ---------------------------------------------------------------------------
@@ -209,9 +234,15 @@ def recent_bullets(events: List[Dict[str, Any]]) -> List[str]:
     for record in events:
         kind = _eventlog.display_kind(record)
         if kind == "tool_use":
-            if str(record.get("tool") or "") == "shell":
-                cmd = _one_line(record.get("command") or record.get("title"))
-                bullets.append(f"ran `{cmd}`")
+            tool = str(record.get("tool") or "")
+            if tool == "shell":
+                # Description-first title when the normalizer salvaged one;
+                # raw command as fallback.
+                detail = _one_line(record.get("title") or record.get("command"))
+                bullets.append(f"ran `{detail}`" if detail else "ran a command")
+            elif tool == "subagent":
+                title = _one_line(record.get("title") or "sub-agent")
+                bullets.append(f'spawned subagent "{title}"')
             else:
                 title = _one_line(record.get("title") or record.get("path"))
                 bullets.append(title or "tool call")
@@ -237,6 +268,8 @@ def status_text(
     summary: str = "",
     error: str = "",
     note: str = "",
+    pending_tools: Optional[List[Dict[str, Any]]] = None,
+    plan: Optional[List[Dict[str, str]]] = None,
     last_prompt_seq: Any = 0,
     runtime: str = "",
     worker: str = "",
@@ -263,6 +296,21 @@ def status_text(
         # it is the task string verbatim — never LLM-generated.
         f"working on: {clip(_one_line(task), WORKING_ON_CHARS)}",
     ]
+    plan_line = _plan_line(plan)
+    if plan_line:
+        lines.append(plan_line)
+    if pending_tools:
+        lines.append("waiting on:")
+        for p in pending_tools[:PENDING_MAX_ROWS]:
+            since = p.get("pending_s")
+            suffix = f" ({secs(since)})" if since is not None else ""
+            lines.append(
+                f"  {clip(_one_line(p.get('title') or 'tool'), 160)}{suffix}"
+            )
+        if len(pending_tools) > PENDING_MAX_ROWS:
+            lines.append(
+                f"  … {len(pending_tools) - PENDING_MAX_ROWS} more in-flight calls"
+            )
     if summary:
         lines += ["", f"summary: {clip(_one_line(summary), STATUS_PEEK_CHARS)}"]
     if error:
@@ -312,6 +360,8 @@ def digest_text(
     files: List[Dict[str, Any]],
     pending_tool: str = "",
     pending_tool_s: Any = None,
+    pending_tools: Optional[List[Dict[str, Any]]] = None,
+    plan: Optional[List[Dict[str, str]]] = None,
     events: Optional[List[Dict[str, Any]]] = None,
     new_count: int = 0,
     next_update_s: Any = None,
@@ -323,7 +373,13 @@ def digest_text(
     distinguishable. ``next_update_s`` is the ticker's CURRENT interval at
     tick time — a mid-run cursor_subscribe change shows in the very next
     digest — rendered as 'next update in 3m' on the status line (omitted
-    when unknown/<= 0)."""
+    when unknown/<= 0).
+
+    ``pending_tools`` (list of {tool, title, pending_s}) supersedes the
+    scalar ``pending_tool``/``pending_tool_s`` pair, which stays accepted
+    for callers without the richer snapshot. ``plan`` is cursor's own
+    todo list ({content, status} dicts) when one was streamed.
+    """
     last = f"{secs(last_activity_s)} ago" if last_activity_s is not None else "—"
     next_update = dur_compact(next_update_s)
     lines = [
@@ -331,14 +387,30 @@ def digest_text(
         f"status: {status} · elapsed: {secs(elapsed_s)} · last activity: {last}"
         + (f" · next update in {next_update}" if next_update else ""),
     ]
+    plan_line = _plan_line(plan)
+    if plan_line:
+        lines.append(plan_line)
     if files:
         lines.append(f"files so far ({len(files)}): {files_inline(files)}")
-    if pending_tool:
-        since = f" ({secs(pending_tool_s)})" if pending_tool_s is not None else ""
-        lines.append(f"pending tool call: {pending_tool}{since}")
+    pending = list(pending_tools or [])
+    if not pending and pending_tool:
+        pending = [{"title": pending_tool, "pending_s": pending_tool_s}]
+    if pending:
+        lines.append("waiting on:")
+        for p in pending[:PENDING_MAX_ROWS]:
+            since = p.get("pending_s")
+            suffix = f" ({secs(since)})" if since is not None else ""
+            lines.append(f"  {clip(_one_line(p.get('title') or 'tool'), 160)}{suffix}")
+        if len(pending) > PENDING_MAX_ROWS:
+            lines.append(f"  … {len(pending) - PENDING_MAX_ROWS} more in-flight calls")
     lines.append("")
     if not events:
-        lines.append("no new events since last update")
+        if pending:
+            lines.append(
+                "no new stream events — cursor is busy inside the calls above"
+            )
+        else:
+            lines.append("no new events since last update")
         return "\n".join(lines)
 
     lines.append(f"new events since last update ({new_count}):")
@@ -503,7 +575,13 @@ def _event_summary(record: Dict[str, Any]) -> str:
     kind = _eventlog.display_kind(record)
     if kind == "tool_use":
         tool = str(record.get("tool") or "tool")
-        detail = _one_line(record.get("command") or record.get("title") or "")
+        # The normalizer's title is description-first ("Start focused rush
+        # install in tmux background"); raw command stays the fallback.
+        detail = _one_line(record.get("title") or record.get("command") or "")
+        if tool == "subagent":
+            model = str(record.get("subagent_model") or "")
+            suffix = f" [{model}]" if model else ""
+            return f'subagent "{detail}"{suffix}' if detail else f"subagent{suffix}"
         return f"{tool} `{detail}`" if detail else tool
     if kind == "tool_result":
         status = str(record.get("status") or "done")
