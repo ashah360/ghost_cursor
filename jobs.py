@@ -138,9 +138,10 @@ class CursorJob:
     # Where the agent executes: "local" (machine-routed worker on this box)
     # or "cloud" (cursor-hosted VM). Set at dispatch from the session entry.
     runtime: str = "local"
-    # v0.4 handle: the human slug minted by cursor_create_session (e.g.
-    # "playful-space-bunny"). The cursor agent id (cursor_session_id below)
-    # stays a resolvable alias. Empty only for direct registry use in tests.
+    # THE public handle: the meaningful session title registered by
+    # cursor_create_session (e.g. "Fix payment webhook retries"). The
+    # cursor agent id (cursor_session_id below) stays a resolvable alias.
+    # Empty only for direct registry use in tests.
     session_name: str = ""
     session_key: str = ""
     requested_session_id: Optional[str] = None

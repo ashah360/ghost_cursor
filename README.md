@@ -24,9 +24,9 @@ The legacy `--print` runner is kept in `runner.py` as a reference/fallback.
 
 ## What you get (v0.6 — cloud-machine runtime)
 
-Seven named-session tools. The handle is a friendly **session name** (e.g. `brave-lunar-otter`) minted by `cursor_create_session`; cursor agent ids from older runs resolve as aliases.
+Seven named-session tools. The handle is a **meaningful session title** (e.g. `Fix payment webhook retries`) provided by the caller to `cursor_create_session`; cursor agent ids from older runs resolve as aliases.
 
-- **`cursor_create_session(repo?, model?, runtime?)`** — mints a named session and dispatches **nothing** (the cloud agent is created lazily on the first message). `runtime="local"` (default) routes execution to a plugin-managed "My Machines" worker on this machine; `runtime="cloud"` uses a cursor-hosted VM. `repo` is a local path either way — the plugin derives the GitHub origin URL + branch itself.
+- **`cursor_create_session(title?, repo?, model?, runtime?)`** — registers a named session and dispatches **nothing** (the cloud agent is created lazily on the first message). `title` is a concise phrase (roughly 3–8 words, plain words with spaces, max 80 chars) describing the task; it becomes the handle everywhere, including the agent's name on cursor.com. A taken title fails the create with the existing entry's status and age; an omitted title falls back to `<repo-basename> session` (numeric suffix past collisions). `runtime="local"` (default) routes execution to a plugin-managed "My Machines" worker on this machine; `runtime="cloud"` uses a cursor-hosted VM. `repo` is a local path either way — the plugin derives the GitHub origin URL + branch itself.
 - **`cursor_send_message(session, message, ...)`** — all work goes through this. The first message on a fresh session is the task; later messages are follow-ups with full prior context. Honest semantics: there is **no mid-run queue** — sending into a live run cancels it natively and re-prompts the same session. Returns immediately; the run executes in the background and the final result is delivered as a message on every terminal state.
 - **`cursor_status(session)`** — **strictly read-only**: status, elapsed, last-activity age, files changed so far, recent events. Polling never cancels (tested property).
 - **`cursor_events(session, offset?, limit?, kind?)`** — pages the per-session JSONL event log (reasoning, tool calls, file diffs, content).
@@ -59,7 +59,7 @@ Drop the plugin into your Hermes plugins directory and enable it:
 ```bash
 # 1. copy the plugin
 mkdir -p ~/.hermes/plugins/ghost_cursor
-cp __init__.py rest_client.py cloud_runner.py workers.py progress.py events.py runner.py jobs.py handles.py eventlog.py names.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
+cp __init__.py rest_client.py cloud_runner.py workers.py progress.py events.py runner.py jobs.py handles.py eventlog.py render.py plugin.yaml ~/.hermes/plugins/ghost_cursor/
 
 # 2. enable it in ~/.hermes/config.yaml
 #    plugins:
@@ -85,15 +85,16 @@ In practice you just talk to your agent normally — when a task is coding work,
 > "Add a `subtract(a, b)` function to `calc.py`"
 
 ```
-cursor_create_session(repo="/path/to/repo")      → session: brave-lunar-otter
-cursor_send_message("brave-lunar-otter", task)   → runs in background
+cursor_create_session(repo="/path/to/repo",
+                      title="Add subtract to calc")   → session: Add subtract to calc
+cursor_send_message("Add subtract to calc", task)     → runs in background
   … completion auto-delivers with a summary + files changed + diffs
 ```
 
 Follow-ups go to the same name and keep full prior context:
 
 ```
-cursor_send_message("brave-lunar-otter", "now add subtract in the same style")
+cursor_send_message("Add subtract to calc", "now add divide in the same style")
 ```
 
 Because the session is a real cloud agent, it also appears in Cursor's Agents UI (web + mobile) — you can open the same conversation there and watch or continue it.
@@ -136,7 +137,6 @@ which the api_server session-chat-stream forwards mid-turn as `event: tool.progr
 | `jobs.py` | Background job tracking + completion/digest delivery into the agent loop |
 | `handles.py` | Session-handle persistence (name → agent id, repo, runtime, subscribers) |
 | `eventlog.py` | Per-session JSONL event log |
-| `names.py` | Friendly session-name minting |
 | `render.py` | Plain-text rendering for tool outputs |
 | `runner.py` | Legacy `--print` stdout runner (reference/fallback) + shared helpers |
 | `plugin.yaml` | Plugin manifest |

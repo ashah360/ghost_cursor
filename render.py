@@ -112,6 +112,24 @@ def dur_compact(seconds: Any) -> str:
     return f"{hours}h{rem_m}m" if rem_m else f"{hours}h"
 
 
+def age_compact(seconds: Any) -> str:
+    """'45s' / '3m' / '4h' / '2d' — coarse age for prose ('' when unknown)."""
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return ""
+    if value <= 0:
+        return ""
+    total = max(int(round(value)), 1)
+    if total < 60:
+        return f"{total}s"
+    if total < 3600:
+        return f"{total // 60}m"
+    if total < 86400:
+        return f"{total // 3600}h"
+    return f"{total // 86400}d"
+
+
 def clip(text: Any, limit: int, where: str = "cursor_events") -> str:
     """Hard clip with an explicit marker + where the full content lives."""
     s = str(text or "")
@@ -192,6 +210,31 @@ def create_session_ack(
         f"session: {name}\n"
         f"repo: {repo} · model: {model or 'default'} · runtime: {runtime}\n"
         "created. send work with cursor_send_message."
+    )
+
+
+def title_too_long(title: str, limit: int) -> str:
+    """The over-long-title create failure: name the cap and ask for a
+    shorter phrase — never silently truncate (a truncated title could
+    collide, and it reads badly on cursor.com)."""
+    return (
+        f"cannot create session: the title is {len(title)} chars — the max "
+        f"is {limit}. shorten it to a concise phrase of roughly 3-8 words, "
+        "like a short commit subject (e.g. 'Fix payment webhook retries')."
+    )
+
+
+def title_taken(title: str, status: str, age_s: Any = None) -> str:
+    """The duplicate-title create failure: name the existing entry's state
+    ('completed, 2d ago' vs 'running') and ask for a more specific title —
+    never auto-suffix silently."""
+    age = age_compact(age_s)
+    state = f"{status}, {age} ago" if age else status
+    return (
+        f"cannot create session: the title '{title}' is already in use by "
+        f"an existing session ({state}). pick a different, more specific "
+        "title for this task — e.g. name the component, bug, or feature "
+        "it covers."
     )
 
 

@@ -1,12 +1,13 @@
 """Persistent handle table for cursor sessions — explicit handles, no heuristics.
 
 EXPLICIT session handles, no auto-resume heuristics: ``cursor_create_session``
-mints a session NAME and every other tool takes it back (the cursor
-agent id resolves as an alias). This module is the tiny persistence layer under
-that model — a JSON file mapping
+registers a session NAME — the caller-provided meaningful title, e.g.
+``Fix payment webhook retries`` — and every other tool takes it back (the
+cursor agent id resolves as an alias). This module is the tiny persistence
+layer under that model — a JSON file mapping
 ``session_name -> {repo, status, task, model, cursor_session_id, ...}`` so a
-handle minted on turn T is still resolvable on turn T+1 even across a process
-restart (the live job table in ``jobs.py`` is process-local).
+handle registered on turn T is still resolvable on turn T+1 even across a
+process restart (the live job table in ``jobs.py`` is process-local).
 
 What this is NOT: there is no ``get_recent()``, no repo matching, no age
 window, no auto-resume. Lookup is by exact handle only. If the caller lost
@@ -33,7 +34,10 @@ Storage: ``<HERMES_HOME>/state/ghost_cursor_handles.json``.
 Bounded growth: terminal-state entries older than
 :data:`PRUNE_TERMINAL_AFTER_S` are dropped on every write, and the table is
 capped at :data:`MAX_ENTRIES` — evicting oldest TERMINAL entries first so a
-crowd of finished runs can never push out another session's live handle.
+crowd of finished runs can never push out another session's live handle. A
+pruned/evicted entry takes its per-session JSONL event log with it
+(best-effort delete via ``eventlog.log_path``) so the log directory's file
+count stays bounded too.
 
 Contract: never raises. A missing/corrupt/unwritable file degrades to the
 in-memory (process-local) view.
@@ -118,13 +122,32 @@ def _is_terminal(entry: Dict[str, Any]) -> bool:
     return str(entry.get("status") or "") in _TERMINAL_STATUSES
 
 
+def _drop_log(name: str) -> None:
+    """Best-effort delete of a pruned session's JSONL event log.
+
+    Without this every pruned/evicted handle leaks one file under
+    ``state/ghost_cursor/logs/`` forever — an unbounded file-count leak.
+    The import is lazy so this module stays import-light and can never
+    join an import cycle with ``eventlog``. Never raises.
+    """
+    try:
+        from . import eventlog
+
+        path = eventlog.log_path(name)
+        if path is not None:
+            path.unlink(missing_ok=True)
+    except Exception:
+        logger.debug("ghost_cursor pruned log delete failed", exc_info=True)
+
+
 def _prune_locked(now: Optional[float] = None) -> None:
     """Age out old terminal entries, then enforce the size cap.
 
     Eviction order under the cap: oldest TERMINAL entries first; only when
     the table is over cap with no terminal entries left do the oldest
     non-terminal (running/unknown) entries go — a burst of finished runs
-    can't push out live handles.
+    can't push out live handles. Every dropped entry takes its JSONL event
+    log with it (:func:`_drop_log`).
     """
     now = time.time() if now is None else now
     for key in [
@@ -133,6 +156,7 @@ def _prune_locked(now: Optional[float] = None) -> None:
         and now - float(e.get("updated_at") or 0.0) > PRUNE_TERMINAL_AFTER_S
     ]:
         _table.pop(key, None)
+        _drop_log(key)
 
     if len(_table) <= MAX_ENTRIES:
         return
@@ -142,6 +166,7 @@ def _prune_locked(now: Optional[float] = None) -> None:
     )
     for key, _ in by_age[: len(_table) - MAX_ENTRIES]:
         _table.pop(key, None)
+        _drop_log(key)
 
 
 def record(session_id: Optional[str], **fields: Any) -> None:
@@ -409,10 +434,10 @@ def _resolve_locked(identifier: str) -> Optional[str]:
 def resolve(identifier: Optional[str]) -> Optional[str]:
     """The canonical session NAME for a name-or-UUID identifier, or None.
 
-    v0.4 keys the table by human slug (``playful-space-bunny``); the cursor
-    agent id is recorded on the entry as ``cursor_session_id`` and stays a
-    working alias — this is the lookup that makes UUIDs resolve everywhere
-    a name is accepted. Never raises.
+    The table is keyed by the meaningful session title (``Fix payment
+    webhook retries``); the cursor agent id is recorded on the entry as
+    ``cursor_session_id`` and stays a working alias — this is the lookup
+    that makes UUIDs resolve everywhere a name is accepted. Never raises.
     """
     try:
         ident = str(identifier or "").strip()

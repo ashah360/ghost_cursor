@@ -3,9 +3,11 @@
 v0.4: explicit named sessions + plain-text tool output. Seven tools in the
 ``ghost_cursor`` toolset:
 
-* ``cursor_create_session(repo?, model?)`` — mint a named session handle
-  (adjective-adjective-noun slug, e.g. ``playful-space-bunny``). LAZY: it
-  dispatches nothing; the cursor agent spawns on the first message.
+* ``cursor_create_session(title?, repo?, model?)`` — register a named
+  session handle. The caller-provided ``title`` — a short meaningful
+  phrase (e.g. ``Fix payment webhook retries``) — IS the handle; omitted
+  titles fall back to ``<repo-basename> session``. LAZY: it dispatches
+  nothing; the cursor agent spawns on the first message.
 * ``cursor_send_message(session, message)`` — ALL work goes through here.
   The first message on a fresh session is the task; later messages are
   follow-ups (or interrupt + re-prompt when the run is live — the ack says
@@ -31,11 +33,15 @@ them outright; pre-launch, no deprecation shim.)
 
 Handle model (v0.4)
 -------------------
-THE handle is the session name minted by ``cursor_create_session``
-(collision-checked against the persistent handle table, ``names.py``). The
-cloud AGENT ID (``bc-...``) is recorded on the handle entry as an
-alias (``handles.resolve``), so ids from older runs / completion payloads
-still resolve everywhere a name is accepted. The handle table
+THE handle is the meaningful session title given to
+``cursor_create_session`` (collision-checked against the persistent handle
+table at create — a taken title fails the create with the existing entry's
+status and age; a title over ``MAX_TITLE_CHARS`` is rejected, never
+truncated; an omitted title falls back to ``<repo-basename> session`` with
+a numeric suffix past collisions). The cloud AGENT ID (``bc-...``) is
+recorded on the handle entry as an alias (``handles.resolve``), so ids
+from older runs / completion payloads still resolve everywhere a name is
+accepted. The handle table
 (``handles.py``) persists name → repo/status/model/runtime/
 cursor_session_id (the agent id) across restarts — a follow-up run on the
 persisted agent id continues the conversation even across a plugin/gateway
@@ -89,7 +95,6 @@ from . import eventlog as _eventlog
 from . import events as _events
 from . import handles as _handles
 from . import jobs as _jobs
-from . import names as _names
 from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
@@ -133,10 +138,18 @@ _INTERRUPT_WAIT_S = 40.0
 _STOP_WAIT_S = 15.0
 
 _SESSION_DOC = (
-    "The session handle: the name returned by cursor_create_session (e.g. "
-    "'playful-space-bunny'). A cursor agent id from an older run also "
-    "resolves as an alias."
+    "The session handle: the title given to cursor_create_session (e.g. "
+    "'Fix payment webhook retries'). A cursor agent id from an older run "
+    "also resolves as an alias."
 )
+
+# Hard cap on session titles (after trimming and collapsing whitespace
+# runs). Over-long titles are REJECTED at create — never silently
+# truncated (a truncated title could collide, and it reads badly on
+# cursor.com). 80 keeps a safety margin under Cursor's REST API limit:
+# POST /v1/agents 400s (validation_error, "String must contain at most
+# 100 character(s)") on a `name` over 100 chars.
+MAX_TITLE_CHARS = 80
 
 # Shared watchdog params for the dispatching tools. Timeouts are
 # inactivity-based: streamed progress keeps a run alive indefinitely unless
@@ -170,15 +183,37 @@ CURSOR_CREATE_SCHEMA = {
     "name": CREATE_TOOL_NAME,
     "description": (
         "Create a named Cursor session for delegating coding work into a "
-        "repository. Returns a session name handle (e.g. "
-        "'playful-space-bunny') and dispatches NOTHING — the cloud agent "
-        "spawns lazily on the first cursor_send_message. Use this, then "
-        "send the task as a message. Only one run may be active per repo "
-        "at a time (different repos proceed in parallel)."
+        "repository. The `title` you provide IS the session handle (e.g. "
+        "'Fix payment webhook retries') — every other cursor tool takes "
+        "it back. Dispatches NOTHING — the cloud agent spawns lazily on "
+        "the first cursor_send_message. Use this, then send the task as "
+        "a message. Only one run may be active per repo at a time "
+        "(different repos proceed in parallel)."
     ),
     "parameters": {
         "type": "object",
         "properties": {
+            "title": {
+                "type": "string",
+                "description": (
+                    "A concise, meaningful English phrase of roughly 3-8 "
+                    "words — like a short commit subject in plain "
+                    "english — naming the task this session is for, "
+                    "based on the context you are creating it in. Plain "
+                    "words WITH SPACES; no hyphens or other delimiters "
+                    "between words. Good: 'Fix payment webhook retries', "
+                    "'Session naming rework'. Bad: a full sentence or "
+                    "task description ('Fix the bug where payment "
+                    "webhooks are not retried when the downstream "
+                    "service returns a 5xx'). This becomes THE session "
+                    "handle everywhere (every cursor tool, listings, "
+                    "logs, and the agent's name in Cursor's UI). Max 80 "
+                    "chars — longer titles are rejected, not truncated. "
+                    "If the title is already in use, the create fails "
+                    "and asks for a more specific one. Omitted: a "
+                    "fallback name is derived from the repo."
+                ),
+            },
             "repo": {
                 "type": "string",
                 "description": (
@@ -1413,14 +1448,51 @@ def _unknown_session_text(identifier: str) -> str:
 # Tool handlers
 # ---------------------------------------------------------------------------
 
+def _normalize_title(title: Any) -> str:
+    """The canonical form of a caller-provided title: whitespace trimmed,
+    internal runs collapsed to single spaces. "" when nothing usable was
+    provided. Length is deliberately NOT enforced here — an over-long
+    title is rejected with a clear error at create, never silently
+    truncated."""
+    return " ".join(str(title or "").split())
+
+
+def _fallback_title(repo: str) -> str:
+    """Deterministic handle when no title was given: '<repo-basename>
+    session', with a numeric suffix past collisions ('hermes-agent
+    session 2'). This path never fails — the suffix search terminates
+    because the handle table is finite, and a pathologically long
+    basename is clipped so the fallback respects MAX_TITLE_CHARS."""
+    base = str(repo or "").rstrip("/").rsplit("/", 1)[-1]
+    if base.endswith(".git"):
+        base = base[: -len(".git")]
+    base = (base or "cursor")[: MAX_TITLE_CHARS - len(" session")].rstrip()
+    candidate = f"{base or 'cursor'} session"
+    if _handles.resolve(candidate) is None:
+        return candidate
+    n = 2
+    while _handles.resolve(f"{candidate} {n}") is not None:
+        n += 1
+    return f"{candidate} {n}"
+
+
 def cursor_create_session(
     repo: Optional[str] = None,
     model: Optional[str] = None,
     runtime: Optional[str] = None,
+    title: Optional[str] = None,
     **_kwargs: Any,
 ) -> str:
-    """Mint a named session handle. LAZY — no cursor agent is created;
+    """Register a named session handle. LAZY — no cursor agent is created;
     the agent starts on the first cursor_send_message.
+
+    The caller's ``title`` (a concise meaningful phrase, e.g. 'Fix payment
+    webhook retries') IS the handle. A title already in the handle table
+    fails the create — with the existing entry's status and age — instead
+    of silently suffixing; a title over MAX_TITLE_CHARS is rejected with
+    an ask to shorten it, never truncated; an omitted/blank title falls
+    back to ``<repo-basename> session`` (numeric suffix past collisions,
+    never fails).
 
     ``runtime="local"`` (default) needs a GitHub-backed local checkout
     (validated here — clear error adjacent to the param, no network
@@ -1470,9 +1542,21 @@ def cursor_create_session(
                 "'-thinking[-<level>]' or '[param=value,...]' suffix — or "
                 "omit model for the default."
             )
-    name = _names.generate(
-        taken=lambda n: _handles.resolve(n) is not None
-    )
+    name = _normalize_title(title)
+    if name:
+        if len(name) > MAX_TITLE_CHARS:
+            return _render.title_too_long(name, MAX_TITLE_CHARS)
+        if _handles.resolve(name) is not None:
+            existing = _handles.get(name) or {}
+            updated = existing.get("updated_at")
+            return _render.title_taken(
+                name,
+                str(existing.get("status") or "unknown"),
+                (time.time() - float(updated))
+                if isinstance(updated, (int, float)) else None,
+            )
+    else:
+        name = _fallback_title(workdir_str)
     _handles.record(
         name,
         repo=workdir_str,
@@ -1811,6 +1895,7 @@ def _handle_cursor_create_session(args: Dict[str, Any], **kwargs: Any) -> str:
         repo=args.get("repo"),
         model=args.get("model"),
         runtime=args.get("runtime"),
+        title=args.get("title"),
     )
 
 
