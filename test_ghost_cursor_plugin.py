@@ -6099,18 +6099,24 @@ class TestSupervisorReattach:
         release.set()
         assert job.done_event.wait(10)
 
-    def test_legacy_running_handles_stay_on_the_orphan_backstop(
+    def test_adopted_legacy_handle_without_agent_id_settles_orphaned(
         self, clean_state, monkeypatch
     ):
-        """Pre-supervisor records (no supervision phase) keep the read-time
-        reconciliation exactly as before (RFC §6 backstop)."""
+        """A pre-supervisor running record is ADOPTED by the reconciler
+        (not skipped); with no remote agent id there is nothing to
+        re-attach to, so the adopted supervisor settles it honestly."""
         gc_handles.record("s-old", repo="/tmp/r", status="running")
-        assert gc_supervisor.reconcile_once() == []
-        out = cursor_status("s-old")
+        _install_supervisor_client(
+            monkeypatch, _FakeRestClient(statuses=("FINISHED",))
+        )
+        attached = gc_supervisor.reconcile_once()
+        assert attached == ["s-old"]
+        _wait_settled("s-old", "failed")
         entry = gc_handles.get("s-old")
-        assert entry["status"] == "failed"
-        assert "orphaned" in entry["status_note"]
-        assert "orphaned" in out
+        assert "orphaned" in str(entry.get("status_note") or "")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "failed"
 
     def test_supervised_running_handle_is_not_declared_dead_at_read_time(
         self, clean_state, monkeypatch
@@ -6227,4 +6233,270 @@ class TestSupervisorReattach:
         assert _wait_until(lambda: not gc_supervisor.has_live(name))
         assert (gc_handles.get(name) or {}).get("status") == "running"
         assert gc_handles.supervision_is_live(gc_handles.get(name))
+        assert _completion_events(_drain_completion_queue()) == []
+
+
+# ---------------------------------------------------------------------------
+# Reconciler adoption of legacy/pre-supervisor handles + false-settle repair
+# (incident: gateway restart left two healthy pre-supervisor cloud runs
+# un-adopted, and a bounced follow-up send falsely settled one as failed)
+# ---------------------------------------------------------------------------
+
+def _seed_legacy_running(name="legacy-run", agent="bc-legacy", run=None,
+                         supervision=None, repo="/tmp/r"):
+    """A pre-supervisor handle: top-level status running, NO (or empty)
+    supervision record — exactly what predates the supervisor deploy."""
+    fields = dict(
+        repo=repo, status="running", task="keep going", session_key="",
+        cursor_session_id=agent, runtime="local",
+    )
+    if run:
+        fields["latest_run_id"] = run
+    if supervision is not None:
+        fields["supervision"] = supervision
+    gc_handles.record(name, **fields)
+    return name
+
+
+class TestReconcilerLegacyAdoption:
+    def test_adopts_running_handle_with_no_supervision_record(
+        self, clean_state, monkeypatch
+    ):
+        """A running handle with NO supervision record is adopted: record
+        seeded (live phase, fresh attempt id), supervisor spawned, digests
+        flow, and the run settles from the GET authority."""
+        name = _seed_legacy_running()  # no latest_run_id: list_runs resolves
+        gc_handles.set_subscriber(name, "", 0.05)
+        gate = threading.Event()
+        stream = [
+            _sse("assistant", {"text": "still going"}, id="e1"),
+            lambda: (gate.wait(10), None)[1],
+        ]
+        client = _FakeRestClient(
+            streams=[stream], statuses=("RUNNING", "FINISHED"), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+
+        # The supervision record was seeded: live phase, fresh attempt id.
+        sup = gc_handles.supervision_of(gc_handles.get(name))
+        assert sup["phase"] == "streaming"
+        assert sup["current_attempt_id"].startswith("att-")
+        assert sup["attempt_n"] == 1
+        assert sup["last_seq_delivered"] == {}
+        assert _wait_until(lambda: gc_supervisor.has_live(name))
+
+        # Digests flow while the adopted run is live.
+        digests = []
+        assert _wait_until(
+            lambda: any(
+                e.get("cursor_progress_update")
+                for e in (digests.extend(_drain_completion_queue()) or digests)
+            ),
+            timeout=10.0,
+        ), f"no digest delivered; got {digests}"
+
+        gate.set()
+        _wait_settled(name, "completed")
+        trail = [l.get("event") for l in _log_lines(name)
+                 if l.get("kind") == "lifecycle"]
+        assert "supervision.adopted" in trail
+        assert "session.settled" in trail
+        _drain_completion_queue()
+
+    def test_adopts_running_handle_with_legacy_empty_phase_dict(
+        self, clean_state, monkeypatch
+    ):
+        """Same adoption for a handle carrying a legacy supervision dict
+        with an EMPTY phase (supervision: null / {} both read as '')."""
+        name = _seed_legacy_running(
+            name="legacy-empty-phase", run="run-9",
+            supervision={"phase": "", "last_seq_delivered": {}},
+        )
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+        _wait_settled(name, "completed")
+        sup = gc_handles.supervision_of(gc_handles.get(name))
+        assert sup["phase"] == "completed"
+        assert sup["current_attempt_id"].startswith("att-")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+
+    def test_adopted_handle_with_terminal_remote_settles_exactly_once(
+        self, clean_state, monkeypatch
+    ):
+        """An adopted handle whose remote GET is already terminal settles
+        ONCE with the real terminal status (the GET authority — the
+        replayed stream's FINISHED never beats it)."""
+        name = _seed_legacy_running(name="legacy-done", run="run-9")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("CANCELLED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+        _wait_settled(name, "cancelled")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "cancelled"
+
+        # Settled is settled: a second pass adopts/attaches nothing and
+        # delivers nothing (exactly-once completion).
+        assert gc_supervisor.reconcile_once() == []
+        assert _completion_events(_drain_completion_queue()) == []
+        settled = [l for l in _log_lines(name)
+                   if l.get("kind") == "lifecycle"
+                   and l.get("event") == "session.settled"]
+        assert len(settled) == 1
+
+    def test_reconciler_never_adopts_terminal_or_created_handles(
+        self, clean_state, monkeypatch
+    ):
+        """Adoption is for RUNNING handles only: settled records and lazy
+        never-run sessions stay untouched."""
+        gc_handles.record("legacy-finished", repo="/tmp/r", status="completed",
+                          cursor_session_id="bc-f", runtime="local")
+        # Outside the false-settle repair window → not probed either.
+        with gc_handles._lock:
+            gc_handles._table["legacy-finished"]["updated_at"] = (
+                time.time() - 2 * gc_supervisor.FALSE_SETTLE_REPAIR_WINDOW_S
+            )
+        gc_handles.record("lazy-created", repo="/tmp/r", status="created",
+                          runtime="local")
+        _install_supervisor_client(
+            monkeypatch, _FakeRestClient(statuses=("RUNNING",))
+        )
+        assert gc_supervisor.reconcile_once() == []
+        assert gc_handles.get("legacy-finished")["status"] == "completed"
+        assert gc_handles.get("lazy-created")["status"] == "created"
+        assert not gc_handles.supervision_of(
+            gc_handles.get("legacy-finished")
+        )["phase"]
+
+
+class TestSendBounceDoesNotSettle:
+    def test_followup_409_agent_busy_keeps_the_handle_running(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """A follow-up send bounced by 409 agent_busy (= the remote run is
+        ACTIVE) must not settle the session failed: the handle stays
+        running and the caller gets an honest 'still active' message."""
+        name = _seed_legacy_running(
+            name="busy-run", agent="bc-busy", repo=str(tmp_path)
+        )
+        client = _FakeRestClient(followup_error=gc_rest.RestApiError(
+            "cursor api POST /v1/agents/bc-busy/followup -> 409 "
+            "agent_busy: agent has an active run",
+            status_code=409, code="agent_busy",
+        ))
+        _install_fake_rest(monkeypatch, client)
+
+        out = cursor_send_message(name, "one more thing")
+
+        # Honest surface: the run is still active, NOT failed.
+        assert "active" in out
+        assert "NOT failed" in out
+        # The follow-up was attempted on the recorded agent (no silent fork).
+        assert client.followup_calls == [
+            {"agent_id": "bc-busy", "prompt": "one more thing"}
+        ]
+        assert client.create_calls == []
+        # No false settlement anywhere: handle running, supervision
+        # non-terminal, nothing delivered.
+        entry = gc_handles.get(name)
+        assert entry["status"] == "running"
+        assert gc_handles.supervision_of(entry)["phase"] not in (
+            gc_handles.SUPERVISION_TERMINAL_PHASES
+        )
+        assert _completion_events(_drain_completion_queue()) == []
+
+    def test_fresh_session_preflight_failure_still_settles(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """The guard is scoped to already-running handles: a FIRST send
+        whose create bounces still settles the (never-run) session."""
+        client = _FakeRestClient(create_error=gc_rest.RestApiError(
+            "cursor api POST /v1/agents -> 400 invalid_model: bad model",
+            status_code=400, code="invalid_model",
+        ))
+        _install_fake_rest(monkeypatch, client)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        out = cursor_send_message(name, "go")
+        assert "failed" in out
+        assert gc_handles.get(name)["status"] == "failed"
+
+
+class TestFalseSettleRepair:
+    def test_local_failed_remote_running_is_unsettled_and_reattached(
+        self, clean_state, monkeypatch
+    ):
+        """Remote authority wins in BOTH directions: a handle falsely
+        settled failed while the remote run is RUNNING is un-settled
+        (running/streaming), re-attached, and supervised to its real end."""
+        name = "falsely-failed"
+        gc_handles.record(
+            name, repo="/tmp/r", status="failed",
+            status_note="cursor agent create failed (... 409 agent_busy ...)",
+            task="t", session_key="", cursor_session_id="bc-lost",
+            latest_run_id="run-9", runtime="local",
+        )
+        gc_handles.record_supervision(
+            name, phase="failed", current_attempt_id="att-prior", attempt_n=1
+        )
+        gate = threading.Event()
+        stream = [
+            _sse("assistant", {"text": "never stopped"}, id="e1"),
+            lambda: (gate.wait(10), None)[1],
+        ]
+        client = _FakeRestClient(
+            streams=[stream], statuses=("RUNNING", "FINISHED"), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+
+        # Un-settled: running again, live supervision phase, repair event.
+        entry = gc_handles.get(name)
+        assert entry["status"] == "running"
+        assert gc_handles.supervision_of(entry)["phase"] == "streaming"
+        unsettled = [l for l in _log_lines(name)
+                     if l.get("kind") == "lifecycle"
+                     and l.get("event") == "session.unsettled"]
+        assert len(unsettled) == 1
+        assert unsettled[0]["was"] == "failed"
+        assert unsettled[0]["remote_status"] == "RUNNING"
+        assert _wait_until(lambda: gc_supervisor.has_live(name))
+
+        # ...and supervised to its REAL terminal state.
+        gate.set()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "completed"
+
+    def test_terminal_local_with_terminal_remote_stays_settled(
+        self, clean_state, monkeypatch
+    ):
+        """The repair only fires on a live remote: a genuinely-finished
+        run's terminal record is left alone (no un-settle churn)."""
+        gc_handles.record(
+            "really-done", repo="/tmp/r", status="completed", task="t",
+            session_key="", cursor_session_id="bc-done",
+            latest_run_id="run-9", runtime="local",
+        )
+        client = _FakeRestClient(statuses=("FINISHED",), run_id="run-9")
+        _install_supervisor_client(monkeypatch, client)
+        assert gc_supervisor.reconcile_once() == []
+        assert client.get_run_calls == 1  # probed once, left settled
+        assert gc_handles.get("really-done")["status"] == "completed"
         assert _completion_events(_drain_completion_queue()) == []
