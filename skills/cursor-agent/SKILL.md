@@ -11,7 +11,7 @@ metadata:
 
 # Cursor delegation (ghost_cursor plugin)
 
-ALL coding work gets delegated to Cursor agents through the plugin's seven tools. Never edit project files directly — create a session, send the task, steer as needed. Even small quick fixes go through cursor (Jason/Waseem rule).
+ALL coding work gets delegated to Cursor agents through the plugin's seven tools. Never edit project files directly — create a session, send the task, steer as needed. Even small quick fixes go through cursor.
 
 ## Architecture (current, post 2026-07-08)
 
@@ -55,14 +55,14 @@ cursor_send_message(session, follow_up)       → same context
 
 ## Models
 
-- Waseem's coding pref: **fable medium thinking**. On the REST runtime the model string must name a FULL catalog variant: `claude-fable-5[thinking=true,context=300k,effort=medium]`. Bare `-thinking-medium` or partial brackets → `400 invalid_model` (fable variants require thinking+context+effort). Valid combos: `GET /v1/models` (auth w/ CURSOR_API_KEY) → `.items[].variants`.
+- On the REST runtime the model string must name a FULL catalog variant: `claude-fable-5[thinking=true,context=300k,effort=medium]`. Bare `-thinking-medium` or partial brackets → `400 invalid_model` (fable variants require thinking+context+effort). Valid combos: `GET /v1/models` (auth w/ CURSOR_API_KEY) → `.items[].variants`.
 - Model is fixed per session at create. The API supports per-prompt override (`POST /v1/agents/{id}/runs` accepts `model`) but the plugin doesn't plumb it yet — changing model mid-session needs a fresh session.
 - Web research tasks: `model="composer-2.5"`, prompt "WEB RESEARCH only, no code, no file writes, summary as final message text."
 
 ## Digests & reporting to the owner
 
 - Digests land in-thread; the owner reads them. Do NOT narrate digests back. Reply only on milestones (first commit, suite result, plan pivot), stalls, or completion — one line, parenthetical.
-- Default interval 180s — keep it (owner pref). Retune live w/ cursor_subscribe.
+- Default interval 180s. Retune live w/ cursor_subscribe.
 - Digests never fire on runs shorter than the interval — correct behavior, not a bug.
 - "files so far" shows UNCOMMITTED work only — after a commit the list empties. Check `git log` in the worktree before claiming work vanished.
 - **NEVER report a final result off a digest.** Completion claims require the completion delivery PLUS self-verification: `git log --oneline -1 origin/<branch>` (sha exists remotely) + a content grep. Digest replies carry no shas/counts/CI verdicts.
@@ -73,10 +73,10 @@ cursor_send_message(session, follow_up)       → same context
 
 Read the completion notification itself first — `elapsed` + `events since prompt` classify most deaths without extra calls.
 
-- **fast_fail** (<2min, lifecycle-only events, zero progress): transient create/billing class. ONE same-session retry, then a FRESH session with a findings brief. Track the retry count IN the send text ("retry 2/2 — …") — the notification quotes it back, making the chain self-tracking. Two identical instant deaths = wedged, go fresh. Before burning retries on this box: check the macOS keychain is unlocked (`security show-keychain-info login.keychain`) — a locked keychain mimics this exactly.
+- **fast_fail** (<2min, lifecycle-only events, zero progress): transient create/billing class. ONE same-session retry, then a FRESH session with a findings brief. Track the retry count IN the send text ("retry 2/2 — …") — the notification quotes it back, making the chain self-tracking. Two identical instant deaths = wedged, go fresh. On macOS: check the login keychain is unlocked (`security show-keychain-info login.keychain`) before burning retries — a locked keychain mimics this exactly.
 - **mid_flight death** (real diffs/commits exist): same-session "continue exactly where you left off" + pointer to the last banked milestone — but only if resumed promptly (<15min idle). Idle >15min → fresh session (expensive-resume rejection class; huge-transcript sessions wedge permanently).
 - **Worker not routable**: stale/dead worker records — `pgrep -fl 'agent worker'`, clear `~/.hermes/state/ghost_cursor/workers/*.json` for dead pids, resend (fresh worker spawns). Only one worker per checkout receives assignments.
-- **400 "Failed to verify existence of branch"**: cursor's github integration can't see the repo or the branch isn't pushed. Push the branch first; if the repo is missing from `GET /v0/repositories`, the integration lost access — route via a fork the integration CAN see (currently: waseemshahwan/ghost_cursor for arman's repo, PR back upstream).
+- **400 "Failed to verify existence of branch"**: cursor's github integration can't see the repo or the branch isn't pushed. Push the branch first; if the repo is missing from `GET /v0/repositories`, the integration lost access — re-grant the repo in cursor's dashboard github settings, or route via a fork the integration CAN see and PR back upstream.
 - **409 agent_busy on send**: the run is ALIVE — the plugin now surfaces `still_active` and never settles the handle. Interrupt path (a normal send) cancels first.
 - **Bare "status: error"**: true cause is in cursor's store — `for db in $(find ~/.cursor/projects -name index.db); do sqlite3 "$db" "select agent_id,turn_number,status,error_code from runs where status='ERROR' order by started_at desc"; done`. Most common hidden cause per cursor staff: swallowed 429 usage-limit; probe by trying `model auto`.
 - **Fresh-session brief after a death**: KEEP vs LOST split — `git status`/`diff` names what survived ("keep it, it's good"), jsonl tail shows what died in-flight ("redo: <spec>"); sections: repo/branch/HEAD → state → root cause → uncommitted-keep → lost-redo → then steps. Harvest the dead run's conclusions from `kind=content` bursts (join `delta` fields) and long tool_results — mark them "hints not gospel".
@@ -100,14 +100,13 @@ Read the completion notification itself first — `elapsed` + `events since prom
 - Read final messages from the jsonl, not the truncated completion: `jq -rj 'select(.kind=="content") | .delta // empty' <log>.jsonl`.
 - Run the plugin suite the way CI does (copy tree per unit.yml; needs `HERMES_SESSION_*` env ABSENT and a `plugins/__init__.py` in the copied tree). Stash-baseline unexplained failures against clean main before blaming your diff.
 
-## Deploy loop (plugin changes on this box)
+## Installing plugin updates
 
-1. Edit in `~/dev/ghost_cursor` (real repo; origin = waseemshahwan fork, upstream = ashah360). ALWAYS branch + push + PR upstream same session — hot-deploy without a PR is not ok.
-2. Suite green locally (CI-mirror invocation), then sync: `rsync -a --delete --exclude __pycache__ --exclude tests --exclude fixtures --exclude 'test_*' --exclude conftest.py --exclude .git --exclude .github --exclude 'Dockerfile*' --exclude .pytest_cache ~/dev/ghost_cursor/ ~/.hermes/plugins/ghost_cursor/` + py_compile every module with the venv python.
-3. Gateway restart via the launchd trick (hermes-gateway-ops skill). ORDER MATTERS: sync → verify the new code is in the install dir (grep a new symbol) → restart. A restart before sync is wasted; supervision survives restarts now, but the restart still interrupts in-flight hermes turns.
-4. GitHub writes via `gh` CLI with `--body-file` (norra MCP stringifies POST bodies → 422).
+1. Work in a real clone of the plugin repo; branch + push + PR upstream — never leave a hot-deployed install drifted from the repo.
+2. Suite green locally (CI-mirror invocation), then sync sources into the live install: `rsync -a --delete --exclude __pycache__ --exclude tests --exclude fixtures --exclude 'test_*' --exclude conftest.py --exclude .git --exclude .github --exclude 'Dockerfile*' --exclude .pytest_cache <clone>/ ~/.hermes/plugins/ghost_cursor/` + py_compile every module with the hermes venv python.
+3. Restart the hermes gateway. ORDER MATTERS: sync → verify the new code is in the install dir (grep a new symbol) → restart. A restart before sync is wasted; supervision survives restarts, but the restart still interrupts in-flight hermes turns.
 
-## CI / e2e quirks (ashah360/ghost_cursor)
+## CI / e2e quirks (upstream repo)
 
 - `unit` = only blocking gate (push-to-main + PRs). `e2e-*` are workflow_dispatch ONLY (each run creates real cloud agents on the account). A pushed branch with no PR gets zero runs.
 - Fork PRs never get repo secrets. `gh secret set` works with push access.
