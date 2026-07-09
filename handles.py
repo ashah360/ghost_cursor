@@ -325,6 +325,35 @@ def record_supervision(session_id: Optional[str], **fields: Any) -> None:
         logger.debug("ghost_cursor supervision record failed", exc_info=True)
 
 
+def transition_supervision(session_id: Optional[str], to_phase: str) -> bool:
+    """Atomically move the supervision phase from a LIVE phase to
+    ``to_phase``. Returns True only for the writer that actually
+    transitioned — the settle gate that makes completion fan-out
+    exactly-once (RFC §3: single-writer settlement). A phase that is
+    already terminal (or empty — never supervised) refuses the
+    transition. Never raises (a failure reads as "did not transition").
+    """
+    try:
+        if not session_id:
+            return False
+        with _lock:
+            _load_locked()
+            name = _resolve_locked(str(session_id).strip()) or str(session_id)
+            entry = _table.setdefault(name, {})
+            current = entry.get("supervision")
+            sup = dict(current) if isinstance(current, dict) else {}
+            if str(sup.get("phase") or "") not in SUPERVISION_LIVE_PHASES:
+                return False
+            sup["phase"] = str(to_phase)
+            entry["supervision"] = sup
+            entry["updated_at"] = time.time()
+            _save_locked()
+            return True
+    except Exception:
+        logger.debug("ghost_cursor supervision transition failed", exc_info=True)
+        return False
+
+
 def advance_delivery_cursor(
     session_id: Optional[str], subscriber_key: str, seq: int
 ) -> None:

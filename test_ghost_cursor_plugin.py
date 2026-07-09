@@ -89,6 +89,7 @@ from plugins.ghost_cursor import names as gc_names
 from plugins.ghost_cursor import progress as gc_progress
 from plugins.ghost_cursor import render as gc_render
 from plugins.ghost_cursor import runner as gc_runner
+from plugins.ghost_cursor import supervisor as gc_supervisor
 
 FIXTURE = Path(__file__).parent / "fixtures" / "cursor_stream.jsonl"
 SDK_FIXTURE = Path(__file__).parent / "fixtures" / "sdk_stream.jsonl"
@@ -184,6 +185,7 @@ def clean_state(monkeypatch):
         lambda path: ("https://github.com/example/repo", "main"),
     )
     monkeypatch.setattr(gc_progress, "MIN_UPDATE_INTERVAL_S", 0.0)
+    gc_supervisor._reset_for_tests()
     gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
@@ -191,6 +193,7 @@ def clean_state(monkeypatch):
     monkeypatch.setattr(gc_handles, "_loaded", False)
     gc_eventlog._reset_for_tests()
     yield gc_jobs.registry
+    gc_supervisor._reset_for_tests()
     gc_progress._reset_for_tests()
     gc_jobs.registry._reset_for_tests()
     _drain_completion_queue()
@@ -3045,6 +3048,7 @@ class TestZeroProgressAutoRetry:
                                    retry_after="0"),
             _terminal_error_replay(sid="agent-ex"),
             _terminal_error_replay(sid="agent-ex"),
+            _terminal_error_replay(sid="agent-ex"),
         )
         monkeypatch.setattr(gc_cloud, "run_cloud", seq)
 
@@ -3053,11 +3057,11 @@ class TestZeroProgressAutoRetry:
         release.set()
         assert job.done_event.wait(10)
 
-        assert len(seq.calls) == 3  # the send + both retries
+        assert len(seq.calls) == 4  # the send + all three retries (RFC §5 cap)
         assert job.status == "failed"
         trail = [e for n, e in _lifecycle_trail(job.session_name)
                  if n == "cloud.autoretry"]
-        assert [e["attempt"] for e in trail] == [1, 2]
+        assert [e["attempt"] for e in trail] == [1, 2, 3]
         completions = _completion_events(_drain_completion_queue())
         assert len(completions) == 1
         evt = completions[0]
@@ -3645,9 +3649,11 @@ class TestEventLogIntegration:
         """The log is keyed by the session NAME — one named session, one log."""
         job = self._run_to_completion(monkeypatch, tmp_path)
         lines = _log_lines(job.session_name)
-        # Every folded envelope landed, in order, seq from 0.
+        # Every folded envelope landed, in order, seq from 0 — plus the
+        # supervisor's log-only session.settled event appended at finalize.
         assert [l["seq"] for l in lines] == list(range(len(lines)))
-        assert len(lines) == job.progress_events
+        assert len(lines) == job.progress_events + 1
+        assert lines[-1]["event"] == "session.settled"
         kinds = [l["kind"] for l in lines]
         assert "lifecycle" in kinds and "tool_result" in kinds
         # FULL fidelity: file_diff lines keep before/after content that the
@@ -3661,13 +3667,15 @@ class TestEventLogIntegration:
         job = self._run_to_completion(monkeypatch, tmp_path)
         status = cursor_status("s-spill")
         path = str(gc_eventlog.log_path(job.session_name))
-        assert f"events: {job.progress_events} total · log: {path}" in status
+        # +1: the supervisor's session.settled event is log-only (never
+        # buffered), so the log total leads progress_events by one.
+        assert f"events: {job.progress_events + 1} total · log: {path}" in status
 
     def test_cursor_events_pages_the_persisted_log_forward(
         self, clean_state, monkeypatch, tmp_path
     ):
         job = self._run_to_completion(monkeypatch, tmp_path)
-        total = job.progress_events
+        total = job.progress_events + 1  # + the settled event (log-only)
 
         first = cursor_events("s-spill", offset=0, limit=2)
         assert f"events 0–1 of {total}" in first
