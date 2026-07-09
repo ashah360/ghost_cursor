@@ -426,7 +426,7 @@ class SessionSupervisor:
         )
         pump.start()
 
-        last_status_check = 0.0
+        last_status_check = time.monotonic()
         pump_exited = False
         try:
             while not self.settled.is_set():

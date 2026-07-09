@@ -4565,6 +4565,9 @@ class _FakeRestClient:
 
     # -- runs --------------------------------------------------------------
 
+    def list_runs(self, agent_id, limit=20):
+        return {"runs": [{"id": self.run_id}]}
+
     def get_run(self, agent_id, run_id):
         self.get_run_calls += 1
         idx = min(self.get_run_calls - 1, len(self.statuses) - 1)
@@ -5613,3 +5616,543 @@ class TestSdkNormalizer:
         envs = self._norm().normalize("cloud.wat", {"x": 1})
         assert envs[0]["event"] == "passthrough"
         assert envs[0]["name"] == "cloud.wat"
+
+
+# ---------------------------------------------------------------------------
+# Session supervisor — durable supervision record (RFC §1)
+# ---------------------------------------------------------------------------
+
+class TestSupervisionRecord:
+    def test_legacy_entry_reads_as_unsupervised(self, clean_state):
+        gc_handles.record("s-legacy", repo="/r", status="running")
+        entry = gc_handles.get("s-legacy")
+        sup = gc_handles.supervision_of(entry)
+        assert sup["phase"] == ""
+        assert sup["current_attempt_id"] == ""
+        assert sup["last_seq_delivered"] == {}
+        assert not gc_handles.supervision_is_live(entry)
+
+    def test_record_supervision_merges_and_persists(self, clean_state):
+        gc_handles.record("s-sup", repo="/r", status="running")
+        gc_handles.record_supervision(
+            "s-sup", phase="streaming", current_attempt_id="att-1", attempt_n=1
+        )
+        gc_handles.record_supervision("s-sup", phase="retrying", attempt_n=2)
+        sup = gc_handles.supervision_of(gc_handles.get("s-sup"))
+        assert sup["phase"] == "retrying"
+        assert sup["current_attempt_id"] == "att-1"  # untouched by the merge
+        assert sup["attempt_n"] == 2
+        assert gc_handles.supervision_is_live(gc_handles.get("s-sup"))
+        # The handle's own fields are untouched.
+        assert gc_handles.get("s-sup")["repo"] == "/r"
+
+    def test_delivery_cursor_is_advance_only_per_subscriber(self, clean_state):
+        gc_handles.record("s-cur", repo="/r", status="running")
+        gc_handles.advance_delivery_cursor("s-cur", "alice", 5)
+        gc_handles.advance_delivery_cursor("s-cur", "alice", 3)  # stale writer
+        gc_handles.advance_delivery_cursor("s-cur", "bob", 2)
+        sup = gc_handles.supervision_of(gc_handles.get("s-cur"))
+        assert sup["last_seq_delivered"] == {"alice": 5, "bob": 2}
+
+    def test_cursor_is_not_writable_through_record_supervision(self, clean_state):
+        gc_handles.record("s-cur2", repo="/r", status="running")
+        gc_handles.advance_delivery_cursor("s-cur2", "alice", 5)
+        gc_handles.record_supervision(
+            "s-cur2", phase="streaming", last_seq_delivered={"alice": 0}
+        )
+        sup = gc_handles.supervision_of(gc_handles.get("s-cur2"))
+        assert sup["last_seq_delivered"] == {"alice": 5}
+
+    def test_transition_is_the_exactly_once_settle_gate(self, clean_state):
+        gc_handles.record("s-gate", repo="/r", status="running")
+        gc_handles.record_supervision("s-gate", phase="streaming")
+        assert gc_handles.transition_supervision("s-gate", "completed") is True
+        # Second writer loses: the phase is already terminal.
+        assert gc_handles.transition_supervision("s-gate", "failed") is False
+        assert (
+            gc_handles.supervision_of(gc_handles.get("s-gate"))["phase"]
+            == "completed"
+        )
+
+    def test_never_supervised_entry_refuses_the_transition(self, clean_state):
+        gc_handles.record("s-none", repo="/r", status="running")
+        assert gc_handles.transition_supervision("s-none", "failed") is False
+
+
+# ---------------------------------------------------------------------------
+# Session supervisor — in-process dispatch lifecycle (attempt identity,
+# derived events, retry policy per RFC §4/§5)
+# ---------------------------------------------------------------------------
+
+class TestSupervisedDispatch:
+    def _fast_retries(self, monkeypatch):
+        monkeypatch.setattr(gc, "_AUTO_RETRY_BACKOFF_S", (0.0, 0.0, 0.0))
+
+    def test_every_spilled_event_carries_the_attempt_id(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        release.set()
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="a-att")
+        )
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-att")
+        assert job.done_event.wait(10)
+
+        lines = _log_lines(job.session_name)
+        assert lines, "the run must have spilled events"
+        attempt_ids = {l.get("attemptId") for l in lines}
+        assert attempt_ids == {job.current_attempt_id}
+        assert job.current_attempt_id.startswith("att-")
+        # The durable record carries the same attempt identity.
+        sup = gc_handles.supervision_of(gc_handles.get(job.session_name))
+        assert sup["current_attempt_id"] == job.current_attempt_id
+        assert sup["attempt_n"] == 1
+
+    def test_dispatch_marks_streaming_and_finalize_settles_the_phase(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="a-ph")
+        )
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-ph")
+        assert _wait_until(
+            lambda: gc_handles.supervision_of(
+                gc_handles.get(job.session_name)
+            )["phase"] == "streaming"
+        )
+        release.set()
+        assert job.done_event.wait(10)
+        sup = gc_handles.supervision_of(gc_handles.get(job.session_name))
+        assert sup["phase"] == "completed"
+        # The supervisor-derived settled event, stamped, no death shape on
+        # a completed run.
+        settled = [e for n, e in _lifecycle_trail(job.session_name)
+                   if n == "session.settled"]
+        assert len(settled) == 1
+        assert settled[0]["status"] == "completed"
+        assert settled[0]["attemptId"] == job.current_attempt_id
+        assert "death_shape" not in settled[0]
+
+    def test_durable_progress_is_derived_once_per_attempt(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        release.set()
+        # Two completed edits in one attempt — one derived marker only.
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud",
+            _gated_replay_factory(release, sid="a-dur",
+                                  early_edit=True, late_edit=True),
+        )
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-dur")
+        assert job.done_event.wait(10)
+        durable = [e for n, e in _lifecycle_trail(job.session_name)
+                   if n == "durable_progress"]
+        assert len(durable) == 1
+        assert durable[0]["evidence"] in ("tool_result", "file_diff")
+        assert durable[0]["attemptId"] == job.current_attempt_id
+
+    def test_retry_mints_a_new_attempt_and_emits_retry_started(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        self._fast_retries(monkeypatch)
+        release = threading.Event()
+        release.set()
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="a-rt"),
+            _gated_replay_factory(release, sid="a-rt"),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-rt")
+        assert job.done_event.wait(10)
+
+        trail = _lifecycle_trail(job.session_name)
+        first_attempt = next(
+            e["attemptId"] for n, e in trail if n == "run.started"
+        )
+        started = [e for n, e in trail if n == "retry_started"]
+        assert len(started) == 1
+        assert started[0]["attempt_n"] == 2
+        # The retry event carries the NEW attemptId (RFC §5).
+        assert started[0]["attemptId"] != first_attempt
+        assert started[0]["attemptId"] == job.current_attempt_id
+        # The legacy alias stays during migration, same attempt identity.
+        alias = [e for n, e in trail if n == "cloud.autoretry"]
+        assert len(alias) == 1
+        assert alias[0]["attemptId"] == started[0]["attemptId"]
+        # The second run's events are stamped with the new attempt.
+        second_started = [e for n, e in trail if n == "run.started"][1]
+        assert second_started["attemptId"] == job.current_attempt_id
+        sup = gc_handles.supervision_of(gc_handles.get(job.session_name))
+        assert sup["attempt_n"] == 2
+        assert sup["phase"] == "completed"
+
+    def test_durable_progress_suppresses_the_retry_with_a_marker(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        self._fast_retries(monkeypatch)
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="a-sup", meaningful=True),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-sup")
+        assert job.done_event.wait(10)
+
+        assert len(seq.calls) == 1  # never re-prompted
+        trail = _lifecycle_trail(job.session_name)
+        assert not [n for n, _ in trail if n == "retry_started"]
+        suppressed = [e for n, e in trail if n == "retry_suppressed"]
+        assert len(suppressed) == 1
+        assert "double-applying" in suppressed[0]["reason"]
+
+    def test_death_shape_fast_fail_vs_mid_flight(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        self._fast_retries(monkeypatch)
+        # Zero-progress lifecycle-only failure (non-retryable so it
+        # settles on the first attempt) → fast_fail.
+        seq = _SdkSequence(
+            _terminal_error_replay(sid="a-ff", retryable=False),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-ff")
+        assert job.done_event.wait(10)
+        settled = [e for n, e in _lifecycle_trail(job.session_name)
+                   if n == "session.settled"]
+        assert settled[0]["death_shape"] == "fast_fail"
+
+        # A failure after real streamed events → mid_flight.
+        gc_jobs.registry._reset_for_tests()
+        seq2 = _SdkSequence(
+            _terminal_error_replay(sid="a-mf", meaningful=True),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq2)
+        _start_run("t", repo=str(tmp_path))
+        job2 = _job_for("a-mf")
+        assert job2.done_event.wait(10)
+        settled2 = [e for n, e in _lifecycle_trail(job2.session_name)
+                    if n == "session.settled"]
+        assert settled2[0]["death_shape"] == "mid_flight"
+
+    def test_interrupt_reprompt_leaves_the_supervisor_event_trace(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release1, release2 = threading.Event(), threading.Event()
+        release2.set()
+        seq = _SdkSequence(
+            _gated_replay_factory(release1, sid="a-int"),
+            _gated_replay_factory(release2, sid="a-int", early_edit=False),
+        )
+        monkeypatch.setattr(gc_cloud, "run_cloud", seq)
+        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        _assert_running_ack(cursor_send_message(name, "first"))
+        ack = cursor_send_message(name, "steer")  # interrupts the live run
+        assert "interrupted" in ack
+        job = _job_for("a-int")
+        assert job.done_event.wait(10)
+        names = [n for n, _ in _lifecycle_trail(name)]
+        assert "interrupt_requested" in names
+        assert "interrupted" in names
+        # Ordering: requested strictly before the interrupted ack.
+        assert names.index("interrupt_requested") < names.index("interrupted")
+
+
+# ---------------------------------------------------------------------------
+# Session supervisor — reconciler + re-attach (RFC §1/§2/§3/§6)
+# ---------------------------------------------------------------------------
+
+def _seed_reattachable(name="lost-run", repo="/tmp/r", agent="bc-lost",
+                       run="run-9", session_key=""):
+    """A handle left behind by a dead process: status running, supervision
+    phase streaming, remote agent + run ids recorded."""
+    gc_handles.record(
+        name, repo=repo, status="running", task="finish the thing",
+        session_key=session_key, cursor_session_id=agent, runtime="local",
+        latest_run_id=run, model="m",
+    )
+    gc_handles.record_supervision(
+        name, phase="streaming", current_attempt_id="att-prior", attempt_n=1
+    )
+    return name
+
+
+def _install_supervisor_client(monkeypatch, client):
+    monkeypatch.setattr(gc_cloud, "make_client", lambda: client)
+
+
+def _wait_settled(name, status, timeout=10.0):
+    assert _wait_until(
+        lambda: (gc_handles.get(name) or {}).get("status") == status,
+        timeout=timeout,
+    ), (
+        f"session {name!r} did not settle to {status!r}; "
+        f"entry={gc_handles.get(name)}"
+    )
+
+
+class TestSupervisorReattach:
+    def test_reconciler_reattaches_ingests_and_settles_from_the_get(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable()
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+        _wait_settled(name, "completed")
+
+        # Settlement came from the GET authority, not the replay.
+        assert client.get_run_calls >= 1
+        sup = gc_handles.supervision_of(gc_handles.get(name))
+        assert sup["phase"] == "completed"
+
+        # Ingested events landed in the jsonl with the attempt identity.
+        lines = _log_lines(name)
+        kinds = [l["kind"] for l in lines]
+        assert "content" in kinds and "tool_result" in kinds
+        assert all(l.get("attemptId") == "att-prior" for l in lines)
+        trail = [l.get("event") for l in lines if l["kind"] == "lifecycle"]
+        assert "supervisor.reattached" in trail
+        assert "durable_progress" in trail  # derived from the completed tool
+        assert "session.settled" in trail
+
+        # Exactly one completion, delivered to the dispatching session.
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        evt = completions[0]
+        assert evt["status"] == "completed"
+        assert evt["session_key"] == ""
+        assert evt["delegation_id"] == name
+        assert "all done" in evt["summary"]
+
+    def test_replayed_finished_never_beats_the_gets_cancelled(
+        self, clean_state, monkeypatch
+    ):
+        """Terminal precedence (RFC §2): the replay of a cancelled run says
+        FINISHED; the GET says CANCELLED; the GET wins."""
+        name = _seed_reattachable(name="lost-cancelled")
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("CANCELLED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "cancelled")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "cancelled"
+
+    def test_replayed_twins_are_deduped_by_provider_event_id(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-dupes")
+        stream = [
+            _sse("assistant", {"text": "once"}, id="e1"),
+            _sse("assistant", {"text": "once"}, id="e1"),  # replayed twin
+            _sse("assistant", {"text": "twice"}, id="e2"),
+        ]
+        client = _FakeRestClient(
+            streams=[stream], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        content = [l for l in _log_lines(name) if l["kind"] == "content"]
+        assert [c["delta"] for c in content] == ["once", "twice"]
+
+    def test_completion_fans_out_exactly_once_per_subscriber(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-fanout")
+        gc_handles.set_subscriber(name, "alice", 300.0)
+        client = _FakeRestClient(
+            streams=[_happy_stream()], statuses=("FINISHED",), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+        _wait_settled(name, "completed")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 2
+        by_key = {e["session_key"]: e for e in completions}
+        assert set(by_key) == {"", "alice"}
+        assert by_key[""]["delegation_id"] == name
+        assert by_key["alice"]["delegation_id"] != name  # suffixed copy
+
+        # A second reconcile pass finds nothing live: settled is settled.
+        assert gc_supervisor.reconcile_once() == []
+        assert _completion_events(_drain_completion_queue()) == []
+
+    def test_orphaned_handle_without_remote_agent_settles_failed(
+        self, clean_state, monkeypatch
+    ):
+        gc_handles.record("lost-orphan", repo="/tmp/r", status="running",
+                          session_key="", runtime="local")
+        gc_handles.record_supervision("lost-orphan", phase="streaming")
+        _install_supervisor_client(
+            monkeypatch, _FakeRestClient(statuses=("FINISHED",))
+        )
+        gc_supervisor.reconcile_once()
+        _wait_settled("lost-orphan", "failed")
+        entry = gc_handles.get("lost-orphan")
+        assert "orphaned" in str(entry.get("status_note") or "")
+        completions = _completion_events(_drain_completion_queue())
+        assert len(completions) == 1
+        assert completions[0]["status"] == "failed"
+
+    def test_reconciler_skips_sessions_with_a_live_in_process_job(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        release = threading.Event()
+        monkeypatch.setattr(
+            gc_cloud, "run_cloud", _gated_replay_factory(release, sid="a-live")
+        )
+        _start_run("t", repo=str(tmp_path))
+        job = _job_for("a-live")
+        # The handle is in a live supervision phase, but the running job
+        # IS its supervision — no re-attach task may be spawned.
+        assert gc_handles.supervision_is_live(gc_handles.get(job.session_name))
+        assert gc_supervisor.reconcile_once() == []
+        assert not gc_supervisor.has_live(job.session_name)
+        release.set()
+        assert job.done_event.wait(10)
+
+    def test_legacy_running_handles_stay_on_the_orphan_backstop(
+        self, clean_state, monkeypatch
+    ):
+        """Pre-supervisor records (no supervision phase) keep the read-time
+        reconciliation exactly as before (RFC §6 backstop)."""
+        gc_handles.record("s-old", repo="/tmp/r", status="running")
+        assert gc_supervisor.reconcile_once() == []
+        out = cursor_status("s-old")
+        entry = gc_handles.get("s-old")
+        assert entry["status"] == "failed"
+        assert "orphaned" in entry["status_note"]
+        assert "orphaned" in out
+
+    def test_supervised_running_handle_is_not_declared_dead_at_read_time(
+        self, clean_state, monkeypatch
+    ):
+        """A live-phase handle read before the supervisor settles it stays
+        running — the read re-attaches instead of flipping to failed."""
+        name = _seed_reattachable(name="lost-read")
+        gate = threading.Event()
+        stream = [
+            _sse("assistant", {"text": "still going"}, id="e1"),
+            lambda: (gate.wait(10), None)[1],
+        ]
+        client = _FakeRestClient(
+            streams=[stream], statuses=("RUNNING", "FINISHED"), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+
+        out = cursor_status(name)
+        assert "orphaned" not in out
+        assert (gc_handles.get(name) or {}).get("status") == "running"
+        assert _wait_until(lambda: gc_supervisor.has_live(name))
+        gate.set()
+        _wait_settled(name, "completed")
+        _drain_completion_queue()
+
+    def test_digests_resume_from_the_persisted_cursor(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-digest")
+        gc_handles.set_subscriber(name, "", 0.05)
+        # Pre-crash history: 3 events already in the log, 2 delivered.
+        for i in range(3):
+            gc_eventlog.append(name, {"kind": "content", "delta": f"pre{i}"})
+        gc_handles.advance_delivery_cursor(name, "", 2)
+
+        gate = threading.Event()
+        stream = [
+            _sse("assistant", {"text": "fresh"}, id="e1"),
+            lambda: (gate.wait(10), None)[1],
+        ]
+        client = _FakeRestClient(
+            streams=[stream], statuses=("RUNNING", "FINISHED"), run_id="run-9"
+        )
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+
+        # A digest arrives while the run is still live, covering
+        # everything after the persisted cursor.
+        digests = []
+        assert _wait_until(
+            lambda: any(
+                e.get("cursor_progress_update")
+                for e in (digests.extend(_drain_completion_queue()) or digests)
+            ),
+            timeout=10.0,
+        ), f"no digest delivered; got {digests}"
+        digest = next(e for e in digests if e.get("cursor_progress_update"))
+        assert digest["status"] == "running"
+        assert "progress update 1" in digest["summary"]
+
+        # The cursor advanced to the log total at delivery time (the write
+        # lands just after the enqueue — poll for it) — a later re-attach
+        # would resume from here, not from zero.
+        assert _wait_until(
+            lambda: gc_handles.supervision_of(
+                gc_handles.get(name)
+            )["last_seq_delivered"].get("", 0) > 2
+        )
+        total = gc_eventlog.stats(name)["total_events"]
+        assert gc_handles.supervision_of(
+            gc_handles.get(name)
+        )["last_seq_delivered"][""] <= total
+
+        gate.set()
+        _wait_settled(name, "completed")
+        _drain_completion_queue()
+
+    def test_cursor_stop_requests_the_transition_and_the_supervisor_settles(
+        self, clean_state, monkeypatch
+    ):
+        name = _seed_reattachable(name="lost-stop")
+        client = _FakeRestClient(streams=[[
+            _sse("assistant", {"text": "grinding"}, id="e1"),
+        ]], statuses=("CANCELLED",), run_id="run-9")
+        # Keep the stream open until the fake observes the cancel.
+        client.streams[0].append(lambda: (client.cancelled.wait(10), None)[1])
+        _install_supervisor_client(monkeypatch, client)
+        gc_supervisor.reconcile_once()
+        assert _wait_until(lambda: gc_supervisor.has_live(name))
+
+        out = cursor_stop(name)
+        assert "cancelled" in out
+        assert client.cancel_calls == [("bc-lost", "run-9")]
+        assert (gc_handles.get(name) or {}).get("status") == "cancelled"
+        trail = [l.get("event") for l in _log_lines(name)
+                 if l.get("kind") == "lifecycle"]
+        assert "interrupt_requested" in trail
+        assert "interrupted" in trail
+        _drain_completion_queue()
+
+    def test_crashed_supervisor_leaves_the_phase_live_for_the_next_pass(
+        self, clean_state, monkeypatch
+    ):
+        """An attach that cannot even build a client must NOT settle the
+        session — supervision stays live and the next pass retries."""
+        name = _seed_reattachable(name="lost-nokey")
+
+        def _boom():
+            raise gc_cloud.CloudRunnerError("CURSOR_API_KEY is not set")
+
+        monkeypatch.setattr(gc_cloud, "make_client", _boom)
+        attached = gc_supervisor.reconcile_once()
+        assert attached == [name]
+        assert _wait_until(lambda: not gc_supervisor.has_live(name))
+        assert (gc_handles.get(name) or {}).get("status") == "running"
+        assert gc_handles.supervision_is_live(gc_handles.get(name))
+        assert _completion_events(_drain_completion_queue()) == []
