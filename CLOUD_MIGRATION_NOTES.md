@@ -253,3 +253,56 @@ Probe script: `/tmp/gc-probe/rest_probe.py`, full log `rest_probe.log`.
   listing valid ids.
 - Repo echo comes back scheme-less; keep `repo_url` in handles as the
   canonical `https://github.com/...` form and normalize on compare.
+
+## Session supervisor (docs/rfcs/session-supervisor.md) — landed on feat/session-supervisor
+
+What landed (RFC section → code):
+
+- §1 durable supervision state + reconciler: `handles.py` grows the
+  per-session `supervision` record (`phase`, `current_attempt_id`,
+  `attempt_n`, `last_seq_delivered`, `watchdog`); `supervisor.py` owns
+  the reconciler (one pass at `register()`, then every 60s) and the
+  re-attach loop — a handle left in a live phase by a dead process gets
+  a `SessionSupervisor` that resumes the SSE stream, ingests to the same
+  jsonl, resumes digests, and delivers the completion. For runs
+  dispatched IN this process, the job worker thread is the supervision
+  executor (the reconciler skips sessions with a running job).
+- §2 push with poll fallback + terminal precedence: the re-attach loop
+  streams with `Last-Event-ID` resume, degrades to `GET runs/{id}`
+  polling when the stream is unreconnectable, and settles ONLY from the
+  GET authority — never from replayed stream status (the cancelled-run
+  replay lies, see `run_c_postcancel.sse`).
+- §3 single-writer settlement: `handles.transition_supervision` is the
+  atomic live→terminal gate; completion fan-out happens exactly once
+  behind it. `cursor_stop`/interrupt-send on a re-attached session
+  REQUEST the transition (`supervisor.request_stop`/`stop_and_wait`)
+  and the supervisor applies it; the interrupt path leaves the
+  `interrupt_requested`/`interrupted` lifecycle trace (shared-schema
+  alignment with twin's runtime).
+- §4 ingest boundary: provider-event-id dedupe before seq assignment
+  (seq = the jsonl append), `attemptId` stamped on every event (both
+  in-process via `CursorJob.append_progress` and re-attached), and
+  `lifecycle.durable_progress` derived controller-side (file_diff /
+  completed tool_result — conservative: any completed tool may have had
+  side effects).
+- §5 retry policy: cap 3 (`supervisor.MAX_AUTO_RETRIES`),
+  `lifecycle.retry_started` with the NEW attemptId (`cloud.autoretry`
+  kept as the migration alias for log tooling),
+  `lifecycle.retry_suppressed` when durable progress blocks the
+  reprompt, and `fast_fail`/`mid_flight` death-shape tagging on the
+  supervisor's `session.settled` event. Re-attached supervisors never
+  auto-reprompt (the full prompt text is not durably recorded).
+- §6 orphans: read-time reconciliation stays as the backstop for
+  PRE-supervisor records only; a live-phase handle read with no job
+  re-attaches a supervisor instead of being declared dead.
+
+Still open (follow-ups, per the RFC's migration plan):
+
+- In-process digest ticks still run on `progress.py` timer chains; they
+  now advance the durable `last_seq_delivered` cursor after each
+  enqueue, but folding them fully into the supervisor loop (and then
+  deleting the legacy ticker chain) is the remaining step-3 work.
+- The kill -9 e2e regression (restart → digests resume → completion
+  delivers exactly once) belongs to the on-demand e2e suite; the unit
+  suite covers the same invariants against the fake REST client
+  (`TestSupervisorReattach`).

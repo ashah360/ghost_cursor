@@ -1,6 +1,8 @@
 # RFC: task-backed session supervisor (cloud runtime)
 
-status: draft · branch: feat/cloud-machine-runtime · 2026-07-08
+status: implemented (steps 1–2; see CLOUD_MIGRATION_NOTES.md §session
+supervisor for the section-by-section mapping and remaining step-3
+work) · branch: feat/session-supervisor · 2026-07-08
 
 pairs with the shared session-event schema agreed with the twin team
 (schematic T-055; twin's counterpart RFC: slashfi/slash#17194
