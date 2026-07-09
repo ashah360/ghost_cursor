@@ -472,9 +472,14 @@ class CursorJobRegistry:
             runtime=runtime or "local",
         )
         with self._lock:
-            existing = self._find_active_for_repo_locked(repo)
-            if existing is not None:
-                return None, existing
+            # Same-repo concurrency guard applies to LOCAL runs only: two
+            # cursor agents on one local working tree corrupt it. Cloud runs
+            # each get their own ephemeral VM clone, so same-repo parallelism
+            # is safe and intended there.
+            if (runtime or "local") != "cloud":
+                existing = self._find_active_for_repo_locked(repo)
+                if existing is not None:
+                    return None, existing
             self._jobs[job.job_id] = job
             self._prune_locked()
 
