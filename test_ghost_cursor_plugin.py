@@ -2,7 +2,7 @@
 
 Six tools: ``cursor_create_session`` / ``cursor_send_message`` /
 ``cursor_status`` / ``cursor_stop`` / ``cursor_events`` / ``cursor_list`` —
-all keyed on adjective-adjective-noun session names (cursor agent ids
+all keyed on caller-provided meaningful session titles (cursor agent ids
 resolve as aliases). Every tool returns plain text (labeled headers, prose,
 raw fenced diffs, TSV) — never JSON. Covered here:
 
@@ -18,8 +18,9 @@ raw fenced diffs, TSV) — never JSON. Covered here:
   (``fixtures/sdk_stream.jsonl``).
 * The tool handlers — session lifecycle (create → lazy first send → status
   → stop/follow-up), the read-only guarantee of ``cursor_status``, the
-  same-repo concurrency guard, name minting + collision retry + agent-id
-  alias resolution, ``cursor_events`` paging (tail defaults, negative
+  same-repo concurrency guard, title handles (duplicate-title rejection,
+  over-long-title rejection, deterministic repo-basename fallback) +
+  agent-id alias resolution, ``cursor_events`` paging (tail defaults, negative
   offsets, kind filter, 2KB inline clip, 20KB response cap), ``cursor_list``
   TSV + scoping, model threading, completion delivery on the shared
   async-delegation rail, rejection of legacy bridge-era handles, and
@@ -36,7 +37,6 @@ No live cursor runs.
 from __future__ import annotations
 
 import json
-import random
 import threading
 import time
 from pathlib import Path
@@ -85,7 +85,6 @@ from plugins.ghost_cursor import handles as gc_handles
 from plugins.ghost_cursor import rest_client as gc_rest
 from plugins.ghost_cursor import workers as gc_workers
 from plugins.ghost_cursor import jobs as gc_jobs
-from plugins.ghost_cursor import names as gc_names
 from plugins.ghost_cursor import progress as gc_progress
 from plugins.ghost_cursor import render as gc_render
 from plugins.ghost_cursor import runner as gc_runner
@@ -3275,6 +3274,16 @@ class TestRegistration:
         assert "dispatches nothing" in desc
         assert "lazily" in desc
 
+    def test_create_schema_title_asks_for_a_meaningful_phrase(self):
+        prop = CURSOR_CREATE_SCHEMA["parameters"]["properties"]["title"]
+        desc = prop["description"]
+        assert "WITH SPACES" in desc
+        assert "3-8 words" in desc
+        assert "Fix payment webhook retries" in desc  # a concrete example
+        assert str(gc.MAX_TITLE_CHARS) in desc
+        # Optional: create must keep working without a title (fallback).
+        assert "title" not in CURSOR_CREATE_SCHEMA["parameters"]["required"]
+
     def test_events_schema_documents_paging_semantics(self):
         desc = CURSOR_EVENTS_SCHEMA["description"]
         assert "LAST 10" in desc
@@ -3887,88 +3896,186 @@ class TestHandlePrune:
         assert "s-run-final" in gc_handles._table
         assert "s-run-0" not in gc_handles._table
 
+    def test_pruned_handle_deletes_its_event_log(self, clean_handles):
+        """A pruned entry takes its JSONL log with it — without this every
+        pruned handle leaks one file under state/ghost_cursor/logs/."""
+        gc_handles.record("Old finished task", status="completed")
+        gc_eventlog.append("Old finished task", {"kind": "content", "delta": "x"})
+        log = gc_eventlog.log_path("Old finished task")
+        assert log is not None and log.is_file()
+
+        gc_handles._table["Old finished task"]["updated_at"] = (
+            time.time() - gc_handles.PRUNE_TERMINAL_AFTER_S - 60
+        )
+        gc_handles.record("Fresh task", status="running")  # write → prune
+        assert gc_handles.get("Old finished task") is None
+        assert not log.exists()
+
+    def test_cap_eviction_deletes_the_evicted_log(
+        self, clean_handles, monkeypatch
+    ):
+        monkeypatch.setattr(gc_handles, "MAX_ENTRIES", 2)
+        now = time.time()
+        gc_handles.record("Oldest done", status="completed")
+        gc_handles._table["Oldest done"]["updated_at"] = now - 300
+        gc_eventlog.append("Oldest done", {"kind": "content", "delta": "x"})
+        log = gc_eventlog.log_path("Oldest done")
+        assert log is not None and log.is_file()
+
+        gc_handles.record("Newer run", status="running")
+        gc_handles.record("Newest run", status="running")  # over cap → evict
+        assert gc_handles.get("Oldest done") is None
+        assert not log.exists()
+
+    def test_surviving_handles_keep_their_logs(self, clean_handles):
+        gc_handles.record("Live task", status="running")
+        gc_eventlog.append("Live task", {"kind": "content", "delta": "x"})
+        log = gc_eventlog.log_path("Live task")
+        gc_handles.record("Another task", status="running")  # write → prune
+        assert log.is_file()
+
+    def test_prune_survives_a_log_delete_failure(
+        self, clean_handles, monkeypatch
+    ):
+        """handles.py never raises: a failing log delete cannot break the
+        write (the entry is still pruned, the caller sees nothing)."""
+        gc_handles.record("Doomed task", status="completed")
+        gc_handles._table["Doomed task"]["updated_at"] = (
+            time.time() - gc_handles.PRUNE_TERMINAL_AFTER_S - 60
+        )
+
+        def boom(_name):
+            raise OSError("disk says no")
+
+        monkeypatch.setattr(gc_eventlog, "log_path", boom)
+        gc_handles.record("Fresh task", status="running")
+        assert gc_handles.get("Doomed task") is None
+        assert gc_handles.get("Fresh task") is not None
+
 
 # ---------------------------------------------------------------------------
-# names.py — adjective-adjective-noun slugs, collision retry, suffix fallback
-# ---------------------------------------------------------------------------
-
-class TestSessionNames:
-    def test_generated_slug_is_mood_modifier_creature(self):
-        name = gc_names.generate(taken=lambda n: False)
-        mood, modifier, creature = name.split("-")
-        assert mood in gc_names.MOODS
-        assert modifier in gc_names.MODIFIERS
-        assert creature in gc_names.CREATURES
-
-    def test_vocabulary_is_50x50x100(self):
-        assert len(set(gc_names.MOODS)) == 50
-        assert len(set(gc_names.MODIFIERS)) == 50
-        assert len(set(gc_names.CREATURES)) == 100
-
-    def test_collision_retries_until_a_free_slug(self):
-        rng = random.Random(7)
-        first = gc_names.generate(taken=lambda n: False, rng=random.Random(7))
-        # The same rng seed with the first draw claimed must yield a
-        # DIFFERENT (second-draw) name, not the taken one.
-        second = gc_names.generate(taken=lambda n: n == first, rng=rng)
-        assert second != first
-        assert second.split("-")[0] in gc_names.MOODS
-
-    def test_exhausted_draws_fall_back_to_a_numeric_suffix(self):
-        def is_taken(n):
-            return n.count("-") == 2  # every plain slug is claimed
-
-        # The fallback must kick in and still terminate, with a suffix.
-        name = gc_names.generate(taken=is_taken, rng=random.Random(1))
-        mood, modifier, creature, suffix = name.split("-")
-        assert suffix == "2"
-        assert mood in gc_names.MOODS
-        assert creature in gc_names.CREATURES
-
-    def test_suffix_increments_past_taken_suffixes(self):
-        def is_taken(n):
-            # Plain slugs and '-2' both claimed → must land on '-3'.
-            return n.count("-") == 2 or n.endswith("-2")
-
-        name = gc_names.generate(taken=is_taken, rng=random.Random(1))
-        assert name.endswith("-3")
-
-
-# ---------------------------------------------------------------------------
-# cursor_create_session — lazy named handles + UUID alias resolution
+# cursor_create_session — title handles, duplicate/over-long rejection,
+# deterministic repo-basename fallback + UUID alias resolution
 # ---------------------------------------------------------------------------
 
 class TestCursorCreateSession:
-    def test_creates_a_named_handle_and_dispatches_nothing(
+    def test_title_becomes_the_handle_and_dispatches_nothing(
         self, clean_state, monkeypatch, tmp_path
     ):
         boom = lambda *a, **k: pytest.fail("create must not start a run")
         monkeypatch.setattr(gc_cloud, "run_cloud", boom)
 
-        ack = cursor_create_session(repo=str(tmp_path))
-        name = _created_name(ack)
+        ack = cursor_create_session(
+            repo=str(tmp_path), title="Fix payment webhook retries"
+        )
+        assert _created_name(ack) == "Fix payment webhook retries"
         # The exact ack format from the spec: 2 headers + instruction.
         assert ack == (
-            f"session: {name}\n"
+            "session: Fix payment webhook retries\n"
             f"repo: {_resolved(tmp_path)} · model: "
             f"{gc._resolve_model(None) or 'default'} · runtime: local\n"
             "created. send work with cursor_send_message."
         )
-        # Named like playful-space-bunny, from the embedded word lists.
-        mood, modifier, creature = name.split("-")
-        assert mood in gc_names.MOODS and creature in gc_names.CREATURES
-        # LAZY: nothing running, but the handle exists as 'created'.
+        # LAZY: nothing running, but the handle exists as 'created' —
+        # keyed by the title verbatim.
         assert gc_jobs.registry.list_jobs() == []
-        entry = gc_handles.get(name)
+        entry = gc_handles.get("Fix payment webhook retries")
         assert entry["status"] == "created"
         assert entry["repo"] == _resolved(tmp_path)
+        assert gc_handles.resolve("Fix payment webhook retries") == (
+            "Fix payment webhook retries"
+        )
 
-    def test_minted_names_avoid_existing_handles(self, clean_state, tmp_path):
-        names = {
+    def test_title_whitespace_is_trimmed_and_collapsed(
+        self, clean_state, tmp_path
+    ):
+        ack = cursor_create_session(
+            repo=str(tmp_path), title="  Fix   payment\twebhook  retries  "
+        )
+        assert _created_name(ack) == "Fix payment webhook retries"
+        assert gc_handles.get("Fix payment webhook retries") is not None
+
+    def test_duplicate_title_fails_with_status_and_age(
+        self, clean_state, tmp_path
+    ):
+        gc_handles.record("Fix payment webhook retries", repo="/elsewhere",
+                          status="completed")
+        gc_handles._table["Fix payment webhook retries"]["updated_at"] = (
+            time.time() - 2 * 86400
+        )
+
+        out = cursor_create_session(
+            repo=str(tmp_path), title="Fix payment webhook retries"
+        )
+        assert "cannot create session" in out
+        assert "'Fix payment webhook retries'" in out
+        assert "already in use" in out
+        assert "completed, 2d ago" in out       # the existing entry's state
+        assert "more specific" in out           # asks for a better name
+        # No entry was recorded or clobbered by the failed create.
+        entry = gc_handles.get("Fix payment webhook retries")
+        assert entry["status"] == "completed"
+        assert entry["repo"] == "/elsewhere"
+
+    def test_duplicate_title_error_shows_running_state(
+        self, clean_state, tmp_path
+    ):
+        gc_handles.record("Ship dark mode", repo="/r", status="running")
+        out = cursor_create_session(repo=str(tmp_path), title="Ship dark mode")
+        assert "cannot create session" in out
+        assert "running" in out
+
+    def test_duplicate_check_never_auto_suffixes(self, clean_state, tmp_path):
+        gc_handles.record("Ship dark mode", repo="/r", status="running")
+        cursor_create_session(repo=str(tmp_path), title="Ship dark mode")
+        assert gc_handles.resolve("Ship dark mode 2") is None
+
+    def test_title_matching_an_agent_id_alias_is_also_taken(
+        self, clean_state, tmp_path
+    ):
+        gc_handles.record("Older session", status="completed",
+                          cursor_session_id="bc-alias-1")
+        out = cursor_create_session(repo=str(tmp_path), title="bc-alias-1")
+        assert "cannot create session" in out
+        assert "already in use" in out
+
+    def test_over_long_title_is_rejected_not_truncated(
+        self, clean_state, tmp_path
+    ):
+        long_title = "Fix " + "very " * 30 + "long title"  # > 80 chars
+        out = cursor_create_session(repo=str(tmp_path), title=long_title)
+        assert "cannot create session" in out
+        assert str(gc.MAX_TITLE_CHARS) in out   # names the cap
+        assert "shorten" in out
+        # Nothing recorded — neither the full nor a truncated key.
+        assert gc_handles.known_handles(scope="all") == []
+
+    def test_max_length_title_is_accepted(self, clean_state, tmp_path):
+        title = "x" * gc.MAX_TITLE_CHARS
+        ack = cursor_create_session(repo=str(tmp_path), title=title)
+        assert _created_name(ack) == title
+
+    def test_omitted_title_falls_back_to_repo_basename(
+        self, clean_state, tmp_path
+    ):
+        ack = cursor_create_session(repo=str(tmp_path))
+        expected = f"{Path(_resolved(tmp_path)).name} session"
+        assert _created_name(ack) == expected
+        assert gc_handles.get(expected)["status"] == "created"
+
+    def test_fallback_suffixes_past_collisions_and_never_fails(
+        self, clean_state, tmp_path
+    ):
+        base = f"{Path(_resolved(tmp_path)).name} session"
+        names = [
             _created_name(cursor_create_session(repo=str(tmp_path)))
-            for _ in range(5)
-        }
-        assert len(names) == 5  # collision-checked against the table
+            for _ in range(3)
+        ]
+        assert names == [base, f"{base} 2", f"{base} 3"]
+
+    def test_blank_title_takes_the_fallback_path(self, clean_state, tmp_path):
+        ack = cursor_create_session(repo=str(tmp_path), title="   ")
+        assert _created_name(ack) == f"{Path(_resolved(tmp_path)).name} session"
 
     def test_explicit_model_is_recorded_on_the_handle(
         self, clean_state, tmp_path
@@ -3992,8 +4099,9 @@ class TestCursorCreateSession:
     def test_handler_maps_args(self, clean_state, tmp_path):
         ack = _handle_cursor_create_session({
             "repo": str(tmp_path), "model": "m-x",
+            "title": "Wire the handler args",
         })
-        assert ack.startswith("session: ")
+        assert ack.startswith("session: Wire the handler args")
         assert "model: m-x" in ack
 
     def test_uuid_alias_resolves_everywhere_a_name_does(
@@ -4005,7 +4113,10 @@ class TestCursorCreateSession:
             gc_cloud, "run_cloud",
             _gated_replay_factory(_preset_event(), sid="11111111-2222-3333"),
         )
-        name = _created_name(cursor_create_session(repo=str(tmp_path)))
+        name = _created_name(cursor_create_session(
+            repo=str(tmp_path), title="Alias resolution check"
+        ))
+        assert name == "Alias resolution check"
         cursor_send_message(name, "do the thing")
         assert gc_jobs.registry.get_by_name(name).done_event.wait(10)
 
@@ -4016,6 +4127,21 @@ class TestCursorCreateSession:
         assert f"session: {name}" in by_uuid
         assert f"session: {name}" in cursor_stop("11111111-2222-3333")
         assert "events" in cursor_events("11111111-2222-3333")
+
+    def test_title_is_the_agent_name_on_the_rest_create(
+        self, clean_state, monkeypatch, tmp_path
+    ):
+        """One string end to end: the title IS the `name` POST /v1/agents
+        receives, so the session shows up on cursor.com under it."""
+        client = _FakeRestClient()
+        _install_fake_rest(monkeypatch, client)
+
+        name = _created_name(cursor_create_session(
+            repo=str(tmp_path), title="Session naming rework"
+        ))
+        cursor_send_message(name, "do the thing")
+        assert gc_jobs.registry.get_by_name(name).done_event.wait(10)
+        assert client.create_calls[0]["name"] == "Session naming rework"
 
 
 # ---------------------------------------------------------------------------
