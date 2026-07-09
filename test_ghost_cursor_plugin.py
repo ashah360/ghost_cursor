@@ -5689,10 +5689,16 @@ class TestSdkNormalizer:
         """Replay the sanitized live capture (2026-07-09, run-c99dd650)
         through the REAL sse→message→normalizer path and assert the
         envelope/args relations hold — no snapshots, invariants only."""
-        fixture = (
-            Path(gc_events.__file__).parent
-            / "fixtures" / "rest_v1" / "tool_vocabulary_live.jsonl"
-        )
+        # Two layouts: in-place (fixtures beside the plugin modules) and CI
+        # (unit.yml copies *.py into plugins/ghost_cursor/ but fixtures next
+        # to the relocated tests) — probe both.
+        rel = Path("fixtures") / "rest_v1" / "tool_vocabulary_live.jsonl"
+        candidates = [
+            Path(gc_events.__file__).parent / rel,
+            Path(__file__).parent / rel,
+        ]
+        fixture = next((p for p in candidates if p.is_file()), None)
+        assert fixture is not None, f"fixture missing from all of: {candidates}"
         norm = self._norm()
         by_call: dict = {}
         for line in fixture.read_text().splitlines():
