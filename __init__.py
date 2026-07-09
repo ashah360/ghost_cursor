@@ -93,6 +93,7 @@ from . import names as _names
 from . import progress as _progress
 from . import render as _render
 from . import runner as _runner
+from . import supervisor as _supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -569,9 +570,19 @@ def _reconcile_orphan(
     died) and nothing is delivered: there is no run left to deliver for.
     A handle with ANY job in this process (running or just settled) is
     left to the normal lifecycle.
+
+    Supervised sessions (RFC §1/§6): a handle in a LIVE supervision phase
+    is NOT declared dead at read time — supervision is durable, so the
+    read re-attaches a supervisor instead (idempotent when one is already
+    live) and reports the record as-is. This backstop now only fires for
+    pre-supervisor records, where "running with no job" really does mean
+    the run died with the process.
     """
     if job is not None or str(entry.get("status") or "") != "running":
         return entry
+    if _handles.supervision_is_live(entry):
+        _supervisor.ensure_supervisor(name)
+        return _handles.get(name) or entry
     _handles.record(name, status="failed", status_note=_ORPHANED_NOTE)
     return _handles.get(name) or entry
 
@@ -706,6 +717,20 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
                     job.reasoning_tail = (job.reasoning_tail + text)[-4000:]
                 job.segment_open = False
 
+    # Derived durable-progress marker (RFC §4): controller-derived from
+    # the observed event, never agent self-report — emitted once per
+    # attempt, the moment the first durable evidence lands.
+    if _supervisor.is_durable_evidence(envelope):
+        attempt_id = job.current_attempt_id
+        with job._lock:
+            first = attempt_id and attempt_id not in job.durable_marked_attempts
+            if first:
+                job.durable_marked_attempts.add(attempt_id)
+        if first:
+            job.append_progress(
+                _events.lifecycle("durable_progress", evidence=kind)
+            )
+
 
 # Transparent zero-progress auto-retry. Born from a bridge-era live
 # incident (2026-07-04: stale sidecars produced instant terminal errors
@@ -721,10 +746,11 @@ def _fold_envelope(job: "_jobs.CursorJob", envelope: Dict[str, Any]) -> None:
 # failure instead — delivered immediately through the normal failure path.
 # NOTE: the unroutable-worker error is deliberately marked non-retryable
 # (cloud_runner sets retryable=False) — re-prompting can't fix routing.
-_MAX_AUTO_RETRIES = 2
+# Cap per RFC §5 (supervisor.MAX_AUTO_RETRIES).
+_MAX_AUTO_RETRIES = _supervisor.MAX_AUTO_RETRIES
 # Backoff ladder before retry N (1-based); a parseable server retry_after
 # on the error overrides the step. Module-level so tests can zero it.
-_AUTO_RETRY_BACKOFF_S = (15.0, 60.0)
+_AUTO_RETRY_BACKOFF_S = (15.0, 60.0, 60.0)
 # Tight first-event watchdog for retry attempts, independent of the user's
 # inactivity_timeout_s (issue #17): a retried run that streams NOTHING in
 # this window is settled failed and the failure delivered, instead of
@@ -829,6 +855,9 @@ def _run_attempt(
                     job.model = str(obj.get("model") or "")
                     job.worker = str(obj.get("worker") or "")
                     job.agents_ui_url = str(obj.get("agents_ui_url") or "")
+                # Supervision phase: the agent exists and events flow
+                # (RFC §1 — the durable record a reconciler re-attaches to).
+                _supervisor.mark_streaming(job.session_name or sid)
                 # Persist the handle the moment the agent exists — keyed by
                 # the session NAME, with the agent id as an alias.
                 _handles.record(
@@ -885,6 +914,14 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
     # in the stream (e.g. shell commands; tool payloads are unstable).
     git_before = _cloud.git_status_snapshot(workdir)
 
+    # Open attempt 1 on the supervision record (RFC §1): the durable
+    # phase + attempt identity a reconciler re-attaches to after a
+    # process death. Every event this run spills carries the attempt id.
+    job.attempt_n = 1
+    job.current_attempt_id = _supervisor.begin_attempt(
+        job.session_name or job.requested_session_id or "", 1
+    )
+
     attempt = 0  # auto-retries used so far
     while True:
         state = _run_attempt(
@@ -915,7 +952,20 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
                 "zero-progress terminal error: "
                 f"{job.run_error or 'unknown error'}"
             )
-        # Log-only signal (jsonl + rolling buffer) — nothing user-facing.
+        # New attempt identity (RFC §5): retry_started carries the NEW
+        # attemptId; the legacy cloud.autoretry alias is kept during
+        # migration for existing log tooling.
+        job.attempt_n = attempt + 1
+        job.current_attempt_id = _supervisor.begin_attempt(
+            job.session_name or job.cursor_session_id or "", attempt + 1
+        )
+        # Log-only signals (jsonl + rolling buffer) — nothing user-facing.
+        _fold_envelope(job, _events.lifecycle(
+            "retry_started",
+            attempt=attempt,
+            attempt_n=attempt + 1,
+            reason=reason,
+        ))
         _fold_envelope(job, _events.lifecycle(
             "cloud.autoretry",
             attempt=attempt,
@@ -933,6 +983,23 @@ def _execute_cursor_run(job: "_jobs.CursorJob") -> Dict[str, Any]:
             job.run_error = None
             job.error_retryable = None
             job.error_retry_after = None
+
+    # RFC §5: a terminal error on an attempt WITH durable progress is
+    # never auto-reprompted (double-apply risk) — record the suppression
+    # so the log says why no retry happened; the failure surfaces through
+    # the normal delivery path and requires an explicit resume.
+    if (
+        state["terminal_error"]
+        and _made_progress(job)
+        and not job.cancel_event.is_set()
+    ):
+        _fold_envelope(job, _events.lifecycle(
+            "retry_suppressed",
+            reason=(
+                "durable progress observed this prompt — an auto-reprompt "
+                "would risk double-applying work; explicit resume required"
+            ),
+        ))
 
     # Git fallback: edits the stream carried no diff for (shell-driven
     # writes, kill-before-diff) still land in files_changed + progress.
@@ -1158,7 +1225,11 @@ def _send_to_session(
     job = _live_job(name, entry)
     interrupted = False
     if job is not None and job.status == "running":
+        # Supervisor-mediated interrupt transition (RFC non-goals): the
+        # tool surface is unchanged, but the event trace records the
+        # cancel → interrupted → re-prompt sequence first-class.
         interrupted = True
+        job.append_progress(_events.lifecycle("interrupt_requested"))
         if not _settle_job(job):
             # Same honesty rule as cursor_stop (issue #22): the run is
             # still live, so re-arm the delivery mark_handled suppressed —
@@ -1175,6 +1246,25 @@ def _send_to_session(
                     "use cursor_stop"
                 ),
             }
+        job.append_progress(_events.lifecycle("interrupted"))
+    elif _supervisor.has_live(name):
+        # A RE-ATTACHED supervisor owns this session's live run (the
+        # dispatching process died) — request the transition and wait for
+        # the supervisor to settle it before re-prompting (RFC §3).
+        interrupted = True
+        if not _supervisor.stop_and_wait(name, _INTERRUPT_WAIT_S):
+            return {
+                "success": False,
+                "status": "running",
+                "session": name,
+                "error": (
+                    "the session's re-attached run did not settle after a "
+                    f"native cancel within {int(_INTERRUPT_WAIT_S)}s — "
+                    "not re-prompting a possibly-live session; retry, or "
+                    "use cursor_stop"
+                ),
+            }
+        entry = _handles.get(name) or entry
 
     resume = (
         (job.cursor_session_id or None)
@@ -1539,6 +1629,26 @@ def cursor_stop(session: str, **_kwargs: Any) -> str:
     entry = _handles.get(name)
     job = _live_job(name, entry)
     if job is None:
+        if _supervisor.has_live(name):
+            # A re-attached supervisor owns the live run: request the
+            # cancel transition and report only what was OBSERVED (RFC §3
+            # — tool calls request, the supervisor settles).
+            if _supervisor.stop_and_wait(name, _STOP_WAIT_S):
+                settled = _handles.get(name) or {}
+                return _render.stop_text(
+                    name=name,
+                    status=str(settled.get("status") or "cancelled"),
+                    elapsed_s=settled.get("duration_s"),
+                    files=[],
+                    already_finished=False,
+                )
+            return (
+                f"cancel signalled, but the run in session '{name}' has "
+                f"not stopped within {int(_STOP_WAIT_S)}s — it is still "
+                "executing. status stays running; nothing terminal was "
+                "recorded. retry cursor_stop, or watch cursor_status; the "
+                "final outcome will be delivered when the run settles."
+            )
         if entry is not None:
             status = str(entry.get("status") or "unknown")
             return _render.stop_text(
@@ -1711,9 +1821,15 @@ def _handle_cursor_subscribe(args: Dict[str, Any], **kwargs: Any) -> str:
 def register(ctx) -> None:
     """Register the 7 cursor tools. Called once by the plugin loader.
 
+    Also starts the supervision reconciler (RFC §1): one pass now — any
+    handle a previous process left in a live supervision phase gets a
+    supervisor re-attached, so digests resume and the completion still
+    delivers — then every 60s.
+
     Nothing to arrange at process exit: workers are DETACHED by design
     (they survive restarts and are reused), and runs live server-side.
     """
+    _supervisor.start_reconciler()
     for name, schema, handler, emoji in (
         (CREATE_TOOL_NAME, CURSOR_CREATE_SCHEMA, _handle_cursor_create_session, "🆕"),
         (SEND_TOOL_NAME, CURSOR_SEND_SCHEMA, _handle_cursor_send_message, "📨"),

@@ -71,6 +71,7 @@ from . import eventlog as _eventlog
 from . import handles as _handles
 from . import progress as _progress
 from . import render as _render
+from . import supervisor as _supervisor
 
 logger = logging.getLogger(__name__)
 
@@ -187,6 +188,15 @@ class CursorJob:
     # mid-job, so streamed progress is never forgotten by a later attempt.
     nonlifecycle_events: int = 0
     completed_tool_ids: Set[str] = field(default_factory=set)
+    # --- supervision identity (RFC §1/§4) ---
+    # The stable id of the CURRENT attempt, stamped on every event this
+    # run spills as ``attemptId`` (mandatory — retry forensics). Minted by
+    # supervisor.begin_attempt at dispatch and re-minted per auto-retry.
+    current_attempt_id: str = ""
+    attempt_n: int = 1
+    # Attempt ids whose lifecycle.durable_progress event was already
+    # emitted (derived once per attempt — see __init__._fold_envelope).
+    durable_marked_attempts: Set[str] = field(default_factory=set)
     run_error: Optional[str] = None
     # Typed detail riding a terminal-error run.failed (see cloud_runner's
     # cloud.error payload): None = unknown, not "no".
@@ -257,7 +267,12 @@ class CursorJob:
         or trims stays recoverable and pageable via ``cursor_status``.
         Envelopes that arrive before the session handle exists are held in
         a bounded pending list and flushed the moment it does.
+
+        Ingest boundary (RFC §4): every envelope is stamped with the
+        CURRENT attempt's ``attemptId`` before it is buffered or spilled.
         """
+        if self.current_attempt_id and not envelope.get("attemptId"):
+            envelope = {**envelope, "attemptId": self.current_attempt_id}
         compact = {k: v for k, v in envelope.items() if k not in ("before", "after")}
         if isinstance(compact.get("diff"), str):
             compact["diff"] = _clip(compact["diff"], _BUFFER_DIFF_CHARS)
@@ -497,6 +512,9 @@ class CursorJobRegistry:
         # Settle the persistent handle table so the handle stays resolvable
         # (and correctly non-running) across process restarts. Keyed by the
         # session NAME (v0.4 handle); name-less jobs fall back to the sid.
+        # Supervision settle (RFC §3): the terminal phase write + the
+        # supervisor-derived session.settled event (death-shape tagged).
+        _supervisor.settle_from_job(job, status)
         handle_key = job.session_name or job.cursor_session_id
         if handle_key:
             _handles.record(

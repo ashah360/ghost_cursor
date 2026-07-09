@@ -449,6 +449,10 @@ class _Ticker:
         with _lock:
             _counters[self.key] = n
             _last_emit[self.key] = time.monotonic()
+        # Durable delivery-ack cursor (RFC: last_seq_delivered advances
+        # only after the successful enqueue) — a supervisor re-attaching
+        # after a restart resumes this subscriber's digests from here.
+        _handles.advance_delivery_cursor(self.name, self.sub_key, self.last_seq)
 
 
 # ---------------------------------------------------------------------------

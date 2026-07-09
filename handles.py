@@ -230,6 +230,167 @@ def set_subscriber(
         logger.debug("ghost_cursor subscriber write failed", exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Supervision record (RFC: docs/rfcs/session-supervisor.md §1)
+# ---------------------------------------------------------------------------
+# Each entry grows a ``supervision`` sub-record owned by the supervisor loop
+# (supervisor.py) — the durable state that makes gateway restarts a
+# non-event. Shape:
+#
+#     {
+#       "phase": "streaming" | ... | "completed" | ...,
+#       "current_attempt_id": "att-...",   # stamped on every event as attemptId
+#       "attempt_n": 1,                    # display/debug only
+#       "last_seq_delivered": {subscriber_key: seq},
+#       "watchdog": {"last_poll_ts": epoch, "last_remote_status": "RUNNING"},
+#     }
+#
+# Only the SUPERVISOR writes phase transitions (single-writer settlement,
+# RFC §3); tool calls request transitions through supervisor APIs.
+
+# Non-terminal phases: a reconciler pass re-attaches a supervisor to any
+# handle in one of these with no live supervisor task.
+SUPERVISION_LIVE_PHASES = ("spawning", "streaming", "retrying")
+# Terminal phases mirror jobs.TERMINAL_STATUSES.
+SUPERVISION_TERMINAL_PHASES = _TERMINAL_STATUSES
+
+
+def supervision_of(entry: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """The entry's supervision record, normalized with defaults. Never raises.
+
+    An entry that predates the supervisor (or was never dispatched through
+    it) reads as phase "" — neither live nor terminal — so the reconciler
+    skips it and legacy handles keep working untouched.
+    """
+    try:
+        raw = (entry or {}).get("supervision")
+        raw = raw if isinstance(raw, dict) else {}
+        cursors = raw.get("last_seq_delivered")
+        watchdog = raw.get("watchdog")
+        return {
+            "phase": str(raw.get("phase") or ""),
+            "current_attempt_id": str(raw.get("current_attempt_id") or ""),
+            "attempt_n": max(int(raw.get("attempt_n") or 0), 0),
+            "last_seq_delivered": (
+                {
+                    str(k): int(v)
+                    for k, v in cursors.items()
+                    if isinstance(v, (int, float))
+                }
+                if isinstance(cursors, dict)
+                else {}
+            ),
+            "watchdog": dict(watchdog) if isinstance(watchdog, dict) else {},
+        }
+    except Exception:
+        logger.debug("ghost_cursor supervision read failed", exc_info=True)
+        return {
+            "phase": "",
+            "current_attempt_id": "",
+            "attempt_n": 0,
+            "last_seq_delivered": {},
+            "watchdog": {},
+        }
+
+
+def supervision_is_live(entry: Optional[Dict[str, Any]]) -> bool:
+    """True when the entry's supervision phase needs a live supervisor."""
+    return supervision_of(entry)["phase"] in SUPERVISION_LIVE_PHASES
+
+
+def record_supervision(session_id: Optional[str], **fields: Any) -> None:
+    """Merge ``fields`` into the entry's supervision record. Never raises.
+
+    Read-modify-write under the table lock; None values are skipped (same
+    contract as :func:`record`). ``last_seq_delivered`` cursors have their
+    own advance-only writer (:func:`advance_delivery_cursor`) and are
+    deliberately NOT writable here.
+    """
+    try:
+        if not session_id:
+            return
+        fields.pop("last_seq_delivered", None)
+        with _lock:
+            _load_locked()
+            name = _resolve_locked(str(session_id).strip()) or str(session_id)
+            entry = _table.setdefault(name, {})
+            current = entry.get("supervision")
+            sup = dict(current) if isinstance(current, dict) else {}
+            sup.update({k: v for k, v in fields.items() if v is not None})
+            entry["supervision"] = sup
+            entry["updated_at"] = time.time()
+            _prune_locked()
+            _save_locked()
+    except Exception:
+        logger.debug("ghost_cursor supervision record failed", exc_info=True)
+
+
+def transition_supervision(session_id: Optional[str], to_phase: str) -> bool:
+    """Atomically move the supervision phase from a LIVE phase to
+    ``to_phase``. Returns True only for the writer that actually
+    transitioned — the settle gate that makes completion fan-out
+    exactly-once (RFC §3: single-writer settlement). A phase that is
+    already terminal (or empty — never supervised) refuses the
+    transition. Never raises (a failure reads as "did not transition").
+    """
+    try:
+        if not session_id:
+            return False
+        with _lock:
+            _load_locked()
+            name = _resolve_locked(str(session_id).strip()) or str(session_id)
+            entry = _table.setdefault(name, {})
+            current = entry.get("supervision")
+            sup = dict(current) if isinstance(current, dict) else {}
+            if str(sup.get("phase") or "") not in SUPERVISION_LIVE_PHASES:
+                return False
+            sup["phase"] = str(to_phase)
+            entry["supervision"] = sup
+            entry["updated_at"] = time.time()
+            _save_locked()
+            return True
+    except Exception:
+        logger.debug("ghost_cursor supervision transition failed", exc_info=True)
+        return False
+
+
+def advance_delivery_cursor(
+    session_id: Optional[str], subscriber_key: str, seq: int
+) -> None:
+    """Advance ONE subscriber's ``last_seq_delivered`` cursor. Never raises.
+
+    Advance-only (RFC non-goals: the cursor moves only after successful
+    delivery onto the completion queue; a stale writer can never rewind
+    it — duplicate digests are acceptable, lost events are not).
+    """
+    try:
+        if not session_id:
+            return
+        seq = int(seq)
+        key = str(subscriber_key or "")
+        with _lock:
+            _load_locked()
+            name = _resolve_locked(str(session_id).strip()) or str(session_id)
+            entry = _table.setdefault(name, {})
+            current = entry.get("supervision")
+            sup = dict(current) if isinstance(current, dict) else {}
+            cursors = sup.get("last_seq_delivered")
+            cursors = dict(cursors) if isinstance(cursors, dict) else {}
+            try:
+                prior = int(cursors.get(key, -1))
+            except (TypeError, ValueError):
+                prior = -1
+            if seq <= prior:
+                return
+            cursors[key] = seq
+            sup["last_seq_delivered"] = cursors
+            entry["supervision"] = sup
+            entry["updated_at"] = time.time()
+            _save_locked()
+    except Exception:
+        logger.debug("ghost_cursor delivery cursor write failed", exc_info=True)
+
+
 def _resolve_locked(identifier: str) -> Optional[str]:
     """Canonical handle name for ``identifier`` (name or UUID alias)."""
     if identifier in _table:
